@@ -5,3 +5,4 @@ altair
 requests
 finance-datareader
 yfinance
+opendartreader

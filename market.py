@@ -10,10 +10,12 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
     if "Close" not in df.columns:
         return pd.DataFrame(columns=["Close"])
-    out = df[["Close"]].copy()
+    cols = ["Close"] + (["Volume"] if "Volume" in df.columns else [])
+    out = df[cols].copy()
     out.index = pd.to_datetime(out.index).tz_localize(None)
-    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
-    return out.dropna().sort_index()
+    for c in cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out.dropna(subset=["Close"]).sort_index()
 
 
 def _start(days: int) -> str:
@@ -74,3 +76,11 @@ def kakao_value(px_usd: pd.DataFrame, fx: pd.DataFrame, per_day_krw: float, star
     n = len(px)
     value = shares * px.iloc[-1] * rate.iloc[-1]
     return float(per_day_krw * n), float(value), int(n)
+
+
+def avg_trading_value_eok(df: pd.DataFrame, n: int = 20):
+    """최근 n거래일 평균 거래대금(억원). 거래량이 없으면 None."""
+    if df is None or df.empty or "Volume" not in df.columns:
+        return None
+    v = (df["Close"] * df["Volume"]).tail(n).dropna()
+    return float(v.mean() / 1e8) if len(v) else None
