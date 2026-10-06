@@ -29,12 +29,20 @@ def _num(x):
         return np.nan
 
 
+def describe_html(html):
+    """실패했을 때 네이버가 돌려준 페이지가 어떤 모양인지 한 줄로 알려준다."""
+    import re
+    m = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.S | re.I)
+    title = re.sub(r"\s+", " ", m.group(1)).strip()[:40] if m else "제목 없음"
+    return f"응답 {len(html or ''):,}자, 제목 '{title}', 표 {len(re.findall('<table', html or '', re.I))}개"
+
+
 def parse_frgn_html(html):
     """네이버 외국인·기관 매매 페이지 HTML -> 날짜 오름차순 DataFrame"""
     try:
         tables = pd.read_html(io.StringIO(html), match="기관")
     except ValueError:
-        raise FlowError("수급 표를 찾지 못했어요(접속이 막혔거나 페이지 형식이 바뀌었을 수 있어요).")
+        raise FlowError(f"수급 표를 찾지 못했어요({describe_html(html)}).")
     except ImportError as e:
         raise FlowError(f"표를 읽는 부품이 설치되어 있지 않아요: {str(e)[:80]}")
     except Exception as e:
@@ -45,7 +53,7 @@ def parse_frgn_html(html):
         if "날짜" in joined and "기관" in joined and "외국인" in joined:
             break
     else:
-        raise FlowError("날짜·기관·외국인 열이 있는 표를 찾지 못했어요(페이지 형식이 바뀌었을 수 있어요).")
+        raise FlowError(f"날짜·기관·외국인 열이 있는 표를 찾지 못했어요({describe_html(html)}).")
     t = t.copy()
     t.columns = cols
 
@@ -75,9 +83,61 @@ def parse_frgn_html(html):
     return d.drop_duplicates("날짜").reset_index(drop=True)
 
 
-def fetch_flow(code, pages=2, get=None, pause=0.3):
-    """한 종목의 최근 수급(약 {pages*20}거래일)을 가져온다."""
-    get = get or requests.get
+MOBILE = "https://m.stock.naver.com/api/stock/{code}/trend"
+KEYS = {"date": ("bizdate", "localTradedAt", "date"), "close": ("closePrice",), "frgn": ("foreignerPureBuyQuant",),
+        "inst": ("organPureBuyQuant",), "indiv": ("individualPureBuyQuant",), "pct": ("foreignerHoldRatio",),
+        "vol": ("accumulatedTradingVolume",)}
+
+
+def parse_trend_json(data):
+    """네이버 모바일 trend JSON -> 날짜 오름차순 DataFrame(개인 포함)"""
+    rows = data
+    if isinstance(data, dict):
+        rows = next((v for v in data.values() if isinstance(v, list)), None)
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        raise FlowError("모바일 API 응답에 목록이 없어요.")
+    keys = set().union(*[set(r) for r in rows[:3]])
+
+    def pick(name):
+        return next((k for k in KEYS[name] if k in keys), None)
+
+    kd, kc, kf, ki = pick("date"), pick("close"), pick("frgn"), pick("inst")
+    if not all([kd, kc, kf, ki]):
+        raise FlowError(f"모바일 API 응답의 항목 이름이 달라요(찾은 항목: {', '.join(sorted(keys))[:150]}).")
+    kp, kh, kv = pick("indiv"), pick("pct"), pick("vol")
+
+    def to_date(x):
+        s = str(x).strip()
+        return pd.to_datetime(s, format="%Y%m%d", errors="coerce") if s.isdigit() and len(s) == 8 else pd.to_datetime(s, errors="coerce")
+
+    d = pd.DataFrame({
+        "날짜": [to_date(r.get(kd)) for r in rows], "종가": [_num(r.get(kc)) for r in rows],
+        "거래량": [_num(r.get(kv)) if kv else np.nan for r in rows],
+        "기관": [_num(r.get(ki)) for r in rows], "외국인": [_num(r.get(kf)) for r in rows],
+        "개인": [_num(r.get(kp)) if kp else np.nan for r in rows],
+        "외국인보유주수": np.nan, "외국인보유율": [_num(r.get(kh)) if kh else np.nan for r in rows]})
+    d = d.dropna(subset=["날짜", "종가"]).sort_values("날짜")
+    if d.empty:
+        raise FlowError("모바일 API에서 읽을 수 있는 행이 없었어요.")
+    return d.drop_duplicates("날짜").reset_index(drop=True)
+
+
+def _fetch_json(code, pages, get, pause):
+    try:
+        r = get(MOBILE.format(code=str(code).zfill(6)), params={"pageSize": pages * 20},
+                headers=dict(HEADERS, Referer="https://m.stock.naver.com/"), timeout=12)
+    except Exception as e:
+        raise FlowError(f"접속 실패({str(e)[:60]})")
+    if getattr(r, "status_code", 200) != 200:
+        raise FlowError(f"HTTP {r.status_code}")
+    try:
+        data = r.json()
+    except Exception:
+        raise FlowError(f"JSON이 아니에요(응답 {len(getattr(r, 'text', '') or ''):,}자)")
+    return parse_trend_json(data)
+
+
+def _fetch_html(code, pages, get, pause):
     frames = []
     for p in range(1, pages + 1):
         try:
@@ -90,8 +150,19 @@ def fetch_flow(code, pages=2, get=None, pause=0.3):
         frames.append(parse_frgn_html(r.text))
         if p < pages:
             time.sleep(pause)
-    d = pd.concat(frames, ignore_index=True).drop_duplicates("날짜").sort_values("날짜").reset_index(drop=True)
-    return d
+    return pd.concat(frames, ignore_index=True).drop_duplicates("날짜").sort_values("날짜").reset_index(drop=True)
+
+
+def fetch_flow(code, pages=2, get=None, pause=0.3):
+    """한 종목의 최근 수급(약 pages*20거래일). 모바일 API를 먼저, 안 되면 웹 페이지를 읽는다."""
+    get = get or requests.get
+    errors = []
+    for name, fn in (("모바일 API", _fetch_json), ("웹 페이지", _fetch_html)):
+        try:
+            return fn(code, pages, get, pause)
+        except FlowError as e:
+            errors.append(f"{name}: {e}")
+    raise FlowError(" / ".join(errors))
 
 
 def with_amounts(df):
@@ -99,7 +170,13 @@ def with_amounts(df):
     d = df.sort_values("날짜").copy()
     d["기관(억)"] = d["기관"] * d["종가"] / 1e8
     d["외국인(억)"] = d["외국인"] * d["종가"] / 1e8
-    d["개인(억)"] = -(d["기관(억)"] + d["외국인(억)"])
+    est = -(d["기관(억)"] + d["외국인(억)"])
+    if "개인" in d.columns and d["개인"].notna().any():
+        d["개인(억)"] = d["개인"] * d["종가"] / 1e8
+        d["개인추정"] = False
+    else:
+        d["개인(억)"] = est
+        d["개인추정"] = True
     return d
 
 
@@ -126,7 +203,8 @@ def summarize(df):
     out = {"last": d["날짜"].iloc[-1].date().isoformat(), "n": int(len(d)),
            "f5": s("외국인(억)", 5), "i5": s("기관(억)", 5), "p5": s("개인(억)", 5),
            "f20": s("외국인(억)", 20), "i20": s("기관(억)", 20), "p20": s("개인(억)", 20),
-           "f_streak": _streak(d["외국인(억)"]), "i_streak": _streak(d["기관(억)"])}
+           "f_streak": _streak(d["외국인(억)"]), "i_streak": _streak(d["기관(억)"]),
+           "indiv_est": bool(d["개인추정"].iloc[-1])}
     pct = d["외국인보유율"].dropna()
     out["hold_pct"] = float(pct.iloc[-1]) if len(pct) else None
     out["hold_chg20"] = float(pct.iloc[-1] - pct.iloc[-min(20, len(pct))]) if len(pct) >= 2 else None
@@ -159,6 +237,7 @@ def read_text(sm):
 def chart_frame(df, n=20):
     d = with_amounts(df).tail(n)
     rows = []
-    for name, col in (("외국인", "외국인(억)"), ("기관", "기관(억)"), ("개인(추정)", "개인(억)")):
+    ind = "개인(추정)" if bool(d["개인추정"].iloc[-1]) else "개인"
+    for name, col in (("외국인", "외국인(억)"), ("기관", "기관(억)"), (ind, "개인(억)")):
         rows += [{"날짜": a, "주체": name, "순매수(억)": b} for a, b in zip(d["날짜"], d[col])]
     return pd.DataFrame(rows)

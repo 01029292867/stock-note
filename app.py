@@ -802,11 +802,11 @@ def report_flow(code):
     k = st.columns(4)
     k[0].metric("외국인 5일", f"{sm['f5']:+,.0f}억", f"20일 {sm['f20']:+,.0f}억", delta_color="off")
     k[1].metric("기관 5일", f"{sm['i5']:+,.0f}억", f"20일 {sm['i20']:+,.0f}억", delta_color="off")
-    k[2].metric("개인(추정) 5일", f"{sm['p5']:+,.0f}억", f"20일 {sm['p20']:+,.0f}억", delta_color="off")
+    k[2].metric(("개인(추정)" if sm["indiv_est"] else "개인") + " 5일", f"{sm['p5']:+,.0f}억", f"20일 {sm['p20']:+,.0f}억", delta_color="off")
     k[3].metric("외국인 보유율", "-" if sm["hold_pct"] is None else f"{sm['hold_pct']:.2f}%",
                 None if sm["hold_chg20"] is None else f"{sm['hold_chg20']:+.2f}%p (20일)")
     cf = flows.chart_frame(df, 20)
-    for who in ("외국인", "기관", "개인(추정)"):
+    for who in cf["주체"].unique():
         st.caption(f"{who} 일별 순매수(억원, 최근 20거래일) — 빨강은 순매수, 파랑은 순매도")
         st.altair_chart(alt.Chart(cf[cf["주체"] == who]).mark_bar().encode(
             x=alt.X("날짜:T", title=None), y=alt.Y("순매수(억):Q", title=None),
@@ -815,7 +815,7 @@ def report_flow(code):
     st.info(flows.read_text(sm))
     st.caption(f"{sm['last']}까지의 자료예요. 외국인 연속 {abs(sm['f_streak'])}일 {'순매수' if sm['f_streak'] > 0 else '순매도'}, "
                f"기관 연속 {abs(sm['i_streak'])}일 {'순매수' if sm['i_streak'] > 0 else '순매도'}. 금액은 순매매량에 그날 종가를 곱한 추정치이고, "
-               "개인은 제공되지 않아 기관·외국인의 반대로 계산한 값(기타 법인 등 포함)이에요. 수급은 참고 자료일 뿐 주가를 보장하지 않아요.")
+               + ("개인은 제공되지 않아 기관·외국인의 반대로 계산한 값(기타 법인 등 포함)이에요. " if sm["indiv_est"] else "") + "수급은 참고 자료일 뿐 주가를 보장하지 않아요.")
     with st.expander("수급 원자료 (최근 40거래일)"):
         raw = flows.with_amounts(df).tail(40).iloc[::-1]
         st.dataframe(raw[["날짜", "종가", "기관", "외국인", "기관(억)", "외국인(억)", "개인(억)", "외국인보유율"]], width="stretch", hide_index=True)
