@@ -1,12 +1,12 @@
 """가격 기반 신호 계산 (시세만으로 판단 가능한 규칙)."""
-VERSION = 3  # 3: 이탈 뒤 고점으로 보호선 재설정, 이탈 알림 유지 기간 / 2: 매수일 이후 고점, 수익 보호선, 수급 신호
+VERSION = 4  # 4: 지지선 이탈 신호(levels.py), 지지선 규칙 / 3: 이탈 뒤 고점으로 보호선 재설정, 이탈 알림 유지 기간 / 2: 매수일 이후 고점, 수익 보호선, 수급 신호
 
 import numpy as np
 import pandas as pd
 
 DEFAULT_RULES = {
-    "중장기": {"점검선": -20.0, "목표": 30.0, "고점권": 90.0, "보호활성": 30.0, "보호폭": 20.0, "보호알림일": 10},
-    "스윙": {"손절선": -7.0, "목표": 15.0, "RSI과열": 70.0, "눌림_하단": 35.0, "눌림_상단": 55.0, "보호활성": 10.0, "보호폭": 8.0, "보호알림일": 10},
+    "중장기": {"점검선": -20.0, "목표": 30.0, "고점권": 90.0, "보호활성": 30.0, "보호폭": 20.0, "보호알림일": 10, "지지선": 1},
+    "스윙": {"손절선": -7.0, "목표": 15.0, "RSI과열": 70.0, "눌림_하단": 35.0, "눌림_상단": 55.0, "보호활성": 10.0, "보호폭": 8.0, "보호알림일": 10, "지지선": 1},
 }
 
 
@@ -38,6 +38,7 @@ def indicators(df: pd.DataFrame, since=None) -> dict | None:
     return {
         "peak": float(seg.max()), "peak_date": seg.idxmax().date().isoformat(), "peak_basis": basis,
         "seg_close": [float(x) for x in seg.values], "seg_dates": [d.date().isoformat() for d in seg.index],
+        "all_close": [float(x) for x in c.tail(600).values], "all_dates": [d.date().isoformat() for d in c.tail(600).index],
         "price": float(last),
         "prev": float(c.iloc[-2]),
         "ma20": float(c.tail(20).mean()),
@@ -78,6 +79,20 @@ def protect(ind: dict, tag: str, avg, rules: dict) -> dict | None:
             "dd": (ind["price"] / peak - 1) * 100, "peak_ret": (peak / avg - 1) * 100, "width": w, "act": act, "win": win,
             "last": last, "days": days, "hit": recent, "basis": ind.get("peak_basis"),
             "overall_peak": ind["peak"], "overall_dd": (ind["price"] / ind["peak"] - 1) * 100}
+
+
+def structure(ind: dict, tag: str, rules: dict) -> dict | None:
+    """가격 흐름에서 찾은 지지선·저항선·평소 되돌림 폭(levels.py). 계산할 수 없으면 None."""
+    try:
+        import levels
+    except ImportError:
+        return None
+    if not ind or not ind.get("all_close"):
+        return None
+    try:
+        return levels.analyze(ind["all_close"], ind["all_dates"], ind["price"], tag, int(rules[tag].get("보호알림일", 10)))
+    except Exception:
+        return None
 
 
 def protect_state(pr: dict | None) -> str:
@@ -122,6 +137,13 @@ def signals(ind: dict, tag: str, avg: float | None, rules: dict, flow: dict | No
                if pr["armed"] else "지금은 수익이 기준 미만이라 보호선이 꺼져 있어요")
         out.append({"kind": "주의", "title": "수익 보호선 도달",
                     "detail": f"{when} 보호선 {l['line']:,.0f}원을 이탈(고점 {l['peak']:,.0f}원 기준) · {now}"})
+    if pr and pr["armed"] and R.get("지지선", 1):
+        lv = structure(ind, tag, rules)
+        if lv and lv["recent_break"]:
+            b = lv["recent_break"][0]
+            nxt = lv["supports"][0]["price"] if lv["supports"] else None
+            out.append({"kind": "주의", "title": "지지선 이탈",
+                        "detail": f"{b['days']}거래일 전({b['break_date']}) 과거에 {b['touches']}번 반등했던 {b['price']:,.0f}원대를 종가 기준으로 이탈" + (f" · 다음 지지선 {nxt:,.0f}원" if nxt else "")})
     if tag == "중장기":
         if ind["pos"] >= R["고점권"]:
             out.append({"kind": "주의", "title": "52주 고점권", "detail": f"52주 범위 중 {ind['pos']:.0f}% 지점"})
