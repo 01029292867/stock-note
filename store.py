@@ -10,8 +10,15 @@ class GasStore:
 
     def _post(self, payload: dict) -> dict:
         payload = dict(payload, token=self.token)
-        r = requests.post(self.url, json=payload, timeout=30)
-        r.raise_for_status()
+        try:
+            r = requests.post(self.url, json=payload, timeout=30)
+            r.raise_for_status()
+        except requests.Timeout:
+            raise RuntimeError("구글 시트(Apps Script)가 제때 응답하지 않았어요(시간 초과).")
+        except requests.HTTPError as e:
+            raise RuntimeError(f"구글 시트(Apps Script) 응답 오류: HTTP {e.response.status_code if e.response is not None else '?'}")
+        except requests.RequestException as e:
+            raise RuntimeError(f"구글 시트(Apps Script)에 접속하지 못했어요({type(e).__name__}).")
         try:
             data = r.json()
         except ValueError:

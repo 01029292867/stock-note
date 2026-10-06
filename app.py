@@ -421,22 +421,49 @@ def load_tables(force=False):
 
 
 # ---------- DART 재무·공시 (구글 시트에 캐시) ----------
-DART_CLIENT_VER = "4"  # DartClient 코드를 바꾸면 이 숫자를 올려서 예전 객체가 재사용되지 않게 한다
+DART_CLIENT_VER = "5"  # DartClient 코드를 바꾸면 이 숫자를 올려서 예전 객체가 재사용되지 않게 한다
 
 
 @st.cache_resource(show_spinner=False)
 def _make_dart(key, ver):
-    return dart_data.DartClient(key)
+    cget, cput = _dart_cache_io()
+    return dart_data.DartClient(key, cget, cput)
+
+
+def _dart_cache_io():
+    """DART 회사 목록 보관본(구글 시트 '회사코드' 탭). 반환: (읽기 함수, 쓰기 함수)"""
+    store = get_store()
+    if store is None:
+        return None, None
+
+    def cget():
+        df = store.read("회사코드", ["종목코드", "고유번호", "갱신일"])
+        if df.empty:
+            return None
+        return dict(zip(df["종목코드"].astype(str).str.zfill(6), df["고유번호"].astype(str))), str(df["갱신일"].iloc[0])
+
+    def cput(m):
+        today = dt.date.today().isoformat()
+        store.write("회사코드", pd.DataFrame({"종목코드": list(m), "고유번호": list(m.values()), "갱신일": today}))
+
+    return cget, cput
 
 
 def get_dart():
+    """반환: (DART 클라이언트 또는 None, 안내 문구). 연결에 실패하면 5분 동안은 다시 시도하지 않아서 화면이 느려지지 않는다."""
+    import time
     key = secret("DART_API_KEY")
     if not key:
-        return None, "DART_API_KEY가 설정되어 있지 않아요."
+        return None, "DART_API_KEY가 설정되어 있지 않아요. Streamlit Secrets에 DART_API_KEY를 넣어 주세요."
+    ts = st.session_state.get("dart_fail_ts")
+    if ts and time.time() - ts < 300:
+        return None, st.session_state.get("dart_fail_msg")
     try:
         return _make_dart(key, DART_CLIENT_VER), None
     except Exception as e:
-        return None, f"DART 연결에 실패했어요: {e}"
+        msg = f"DART에 연결하지 못했어요: {dart_data.redact(e)[:160]} 5분 뒤에 자동으로 다시 시도해요."
+        st.session_state["dart_fail_ts"], st.session_state["dart_fail_msg"] = time.time(), msg
+        return None, msg
 
 
 def load_fincache():
@@ -480,7 +507,7 @@ def fetch_company(code):
     try:
         d = dart_data.fetch_all(dart, code)
     except Exception as e:
-        return None, str(e)
+        return None, dart_data.redact(e)
     st.session_state.fincache[code] = d
     return d, None
 
@@ -999,7 +1026,7 @@ def report_financials(code):
     st.subheader("재무와 안전 점검 (DART)")
     dart, err = get_dart()
     if dart is None:
-        st.info(f"{err} Streamlit Secrets에 DART_API_KEY를 넣으면 재무와 안전 점검이 켜져요.")
+        st.info(err)
         return
     d = st.session_state.fincache.get(code)
     c1, c2 = st.columns([1, 3])
@@ -1471,7 +1498,7 @@ def tab_discover():
     st.markdown("시장 전체에서 후보를 좁히는 깔때기예요. **① 시가총액·거래대금 → ② DART 재무 → ③ 남은 상위 후보만 안전 기준·가격 흐름까지 상세 점검**해요. 통과했다고 사라는 뜻은 아니고, 더 살펴볼 후보라는 뜻이에요.")
     dart, err = get_dart()
     if dart is None:
-        st.warning(f"{err} Streamlit Secrets에 DART_API_KEY를 넣어 주세요.")
+        st.warning(err)
         return
     f = st.session_state.disc_f
     with st.expander("발굴 조건", expanded=False):
@@ -1735,7 +1762,7 @@ def tab_safety():
         return
     dart, err = get_dart()
     if dart is None:
-        st.warning(f"{err} Streamlit Secrets에 DART_API_KEY를 넣어 주세요.")
+        st.warning(err)
         return
     note = admin_notice()
     if note:
@@ -1911,6 +1938,34 @@ def tab_rules():
         reset_settings()
         st.rerun()
     st.caption("숫자를 바꾼 뒤 '규칙 저장'을 눌러야 구글 시트에 남아요. 누르지 않으면 이 화면에서만 적용되고 새로고침하면 사라져요.")
+
+    st.divider()
+    st.markdown("**사용설명서를 구글 시트에 기록**")
+    st.caption("앱 주소, 시트의 탭 설명, 화면별 용도, 매일·매주·매월 작업 순서, 코드 반영 순서를 `사용설명서` 탭에 적어요. 비밀번호·TOKEN·인증키 같은 값은 적지 않아요.")
+    try:
+        cur_url = str(st.context.url)
+    except Exception:
+        cur_url = ""
+    url = st.text_input("앱 주소", value=cur_url.split("?")[0], key="guide_url",
+                        help="자동으로 채워지지 않으면 브라우저 주소창의 앱 주소를 붙여넣으세요.")
+    if st.button("사용설명서 기록", key="guide_write"):
+        store = get_store()
+        try:
+            import guide
+        except ImportError:
+            st.error("guide.py가 없어요. GitHub에 올린 뒤 앱을 다시 시작해 주세요.")
+        else:
+            if store is None:
+                st.warning("데모 모드라서 시트에 쓸 수 없어요.")
+            elif st.session_state.get("load_error"):
+                st.error("구글 시트 연결이 불안정해서 기록하지 않았어요.")
+            else:
+                rows = guide.rows(url)
+                try:
+                    store.write("사용설명서", pd.DataFrame(rows[1:], columns=rows[0]))
+                    st.success(f"구글 시트의 '사용설명서' 탭에 {len(rows) - 1}줄을 기록했어요.")
+                except Exception as e:
+                    st.error(f"기록에 실패했어요: {e}")
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.

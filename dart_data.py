@@ -1,6 +1,7 @@
 """DART(전자공시) 재무·공시 수집. 가져오지 못한 항목은 None(확인 불가)으로 남긴다.
 오류와 '데이터 없음'을 구분해서, 통신 실패가 '문제없음'으로 둔갑하지 않게 한다."""
 import datetime as dt
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -19,6 +20,12 @@ class DartError(Exception):
     pass
 
 
+def redact(text):
+    """오류 문구에서 인증키(crtfc_key)와 접속 주소를 가린다. 화면이나 캡처에 키가 보이면 안 된다."""
+    t = re.sub(r"crtfc_key=[0-9A-Za-z]+", "crtfc_key=***", str(text))
+    return re.sub(r"https?://\S+", "(주소 생략)", t)
+
+
 def _num(x):
     try:
         s = str(x).replace(",", "").strip()
@@ -35,9 +42,16 @@ def _norm(s):
 
 def _call(api_key, endpoint, params, timeout=25):
     """성공이면 JSON dict, '조회된 데이터 없음(013)'이면 빈 list, 그 외는 DartError."""
-    r = requests.get(BASE + endpoint + ".json", params=dict(params, crtfc_key=api_key), timeout=timeout)
-    r.raise_for_status()
-    jo = r.json()
+    try:
+        r = requests.get(BASE + endpoint + ".json", params=dict(params, crtfc_key=api_key), timeout=timeout)
+        r.raise_for_status()
+        jo = r.json()
+    except requests.Timeout:
+        raise DartError("DART 서버가 제때 응답하지 않았어요(시간 초과). 잠시 뒤에 다시 시도해 주세요.")
+    except requests.RequestException as e:
+        raise DartError(f"DART 접속에 실패했어요({type(e).__name__}).")
+    except ValueError:
+        raise DartError("DART 응답을 읽지 못했어요(형식이 달라요).")
     status = str(jo.get("status", ""))
     if status == "000":
         return jo
@@ -47,19 +61,29 @@ def _call(api_key, endpoint, params, timeout=25):
 
 
 class DartClient:
-    """DART 접속. 종목코드 -> 회사 고유번호 목록(corpCode.xml)을 직접 받아서 쓴다(외부 라이브러리 없음)."""
+    """DART 접속. 종목코드 -> 회사 고유번호 목록(corpCode.xml)을 직접 받아서 쓴다(외부 라이브러리 없음).
+    DART 서버가 느릴 때를 대비해 목록을 구글 시트에도 한 번씩 보관하고, 접속이 안 되면 그 보관본을 쓴다."""
 
-    def __init__(self, api_key):
+    def __init__(self, api_key, cache_get=None, cache_put=None):
         self.api_key = api_key
-        self._map = self._load_map()
+        self.from_backup = False
+        self._map = self._load_map(cache_get, cache_put)
 
-    def _load_map(self):
+    def _download(self):
         import io
         import xml.etree.ElementTree as ET
         import zipfile
 
-        r = requests.get(BASE + "corpCode.xml", params={"crtfc_key": self.api_key}, timeout=60)
-        r.raise_for_status()
+        last = None
+        for _ in range(2):  # 연결은 10초, 내려받기는 60초까지 기다리고 한 번 더 시도한다
+            try:
+                r = requests.get(BASE + "corpCode.xml", params={"crtfc_key": self.api_key}, timeout=(10, 60))
+                r.raise_for_status()
+                break
+            except requests.RequestException as e:
+                last = e
+        else:
+            raise DartError("DART 서버에 연결하지 못했어요(시간 초과)." if isinstance(last, requests.Timeout) else f"DART 접속에 실패했어요({type(last).__name__}).")
         try:
             zf = zipfile.ZipFile(io.BytesIO(r.content))
         except zipfile.BadZipFile:
@@ -77,6 +101,29 @@ class DartClient:
                 m[sc.zfill(6)] = (it.findtext("corp_code") or "").strip()
         if not m:
             raise DartError("DART 회사 목록이 비어 있어요.")
+        return m
+
+    def _load_map(self, cache_get, cache_put):
+        backup = None
+        if cache_get:
+            try:
+                backup = cache_get()  # (목록 dict, 보관한 날짜) 또는 None
+            except Exception:
+                backup = None
+        try:
+            m = self._download()
+        except DartError as e:
+            if backup and backup[0]:
+                self.from_backup = True
+                return backup[0]
+            raise DartError(redact(str(e)))
+        if cache_put:
+            try:
+                fresh = backup and backup[1] and (dt.date.today() - dt.date.fromisoformat(backup[1])).days < 30
+                if not fresh:
+                    cache_put(m)
+            except Exception:
+                pass
         return m
 
     def resolve(self, stock_code):
