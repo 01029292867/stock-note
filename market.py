@@ -22,7 +22,7 @@ def _start(days: int) -> str:
     return (dt.date.today() - dt.timedelta(days=days)).isoformat()
 
 
-def history_kr(code: str, days: int = 420) -> pd.DataFrame:
+def history_kr(code: str, days: int = 800) -> pd.DataFrame:
     """국내 종목 일봉 종가. FinanceDataReader 먼저, 실패하면 야후(.KS/.KQ)로 시도."""
     code = str(code).strip().zfill(6)
     try:
@@ -100,3 +100,19 @@ def avg_trading_value_eok(df: pd.DataFrame, n: int = 20):
         return None
     v = (df["Close"] * df["Volume"]).tail(n).dropna()
     return float(v.mean() / 1e8) if len(v) else None
+
+
+def history_index(days: int = 1000) -> pd.DataFrame:
+    """코스피 지수 종가(판단 결과를 시장과 비교할 때 쓴다)."""
+    try:
+        import FinanceDataReader as fdr
+        df = _clean(fdr.DataReader("KS11", _start(days)))
+        if len(df) > 0:
+            return df
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        return _clean(yf.download("^KS11", start=_start(days), progress=False, auto_adjust=True))
+    except Exception:
+        return pd.DataFrame(columns=["Close"])
