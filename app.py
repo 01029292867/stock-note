@@ -12,6 +12,7 @@ import streamlit as st
 import dart_data
 import discover
 import market
+import perf
 import safety
 import signals as sg
 from store import GasStore
@@ -108,12 +109,13 @@ def load_settings():
         return
     try:
         df = store.read("설정", SETTINGS_COLS)
-        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc")}
+        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc", "goal")}
     except Exception:
         return  # 설정을 못 읽으면 기본값으로 시작한다(저장된 값을 지우지는 않는다)
     _merge(st.session_state.rules, saved.get("rules"))
     _merge(st.session_state.safe, saved.get("safe"))
     _merge(st.session_state.disc_f, saved.get("disc"))
+    _merge(st.session_state.goal, saved.get("goal"))
 
 
 def save_settings():
@@ -126,7 +128,8 @@ def save_settings():
     try:
         rows = [["rules", json.dumps(st.session_state.rules, ensure_ascii=False)],
                 ["safe", json.dumps(st.session_state.safe, ensure_ascii=False)],
-                ["disc", json.dumps(st.session_state.disc_f, ensure_ascii=False)]]
+                ["disc", json.dumps(st.session_state.disc_f, ensure_ascii=False)],
+                ["goal", json.dumps(st.session_state.goal, ensure_ascii=False)]]
         store.write("설정", pd.DataFrame(rows, columns=SETTINGS_COLS))
         return True, "규칙을 저장했어요. 이제 새로고침하거나 폰에서 열어도 그대로예요."
     except Exception as e:
@@ -137,8 +140,9 @@ def reset_settings():
     st.session_state.rules = copy.deepcopy(sg.DEFAULT_RULES)
     st.session_state.safe = safety.default_rules()
     st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
+    st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_")) or k in ("l_t", "s_t", "d_maxn"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("l_t", "s_t", "d_maxn"):
             del st.session_state[k]
 
 
@@ -174,6 +178,84 @@ def add_watch(items):
             store.write("관심종목", df)
         st.session_state.watch = df
         return True, f"{len(new)}개를 관심종목에 추가했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+
+# ---------- 성과 기록 (구글 시트 '자산기록'·'입출금' 탭) ----------
+def snaps_view(df):
+    """편집·저장용: 날짜는 글자, 금액은 숫자로 맞춘다."""
+    d = df.copy()
+    for c in perf.SNAP_COLS:
+        if c not in d.columns:
+            d[c] = None
+    for c in ("주식", "현금", "총자산"):
+        d[c] = pd.to_numeric(d[c].astype(str).str.replace(",", "", regex=False).replace({"": None, "None": None, "nan": None}), errors="coerce")
+    for c in ("날짜", "구분", "메모"):
+        d[c] = d[c].fillna("").astype(str)
+    return d[perf.SNAP_COLS].reset_index(drop=True)
+
+
+def flows_view(df):
+    d = df.copy()
+    for c in perf.FLOW_COLS:
+        if c not in d.columns:
+            d[c] = None
+    d["금액"] = pd.to_numeric(d["금액"].astype(str).str.replace(",", "", regex=False).replace({"": None, "None": None, "nan": None}), errors="coerce")
+    for c in ("날짜", "메모"):
+        d[c] = d[c].fillna("").astype(str)
+    return d[perf.FLOW_COLS].reset_index(drop=True)
+
+
+def load_perf():
+    if "perf_snaps" in st.session_state:
+        return
+    snaps, flows = pd.DataFrame(columns=perf.SNAP_COLS), pd.DataFrame(columns=perf.FLOW_COLS)
+    err = None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            snaps = store.read("자산기록", perf.SNAP_COLS)
+            flows = store.read("입출금", perf.FLOW_COLS)
+        except Exception as e:
+            err = str(e)  # 읽지 못한 상태에서 저장하면 기존 기록을 덮어쓰므로 저장을 막는다
+    st.session_state.perf_snaps = snaps_view(snaps)
+    st.session_state.perf_flows = flows_view(flows)
+    st.session_state.perf_err = err
+
+
+def _to_store_text(df, num_cols):
+    d = df.copy()
+    for c in num_cols:
+        d[c] = d[c].map(lambda x: "" if pd.isna(x) else str(int(round(float(x)))))
+    return d
+
+
+def save_perf(snaps=None, flows=None):
+    """반환: (성공, 문구)"""
+    store = get_store()
+    if store is not None and (st.session_state.get("load_error") or st.session_state.get("perf_err")):
+        return False, "구글 시트에서 기록을 읽지 못한 상태라 저장을 막았어요."
+    try:
+        if snaps is not None:
+            c = perf.clean_snaps(snaps)
+            c["날짜"] = c["날짜"].dt.strftime("%Y-%m-%d")
+            c["구분"] = c["구분"].fillna("").replace("", "수동")
+            c["메모"] = c["메모"].fillna("")
+            out = _to_store_text(c[perf.SNAP_COLS], ["주식", "현금", "총자산"])
+            if store is not None:
+                store.write("자산기록", out)
+            st.session_state.perf_snaps = snaps_view(out)
+        if flows is not None:
+            c = perf.clean_flows(flows)
+            c["날짜"] = c["날짜"].dt.strftime("%Y-%m-%d")
+            c["메모"] = c["메모"].fillna("")
+            out = _to_store_text(c[perf.FLOW_COLS], ["금액"])
+            if store is not None:
+                store.write("입출금", out)
+            st.session_state.perf_flows = flows_view(out)
+        return True, "저장했어요." if store is not None else "임시로 반영했어요(데모 모드라서 저장되지는 않아요)."
     except Exception as e:
         return False, f"저장에 실패했어요: {e}"
 
@@ -889,6 +971,150 @@ def tab_discover():
         (st.success if ok else st.error)(msg)
 
 
+
+# ---------- 목표·성과 ----------
+def current_stock_value(rules):
+    """지금 보유 주식의 평가금액 합계. 시세를 하나라도 못 가져오면 (None, 못 가져온 종목)."""
+    hold, kakao = st.session_state.hold, st.session_state.kakao
+    pos = build_positions(hold, rules) if len(hold) else pd.DataFrame()
+    kk = build_kakao(kakao) if len(kakao) else pd.DataFrame()
+    missing = (pos[pos["평가금액"].isna()]["종목명"].tolist() if len(pos) else []) + (kk[kk["평가금액"].isna()]["종목명"].tolist() if len(kk) else [])
+    if missing:
+        return None, missing
+    val = (pos["평가금액"].sum() if len(pos) else 0.0) + (kk["평가금액"].sum() if len(kk) else 0.0)
+    return float(val), []
+
+
+def tab_perf(rules):
+    st.markdown("매달 총자산을 기록해서 **올해 수익률**과 **고점 대비 낙폭**을 보는 화면이에요. 총자산은 **주식 평가금액 + 현금**이고, 새로 넣은 돈(입금)은 수익으로 치지 않아요. 기록은 앱을 연 날 하루 한 번 자동으로 남아요.")
+    store = get_store()
+    if store is None:
+        st.warning("데모 모드라서 기록이 저장되지 않아요.")
+    if st.session_state.get("perf_err"):
+        st.error(f"구글 시트에서 자산 기록을 읽지 못해서 저장을 막았어요. ({st.session_state['perf_err']})")
+    goal = st.session_state.goal
+    with st.expander("올해 목표 설정", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        goal["min"] = c1.number_input("기대 범위 하단(%)", value=float(goal["min"]), step=0.5, key="g_min")
+        goal["max"] = c2.number_input("기대 범위 상단(%)", value=float(goal["max"]), step=0.5, key="g_max")
+        goal["dd"] = c3.number_input("허용 낙폭(%)", value=float(goal["dd"]), step=1.0, key="g_dd", help="고점 대비 이만큼 내려가면 경고해요")
+        goal["kakao_flow"] = st.checkbox("카카오 정기매수를 외부에서 들어온 돈(입금)으로 계산", value=bool(goal["kakao_flow"]), key="g_kk",
+                                         help="월급 등 계좌 밖의 돈으로 사는 거라면 켜 두세요. 이미 증권 계좌 안 현금으로 사는 거라면 끄세요.")
+        st.caption("목표는 약속이 아니라 점검 기준이에요. 해마다 시장이 달라서, 범위를 벗어난 해에도 만회하려고 위험을 키우지 않는 게 중요해요.")
+        if st.button("목표 저장", key="g_save"):
+            ok, msg = save_settings()
+            (st.success if ok else st.error)(msg)
+
+    stock_val, missing = current_stock_value(rules)
+    snaps_raw = st.session_state.perf_snaps
+    snaps = perf.clean_snaps(snaps_raw)
+    last_cash = float(snaps["현금"].dropna().iloc[-1]) if len(snaps) and snaps["현금"].notna().any() else 0.0
+    today = pd.Timestamp(dt.date.today())
+
+    # 하루 한 번 자동 기록
+    if (stock_val and stock_val > 0 and st.session_state.get("perf_auto") != str(today.date())
+            and not st.session_state.get("perf_err") and not st.session_state.get("load_error")
+            and not (len(snaps) and (snaps["날짜"] == today).any())):
+        st.session_state.perf_auto = str(today.date())
+        row = pd.DataFrame([[str(today.date()), stock_val, last_cash, stock_val + last_cash, "자동", "현금은 마지막 기록값"]], columns=perf.SNAP_COLS)
+        ok, msg = save_perf(snaps=pd.concat([snaps_view(snaps_raw), row], ignore_index=True))
+        if ok:
+            snaps_raw = st.session_state.perf_snaps
+            snaps = perf.clean_snaps(snaps_raw)
+        else:
+            st.error(f"오늘 자산을 자동으로 기록하지 못했어요: {msg}")
+    if missing:
+        st.warning("시세를 가져오지 못한 종목이 있어서 오늘 자산을 자동 기록하지 않았어요: " + ", ".join(missing))
+
+    flows = perf.all_flows(st.session_state.perf_flows, st.session_state.kakao, goal["kakao_flow"],
+                           snaps["날짜"].min() if len(snaps) else today, snaps["날짜"].max() if len(snaps) else today)
+    ser = perf.build_series(snaps, flows) if len(snaps) else None
+    ys = perf.year_stats(ser, today.year) if ser is not None else None
+
+    if ys is None:
+        st.info("수익률을 계산하려면 **기준이 되는 기록 하나**와 **오늘 기록**이 필요해요. 오늘 기록은 자동으로 남으니, 아래 '자산 기록 관리'에서 **연초(작년 12월 말) 총자산을 직접 한 줄 추가**해 주세요. 증권사 앱의 그날 평가금액을 합친 값이면 돼요.")
+    else:
+        dd = perf.drawdown(ser)
+        ydd = perf.drawdown(ser, since=ys["base_date"])
+        k = st.columns(4)
+        k[0].metric("총자산(최근 기록)", man(ys["end_total"]), f"기록일 {ys['end_date'].date()}", delta_color="off")
+        k[1].metric("올해 수익률(입금 보정)", pct(ys["twr"] * 100))
+        k[2].metric("올해 손익", man(ys["profit"]))
+        k[3].metric("고점 대비 낙폭", pct(dd["current"] * 100), f"올해 최대 {ydd['max'] * 100:.1f}%", delta_color="off")
+        st.caption(f"{ys['base_date'].date()}부터 {ys['end_date'].date()}까지 계산했어요. 단순 증감은 {pct(ys['simple'] * 100)}이고, 그 사이 입금(+)·출금(-)은 합계 {man(ys['flow'])}이에요. 차이가 크면 입금 기록을 확인해 보세요.")
+        if ys["approx_base"]:
+            st.warning(f"작년 말 기록이 없어서 올해 첫 기록({ys['base_date'].date()})을 기준으로 계산했어요. 연초 이후 변화가 일부 빠졌을 수 있어요.")
+        age = (today - ys["end_date"]).days
+        if age >= 7:
+            st.warning(f"마지막 기록이 {age}일 전이에요. 그 사이 현금이나 입출금이 바뀌었다면 아래에서 기록을 갱신해 주세요.")
+        cur, lo, hi = ys["twr"] * 100, float(goal["min"]), float(goal["max"])
+        state = "범위 아래" if cur < lo else ("범위 안" if cur <= hi else "범위 위")
+        st.write(f"**올해 목표 범위 {lo:g}~{hi:g}%** 중 현재 **{cur:.1f}%** — {state}")
+        st.progress(float(min(max(cur / hi, 0.0), 1.0)) if hi > 0 else 0.0)
+        left = (pd.Timestamp(year=today.year, month=12, day=31) - today).days
+        st.caption(f"올해 남은 기간은 {left}일이에요. 목표는 점검 기준일 뿐이고, 못 미쳐도 위험을 키워 만회하려 하지 않는 게 좋아요.")
+        if dd["current"] * 100 <= -float(goal["dd"]):
+            st.error(f"고점 대비 {dd['current'] * 100:.1f}%로 허용 낙폭(-{goal['dd']:g}%)을 넘었어요. 보유 종목을 점검하고, 산 이유가 아직 유효한지 먼저 확인해 보세요.")
+        a, b = st.columns(2)
+        with a:
+            st.markdown("**총자산 추이**")
+            st.altair_chart(alt.Chart(ser).mark_line(point=True, color="#0F6B63").encode(
+                x=alt.X("날짜:T", title=None), y=alt.Y("총자산:Q", scale=alt.Scale(zero=False), title=None),
+                tooltip=["날짜:T", alt.Tooltip("총자산:Q", format=",.0f")]).properties(height=240), width="stretch")
+        with b:
+            st.markdown("**고점 대비 낙폭**")
+            sdf = dd["series"].copy()
+            sdf["낙폭(%)"] = sdf["낙폭"] * 100
+            st.altair_chart(alt.Chart(sdf).mark_area(color="#2A63D4", opacity=0.5).encode(
+                x=alt.X("날짜:T", title=None), y=alt.Y("낙폭(%):Q", title=None),
+                tooltip=["날짜:T", alt.Tooltip("낙폭(%):Q", format=".1f")]).properties(height=240), width="stretch")
+        st.markdown("**월말 자산**")
+        me = perf.month_end(ser).copy()
+        me["월말 총자산(만원)"] = (me["월말 총자산"] / 1e4).round(0)
+        me["월간 수익률(%)"] = (me["월간 수익률"] * 100).round(1)
+        me["입출금(만원)"] = (me["입출금"] / 1e4).round(0)
+        st.dataframe(me[["월", "월말 총자산(만원)", "월간 수익률(%)", "입출금(만원)"]].iloc[::-1], width="stretch", hide_index=True,
+                     column_config={"월말 총자산(만원)": st.column_config.NumberColumn(format="%,d"), "입출금(만원)": st.column_config.NumberColumn(format="%,d")})
+        st.caption("월말 자산은 그 달 마지막 기록이에요. 앱을 열지 않은 날은 기록이 없으니, 월말에는 한 번 열어서 현금도 같이 갱신해 주세요.")
+
+    with st.expander("자산 기록 관리 (현금·연초 기준·입출금)", expanded=ys is None):
+        c1, c2 = st.columns([2, 1])
+        cash = c1.number_input("지금 현금(예수금 합계, 원)", min_value=0, value=int(last_cash), step=100000, key="g_cash",
+                               help="증권사 계좌들의 예수금을 합친 값이에요. 총자산 = 주식 평가금액 + 현금이에요.")
+        if c2.button("지금 기록하기", type="primary", key="g_rec"):
+            if stock_val is None:
+                st.error("시세를 가져오지 못한 종목이 있어서 기록하지 못했어요.")
+            else:
+                base = snaps_view(st.session_state.perf_snaps)
+                base = base[base["날짜"] != str(today.date())]
+                row = pd.DataFrame([[str(today.date()), stock_val, float(cash), stock_val + float(cash), "수동", ""]], columns=perf.SNAP_COLS)
+                ok, msg = save_perf(snaps=pd.concat([base, row], ignore_index=True))
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.session_state.pop("g_snaps_ed", None)
+                    st.rerun()
+        st.markdown("**자산 기록** — 연초 기준을 넣을 때는 날짜(예: 2025-12-31)와 총자산만 적으면 돼요. 잘못된 줄은 삭제할 수 있어요.")
+        ed = st.data_editor(snaps_view(st.session_state.perf_snaps), num_rows="dynamic", width="stretch", hide_index=True, key="g_snaps_ed",
+                            column_config={"날짜": st.column_config.TextColumn(help="2026-01-31 형식"),
+                                           "주식": st.column_config.NumberColumn(format="%,d"), "현금": st.column_config.NumberColumn(format="%,d"),
+                                           "총자산": st.column_config.NumberColumn(format="%,d")})
+        if st.button("자산 기록 저장", key="g_snaps_save"):
+            ok, msg = save_perf(snaps=ed)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.session_state.pop("g_snaps_ed", None)
+                st.rerun()
+        st.markdown("**입출금** — 증권 계좌 밖에서 들어온 돈은 +, 빠져나간 돈은 -로 적어요(예: 2026-03-15, 50000000). 주식 사고팔기는 입출금이 아니에요.")
+        fe = st.data_editor(flows_view(st.session_state.perf_flows), num_rows="dynamic", width="stretch", hide_index=True, key="g_flows_ed",
+                            column_config={"날짜": st.column_config.TextColumn(help="2026-03-15 형식"), "금액": st.column_config.NumberColumn(format="%,d")})
+        if st.button("입출금 저장", key="g_flows_save"):
+            ok, msg = save_perf(flows=fe)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.session_state.pop("g_flows_ed", None)
+                st.rerun()
+
+
 def tab_safety():
     st.markdown("보유 종목의 재무·공시 데이터를 DART에서 가져와 **내 안전 기준**과 비교해요. 한 번 가져오면 구글 시트에 저장돼서 "
                 f"{FRESH_DAYS}일 동안은 다시 가져오지 않아요. 안전 기준 숫자는 '규칙' 탭에서 바꿔요.")
@@ -986,16 +1212,21 @@ def main():
         st.session_state.safe = safety.default_rules()
     if "disc_f" not in st.session_state:
         st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
+    if "goal" not in st.session_state:
+        st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
     load_settings()
     load_watch()
+    load_perf()
     load_fincache()
     rules = st.session_state.rules
 
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
-    t1, t5, t2, t3, t4 = st.tabs(["내 자산", "종목 발굴", "안전 점검", "종목 리포트", "규칙"])
+    t1, t6, t5, t2, t3, t4 = st.tabs(["내 자산", "목표·성과", "종목 발굴", "안전 점검", "종목 리포트", "규칙"])
     with t1:
         tab_assets(rules)
+    with t6:
+        tab_perf(rules)
     with t5:
         tab_discover()
     with t2:
