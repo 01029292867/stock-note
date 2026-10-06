@@ -52,11 +52,22 @@ class DartClient:
         self.api_key = api_key
         self._r = OpenDartReader(api_key)
 
+    def resolve(self, stock_code):
+        """종목코드 -> (회사 고유번호, 실제 조회에 쓴 종목코드).
+        우선주(코드 끝자리 5·7·9·K·L·M)는 DART에 따로 등록돼 있지 않아서 보통주 회사로 연결한다."""
+        code = str(stock_code).zfill(6)
+        c = self._r.find_corp_code(code)
+        if c:
+            return c, code
+        if code[-1] in "579KLM":
+            base = code[:5] + "0"
+            c = self._r.find_corp_code(base)
+            if c:
+                return c, base
+        raise DartError("DART에서 이 종목코드의 회사를 찾지 못했어요(상장사가 맞는지 확인하세요).")
+
     def corp_code(self, stock_code):
-        c = self._r.find_corp_code(str(stock_code).zfill(6))
-        if not c:
-            raise DartError("DART에서 이 종목코드의 회사를 찾지 못했어요(상장사가 맞는지 확인하세요).")
-        return c
+        return self.resolve(stock_code)[0]
 
 
 # ---------- 항목별 수집 ----------
@@ -187,7 +198,11 @@ def fetch_all(client, stock_code, today=None):
     """한 종목의 DART 데이터를 모은다. 반환값은 JSON 저장이 가능한 dict."""
     today = today or dt.date.today()
     ty = today.year
-    corp = client.corp_code(stock_code)
+    code = str(stock_code).zfill(6)
+    if hasattr(client, "resolve"):
+        corp, used = client.resolve(code)
+    else:
+        corp, used = client.corp_code(code), code
     start = (today.replace(year=today.year - 3)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
     tasks = {
@@ -200,7 +215,9 @@ def fetch_all(client, stock_code, today=None):
         "issues": lambda: _count_events(client, corp, EVENT_KEYS, start, end),
         "distress": lambda: _count_events(client, corp, DISTRESS_KEYS, start, end),
     }
-    result = {"code": str(stock_code).zfill(6), "fetched": today.isoformat(), "errors": {}}
+    result = {"code": code, "fetched": today.isoformat(), "errors": {}}
+    if used != code:
+        result["resolved_code"] = used  # 우선주는 보통주 회사의 재무로 점검한다
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {k: ex.submit(f) for k, f in tasks.items()}
         for k, f in futs.items():

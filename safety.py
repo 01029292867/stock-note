@@ -26,6 +26,8 @@ def default_rules():
 def derive(d, price=None, tv_eok=None):
     """DART 원자료 d(dict)와 시세에서 판단용 지표를 만든다."""
     m = {"is_fin": False}
+    m["is_pref"] = bool((d or {}).get("resolved_code"))
+    m["resolved_code"] = (d or {}).get("resolved_code")
     comp = (d or {}).get("company") or {}
     m["name"] = comp.get("name") or ""
     m["is_fin"] = str(comp.get("induty", "")).startswith(FIN_PREFIX)
@@ -61,7 +63,8 @@ def derive(d, price=None, tv_eok=None):
     m["major"] = mj.get("ratio") if mj else None
     sh = (d or {}).get("shares")
     m["shares"] = sh.get("common") if sh else None
-    m["cap_jo"] = (price * m["shares"] / 1e12) if (price and m["shares"]) else None
+    # 우선주 가격에 보통주 주식 수를 곱하면 틀려서, 우선주는 시가총액을 계산하지 않는다
+    m["cap_jo"] = (price * m["shares"] / 1e12) if (price and m["shares"] and not m["is_pref"]) else None
     au = (d or {}).get("audit")
     m["audit"] = au.get("opinion") if au else None
     if au and au.get("opinion"):
@@ -94,7 +97,7 @@ def evaluate(m, rules):
         v = m["cap_jo"]
         lab = f"시가총액 {f['cap']['v']:g}조원 이상"
         out.append(_r("cap", lab, "unknown" if v is None else ("pass" if v >= f["cap"]["v"] else "fail"),
-                      "확인 불가" if v is None else f"{v:,.2f}조원"))
+                      ("우선주는 보통주 회사 기준이라 계산하지 않아요" if m.get("is_pref") else "확인 불가") if v is None else f"{v:,.2f}조원"))
     if f["loss"]["on"]:
         n = m["loss_n"]
         lab = f"최근 3년 영업적자 {f['loss']['v']:g}번 이하"

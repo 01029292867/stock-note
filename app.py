@@ -452,6 +452,8 @@ def report_financials(code):
     sres = safety_for(code)
     m, items = sres
     cnt = safety.summarize(items)
+    if m.get("is_pref"):
+        st.info(f"우선주예요. 재무와 공시는 보통주 회사({m['resolved_code']}) 기준으로 점검하고, 시가총액은 계산하지 않아요.")
     if m.get("name"):
         st.write(f"**{m['name']}**" + (" · 금융업" if m["is_fin"] else "") + (f" · {m['fin_year']}년 사업보고서({'연결' if m['fs'] == 'CFS' else '별도'}) 기준" if m["fin_year"] else ""))
     k = st.columns(5)
