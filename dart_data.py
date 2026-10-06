@@ -69,6 +69,14 @@ class DartClient:
     def corp_code(self, stock_code):
         return self.resolve(stock_code)[0]
 
+    def corp_map(self):
+        """{종목코드: 회사 고유번호} (상장사만)"""
+        if not hasattr(self, "_map"):
+            df = self._r.corp_codes
+            df = df[df["stock_code"].fillna("").astype(str).str.strip().ne("")]
+            self._map = dict(zip(df["stock_code"].astype(str).str.zfill(6), df["corp_code"].astype(str)))
+        return self._map
+
 
 # ---------- 항목별 수집 ----------
 def _pick(rows, sjs, ids, names):

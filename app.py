@@ -5,10 +5,12 @@ import hmac
 import json
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 import dart_data
+import discover
 import market
 import safety
 import signals as sg
@@ -23,12 +25,14 @@ KAKAO_COLS = ["종목명", "티커", "하루금액", "시작일"]
 CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
+WATCH_COLS = ["종목코드", "종목명"]
 FRESH_DAYS = 7  # 재무·공시 데이터를 이 기간 안에는 다시 가져오지 않는다
 STATUS_ICON = {"pass": "✅", "fail": "❌", "unknown": "❔", "na": "➖"}
 SAFE_LABELS = {
     "cap": ("시가총액", "조원 이상"), "loss": ("최근 3년 영업적자", "번 이하"), "cover": ("이자보상배율", "배 이상"),
     "debt": ("부채비율", "% 이하"), "ocf": ("영업활동현금흐름 흑자", None), "impair": ("자본잠식 없음", None),
     "audit": ("감사의견 적정", None), "distress": ("부도·회생·관리절차 공시 없음", None),
+    "admin": ("관리종목 지정 없음", None),
     "divy": ("최근 3년 중 현금배당", "년 이상"), "major": ("최대주주 지분율", "% 이상"),
     "issue": ("최근 3년 유상증자·전환사채 등 발행", "번 이하"), "tv": ("일평균 거래대금", "억원 이상"),
 }
@@ -104,11 +108,12 @@ def load_settings():
         return
     try:
         df = store.read("설정", SETTINGS_COLS)
-        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe")}
+        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc")}
     except Exception:
         return  # 설정을 못 읽으면 기본값으로 시작한다(저장된 값을 지우지는 않는다)
     _merge(st.session_state.rules, saved.get("rules"))
     _merge(st.session_state.safe, saved.get("safe"))
+    _merge(st.session_state.disc_f, saved.get("disc"))
 
 
 def save_settings():
@@ -120,7 +125,8 @@ def save_settings():
         return False, "구글 시트 연결이 불안정해서 저장하지 않았어요."
     try:
         rows = [["rules", json.dumps(st.session_state.rules, ensure_ascii=False)],
-                ["safe", json.dumps(st.session_state.safe, ensure_ascii=False)]]
+                ["safe", json.dumps(st.session_state.safe, ensure_ascii=False)],
+                ["disc", json.dumps(st.session_state.disc_f, ensure_ascii=False)]]
         store.write("설정", pd.DataFrame(rows, columns=SETTINGS_COLS))
         return True, "규칙을 저장했어요. 이제 새로고침하거나 폰에서 열어도 그대로예요."
     except Exception as e:
@@ -130,9 +136,46 @@ def save_settings():
 def reset_settings():
     st.session_state.rules = copy.deepcopy(sg.DEFAULT_RULES)
     st.session_state.safe = safety.default_rules()
+    st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     for k in list(st.session_state.keys()):
-        if k.startswith("s_on_") or k.startswith("s_v_") or k in ("l_t", "s_t"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_")) or k in ("l_t", "s_t", "d_maxn"):
             del st.session_state[k]
+
+
+
+# ---------- 관심종목 (구글 시트 '관심종목' 탭) ----------
+def load_watch():
+    if "watch" in st.session_state:
+        return
+    df = pd.DataFrame(columns=WATCH_COLS)
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("관심종목", WATCH_COLS)
+            df["종목코드"] = df["종목코드"].astype(str).str.strip().str.zfill(6)
+        except Exception:
+            pass
+    st.session_state.watch = df.reset_index(drop=True)
+
+
+def add_watch(items):
+    """items: [(코드, 이름)]. 반환: (성공, 문구)"""
+    cur = st.session_state.watch
+    have = set(cur["종목코드"])
+    new = [(c, n) for c, n in items if c not in have]
+    if not new:
+        return True, "이미 모두 관심종목에 있어요."
+    df = pd.concat([cur, pd.DataFrame(new, columns=WATCH_COLS)], ignore_index=True)
+    store = get_store()
+    try:
+        if store is not None:
+            if st.session_state.get("load_error"):
+                return False, "구글 시트 연결이 불안정해서 저장하지 않았어요."
+            store.write("관심종목", df)
+        st.session_state.watch = df
+        return True, f"{len(new)}개를 관심종목에 추가했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
 
 
 # ---------- 데이터 정리 ----------
@@ -252,6 +295,19 @@ def fetch_company(code):
     return d, None
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def _admin_cached():
+    return sorted(discover.load_admin_codes())
+
+
+def admin_codes():
+    """관리종목 코드 집합. 거래소 목록을 못 불러오면 None(확인 불가)."""
+    try:
+        return set(_admin_cached())
+    except Exception:
+        return None
+
+
 def safety_for(code):
     """캐시에 있는 DART 데이터로 안전 점검. 아직 안 가져왔으면 None."""
     d = st.session_state.get("fincache", {}).get(code)
@@ -259,7 +315,8 @@ def safety_for(code):
         return None
     df = hist_kr(code)
     price = float(df["Close"].iloc[-1]) if len(df) else None
-    m = safety.derive(d, price, market.avg_trading_value_eok(df))
+    adm = admin_codes()
+    m = safety.derive(d, price, market.avg_trading_value_eok(df), None if adm is None else (code in adm))
     return m, safety.evaluate(m, st.session_state.safe)
 
 
@@ -277,6 +334,22 @@ def hist_us(ticker):
 @st.cache_data(ttl=900, show_spinner=False)
 def hist_fx():
     return market.history_fx()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def listing_cached():
+    return discover.load_listing()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def bulk_cached(codes):
+    dart, err = get_dart()
+    if dart is None:
+        raise RuntimeError(err)
+    fin, errs = discover.bulk_financials(dart, list(codes))
+    if not fin and errs:
+        raise RuntimeError(errs[0])  # 실패한 결과는 캐시에 남기지 않는다
+    return fin, errs
 
 
 # ---------- 계산 ----------
@@ -532,7 +605,7 @@ def report_financials(code):
     else:
         st.success("내 안전 기준을 모두 통과했어요.")
     render_safety(items)
-    st.caption("안전 기준을 통과해도 안전하다는 보증은 아니에요. 투자경고·관리종목 지정 여부는 DART에서 가져올 수 없어서 이번 점검에 포함되지 않아요.")
+    st.caption("안전 기준을 통과해도 안전하다는 보증은 아니에요. 관리종목은 거래소 목록으로 확인하고, 투자경고·투자주의 지정은 점검에 포함되지 않아요.")
     with st.expander("근거 데이터 보기 (증권사 앱·네이버 금융과 비교해 보세요)"):
         st.json(d)
 
@@ -540,6 +613,11 @@ def report_financials(code):
 def tab_report(rules):
     hold = st.session_state.hold
     opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · {r['증권사']}": r for r in hold.to_dict("records")}
+    held_codes = set(hold["종목코드"])
+    for w in st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS)).to_dict("records"):
+        if w["종목코드"] not in held_codes:
+            opts[f"{w['종목명'] or w['종목코드']} ({w['종목코드']}) · 관심"] = {
+                "증권사": "-", "종목코드": w["종목코드"], "종목명": w["종목명"], "꼬리표": "중장기", "수량": 0, "평균단가": 0}
     labels = list(opts) + ["직접 입력"]
     pick = st.selectbox("종목 선택", labels)
     if pick == "직접 입력":
@@ -598,6 +676,190 @@ def tab_report(rules):
 
 
 
+
+# ---------- 종목 발굴 ----------
+def disc_filters_ui(f):
+    def row(key, label, unit, step=1.0):
+        a, b = st.columns([3, 2])
+        f[key]["on"] = a.checkbox(label, value=f[key]["on"], key=f"d_on_{key}")
+        if unit:
+            f[key]["v"] = b.number_input(unit, value=float(f[key]["v"]), step=step, key=f"d_v_{key}")
+    p1, p2, _ = st.columns([1, 1, 3])
+    if p1.button("가치 중심 기본", key="d_p1"):
+        st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
+        for k in list(st.session_state.keys()):
+            if k.startswith(("d_on_", "d_v_")) or k == "d_maxn":
+                del st.session_state[k]
+        st.rerun()
+    if p2.button("성장 중심", key="d_p2"):
+        g = copy.deepcopy(discover.DEFAULT_FILTERS)
+        g["roe"]["v"], g["per"]["v"], g["debt"]["v"], g["growth"]["on"] = 12.0, 25.0, 150.0, True
+        st.session_state.disc_f = g
+        for k in list(st.session_state.keys()):
+            if k.startswith(("d_on_", "d_v_")) or k == "d_maxn":
+                del st.session_state[k]
+        st.rerun()
+    st.markdown("**1단계 — 시장 목록 필터** (바꾸면 아래 '시장 데이터 불러오기'를 다시 눌러요)")
+    row("cap", "시가총액", "조원 이상", 0.5)
+    row("tv", "일 거래대금", "억원 이상", 10.0)
+    f["maxn"] = int(st.number_input("2단계에서 조회할 최대 종목 수(시가총액 큰 순)", min_value=50, max_value=1000, value=int(f["maxn"]), step=50, key="d_maxn"))
+    st.markdown("**2단계 — 재무 조건** (바로 반영돼요)")
+    row("profit", "최근 영업이익 흑자", None)
+    row("loss", "최근 3년 영업적자", "번 이하")
+    row("debt", "부채비율", "% 이하", 10.0)
+    row("roe", "ROE", "% 이상", 1.0)
+    row("per", "PER", "배 이하", 1.0)
+    row("pbr", "PBR", "배 이하", 0.1)
+    row("growth", "영업이익이 전년보다 증가", None)
+    st.caption("PER·PBR은 오늘 시가총액을 최근 사업보고서의 순이익·자본총계로 나눈 추정치예요(지배주주 몫과 올해 실적은 반영되지 않아요). 금융업으로 보이는 종목(이름에 금융·은행·증권·보험 등)은 부채비율 조건을 면제해요.")
+
+
+def run_discovery(f, manual_codes=None):
+    bar = st.progress(0.0, text="종목 목록을 가져오는 중…")
+    try:
+        uni = discover.manual_listing(manual_codes) if manual_codes else listing_cached()
+    except Exception as e:
+        bar.empty()
+        st.session_state.disc_res = {"fail": str(e)}
+        return
+    held = set(st.session_state.hold["종목코드"]) if st.session_state.get("disc_excl_held", True) else set()
+    s1, notes = discover.stage1(uni, f, exclude=held)
+    bar.progress(0.3, text=f"DART 재무 일괄 조회 중… ({len(s1)}개)")
+    try:
+        fin, errs = bulk_cached(tuple(s1["Code"]))
+    except Exception as e:
+        bar.empty()
+        st.session_state.disc_res = {"fail": f"DART 재무 조회에 실패했어요: {e}", "uni_n": len(uni), "s1_n": len(s1)}
+        return
+    tbl = discover.metrics_table(s1, fin)
+    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes,
+                                 "errors": errs, "manual": bool(manual_codes), "ts": dt.datetime.now().strftime("%m-%d %H:%M")}
+    bar.progress(1.0, text="완료")
+
+
+def run_detail(codes):
+    bar, errors = st.progress(0.0), []
+    for i, c in enumerate(codes):
+        name = st.session_state.disc_names.get(c, c)
+        bar.progress(i / max(len(codes), 1), text=f"{name} 상세 점검 중… ({i + 1}/{len(codes)})")
+        d = st.session_state.fincache.get(c)
+        if not (d and is_fresh(d)):
+            _, e = fetch_company(c)
+            if e:
+                errors.append(f"{name}: {e}")
+                if any(k in e for k in ("010", "011", "020")):
+                    break
+    bar.progress(1.0)
+    save_fincache()
+    st.session_state.disc_detail = list(codes)
+    if errors:
+        st.error("가져오지 못한 종목이 있어요:\n\n" + "\n\n".join(errors))
+
+
+def tab_discover():
+    st.markdown("시장 전체에서 후보를 좁히는 깔때기예요. **① 시가총액·거래대금 → ② DART 재무 → ③ 남은 상위 후보만 안전 기준·가격 흐름까지 상세 점검**해요. 통과했다고 사라는 뜻은 아니고, 더 살펴볼 후보라는 뜻이에요.")
+    dart, err = get_dart()
+    if dart is None:
+        st.warning(f"{err} Streamlit Secrets에 DART_API_KEY를 넣어 주세요.")
+        return
+    f = st.session_state.disc_f
+    with st.expander("발굴 조건", expanded=False):
+        disc_filters_ui(f)
+        a, _ = st.columns([1, 3])
+        if a.button("조건 저장", key="d_save"):
+            ok, msg = save_settings()
+            (st.success if ok else st.error)(msg)
+    st.checkbox("이미 보유한 종목은 제외", value=True, key="disc_excl_held")
+    res = st.session_state.get("disc_res")
+    manual_codes = None
+    if res and res.get("fail") and "종목 목록" in res["fail"]:
+        st.error(res["fail"])
+        st.info("종목 목록 출처에 접속하지 못했어요. 대신 살펴볼 종목코드를 직접 붙여넣어 재무 조건만 적용할 수 있어요(시가총액이 없어서 PER·PBR·시가총액 조건은 빠져요).")
+        txt = st.text_area("종목코드 목록 (쉼표나 줄바꿈으로 구분)", key="disc_manual", placeholder="005930, 000660, 035420")
+        manual_codes = [x for x in txt.replace("\n", ",").replace(" ", ",").split(",") if x.strip()] or None
+    if st.button("시장 데이터 불러오기", type="primary"):
+        with st.spinner("시장 데이터를 불러오는 중이에요(1~3분 걸릴 수 있어요)…"):
+            run_discovery(f, manual_codes)
+        res = st.session_state.get("disc_res")
+        if res and res.get("fail"):
+            st.rerun()
+    res = st.session_state.get("disc_res")
+    if not res:
+        st.caption("버튼을 누르면 종목 목록과 재무를 가져와요. 한 번 가져오면 몇 시간(목록)·하루(재무) 동안 다시 쓰고, 결과는 조건을 바꿔도 바로 달라져요.")
+        return
+    if res.get("fail"):
+        if "종목 목록" not in res["fail"]:
+            st.error(res["fail"])
+        return
+    tbl = discover.stage2(res["tbl"], f, has_cap=not res["manual"])
+    cand = tbl[tbl["통과"]].copy()
+    k = st.columns(4)
+    k[0].metric("전체 종목", f"{res['uni_n']:,}")
+    k[1].metric("① 목록 필터 통과", f"{res['s1_n']:,}")
+    k[2].metric("② 재무 조회됨", f"{res['fin_n']:,}")
+    k[3].metric("② 재무 조건 통과", f"{len(cand):,}")
+    st.caption(f"{res['ts']}에 불러온 데이터예요.")
+    for n in res.get("notes", []):
+        st.warning(n)
+    if res.get("errors"):
+        with st.expander(f"DART 조회 중 오류 {len(res['errors'])}건"):
+            for e in res["errors"]:
+                st.write(e)
+    sort_label = st.selectbox("정렬", list(discover.SORTS), index=0)
+    col, asc = discover.SORTS[sort_label]
+    cand = cand.sort_values(col, ascending=asc, na_position="last").reset_index(drop=True)
+    st.session_state.disc_names = dict(zip(tbl["종목코드"], tbl["종목명"]))
+    show = cand[["종목코드", "종목명", "시가총액(조)", "ROE", "PER", "PBR", "부채비율", "영업이익률", "영업이익증가율", "영업적자횟수"]].head(100)
+    st.dataframe(show, width="stretch", hide_index=True, column_config={
+        "시가총액(조)": st.column_config.NumberColumn(format="%.1f"), "ROE": st.column_config.NumberColumn(format="%.1f%%"),
+        "PER": st.column_config.NumberColumn(format="%.1f"), "PBR": st.column_config.NumberColumn(format="%.2f"),
+        "부채비율": st.column_config.NumberColumn(format="%.0f%%"), "영업이익률": st.column_config.NumberColumn(format="%.1f%%"),
+        "영업이익증가율": st.column_config.NumberColumn(format="%.0f%%"), "영업적자횟수": st.column_config.NumberColumn(format="%d")})
+    if not len(cand):
+        st.info("조건을 모두 통과한 종목이 없어요. 위의 발굴 조건에서 ROE·PER 같은 기준을 조금 완화해 보세요.")
+        return
+
+    st.subheader("③ 상위 후보 상세 점검")
+    st.caption("안전 기준(DART 공시)과 가격 흐름까지 확인해요. 종목마다 10~30초 걸리고, 가져온 데이터는 7일 동안 저장돼요.")
+    n = st.slider("상위 몇 개를 점검할까요", 3, 30, min(10, max(3, min(30, len(cand)))))
+    if st.button("상위 후보 상세 점검"):
+        run_detail(cand["종목코드"].head(n).tolist())
+    det = [c for c in st.session_state.get("disc_detail", []) if c in set(cand["종목코드"])]
+    if not det:
+        return
+    only_safe = st.checkbox("안전 기준 미달 종목 숨기기", value=False)
+    rows = []
+    for c in det:
+        sres = safety_for(c)
+        df = hist_kr(c)
+        ind = sg.indicators(df)
+        if sres is None:
+            continue
+        items = sres[1]
+        cnt = safety.summarize(items)
+        if only_safe and cnt["fail"]:
+            continue
+        rows.append({
+            "종목코드": c, "종목명": st.session_state.disc_names.get(c, c), "안전": safety.headline(items),
+            "미달 항목": ", ".join(i["label"] for i in items if i["status"] == "fail") or "-",
+            "확인 불가": ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-",
+            "흐름": sg.flow_of(ind)[0] if ind else "-", "52주 위치(%)": ind["pos"] if ind else np.nan,
+            "RSI": ind["rsi"] if ind else np.nan, "3개월(%)": ind["m3"] if ind else np.nan})
+    if not rows:
+        st.info("표시할 종목이 없어요.")
+        return
+    rdf = pd.DataFrame(rows)
+    st.dataframe(rdf, width="stretch", hide_index=True, column_config={
+        "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"), "RSI": st.column_config.NumberColumn(format="%.0f"),
+        "3개월(%)": st.column_config.NumberColumn(format="%.1f")})
+    st.caption("52주 위치가 낮을수록 1년 중 싼 구간이고, RSI가 70 이상이면 단기 과열이에요. 자세한 재무와 근거는 종목 리포트 탭에서 종목코드를 직접 입력해 확인할 수 있어요.")
+    names = {f"{r['종목명']} ({r['종목코드']})": (r["종목코드"], r["종목명"]) for r in rows}
+    pick = st.multiselect("관심종목에 추가", list(names))
+    if st.button("관심종목에 추가") and pick:
+        ok, msg = add_watch([names[p] for p in pick])
+        (st.success if ok else st.error)(msg)
+
+
 def tab_safety():
     st.markdown("보유 종목의 재무·공시 데이터를 DART에서 가져와 **내 안전 기준**과 비교해요. 한 번 가져오면 구글 시트에 저장돼서 "
                 f"{FRESH_DAYS}일 동안은 다시 가져오지 않아요. 안전 기준 숫자는 '규칙' 탭에서 바꿔요.")
@@ -645,7 +907,7 @@ def tab_safety():
             unk = ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-"
             rows.append({"종목": r["종목명"] or code, "갱신일": d.get("fetched", "-"), "결과": safety.headline(items), "미달 항목": bad, "확인 불가": unk})
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-    st.caption("자세한 수치와 근거는 '종목 리포트' 탭에서 종목을 고르면 볼 수 있어요. 투자경고·관리종목 지정은 DART에서 가져올 수 없어 점검에 포함되지 않아요.")
+    st.caption("자세한 수치와 근거는 '종목 리포트' 탭에서 종목을 고르면 볼 수 있어요. 관리종목은 거래소 목록으로 확인하고, 투자경고·투자주의 지정은 점검에 포함되지 않아요.")
 
 
 def tab_rules():
@@ -690,15 +952,20 @@ def main():
         st.session_state.rules = copy.deepcopy(sg.DEFAULT_RULES)
     if "safe" not in st.session_state:
         st.session_state.safe = safety.default_rules()
+    if "disc_f" not in st.session_state:
+        st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     load_settings()
+    load_watch()
     load_fincache()
     rules = st.session_state.rules
 
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
-    t1, t2, t3, t4 = st.tabs(["내 자산", "안전 점검", "종목 리포트", "규칙"])
+    t1, t5, t2, t3, t4 = st.tabs(["내 자산", "종목 발굴", "안전 점검", "종목 리포트", "규칙"])
     with t1:
         tab_assets(rules)
+    with t5:
+        tab_discover()
     with t2:
         tab_safety()
     with t3:

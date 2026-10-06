@@ -11,6 +11,7 @@ DEFAULT_SAFE = {
     "impair": {"on": True},             # 자본잠식 없음
     "audit": {"on": True},              # 감사의견 적정
     "distress": {"on": True},           # 부도·회생·관리절차 공시 없음
+    "admin": {"on": True},              # 관리종목 지정 없음(거래소 목록)
     "divy": {"on": True, "v": 3},       # 최근 3년 중 현금배당 N년 이상
     "major": {"on": True, "v": 10.0},   # 최대주주 지분율(%) 이상
     "issue": {"on": True, "v": 0},      # 최근 3년 증자·CB·BW·EB 결정 횟수 이하
@@ -23,9 +24,9 @@ def default_rules():
     return copy.deepcopy(DEFAULT_SAFE)
 
 
-def derive(d, price=None, tv_eok=None):
+def derive(d, price=None, tv_eok=None, admin=None):
     """DART 원자료 d(dict)와 시세에서 판단용 지표를 만든다."""
-    m = {"is_fin": False}
+    m = {"is_fin": False, "admin": admin}
     m["is_pref"] = bool((d or {}).get("resolved_code"))
     m["resolved_code"] = (d or {}).get("resolved_code")
     comp = (d or {}).get("company") or {}
@@ -161,6 +162,10 @@ def evaluate(m, rules):
         v = m["distress_n"]
         out.append(_r("distress", "부도·회생절차·관리절차 공시 없음(최근 3년)", "unknown" if v is None else ("pass" if v == 0 else "fail"),
                       "확인 불가" if v is None else f"{v}건"))
+    if f["admin"]["on"]:
+        v = m.get("admin")
+        out.append(_r("admin", "관리종목 지정 없음", "unknown" if v is None else ("fail" if v else "pass"),
+                      "확인 불가(거래소 목록을 못 불러왔어요)" if v is None else ("관리종목으로 지정돼 있어요" if v else "없음")))
     if f["divy"]["on"]:
         v = m["div_years"]
         lab = f"최근 3년 중 현금배당 {f['divy']['v']:g}년 이상"
