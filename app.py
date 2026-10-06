@@ -251,10 +251,10 @@ def tab_assets(rules):
             width="stretch",
             hide_index=True,
             column_config={
-                "수량": st.column_config.NumberColumn(format="%d"),
-                "평균단가": st.column_config.NumberColumn(format="%d원"),
-                "현재가": st.column_config.NumberColumn(format="%d원"),
-                "평가금액": st.column_config.NumberColumn(format="%d원"),
+                "수량": st.column_config.NumberColumn(format="%,d"),
+                "평균단가": st.column_config.NumberColumn(format="%,d원"),
+                "현재가": st.column_config.NumberColumn(format="%,d원"),
+                "평가금액": st.column_config.NumberColumn(format="%,d원"),
                 "수익률": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
@@ -265,8 +265,8 @@ def tab_assets(rules):
         st.dataframe(
             kk2, width="stretch", hide_index=True,
             column_config={
-                "투자원금": st.column_config.NumberColumn(format="%d원"),
-                "평가금액": st.column_config.NumberColumn(format="%d원"),
+                "투자원금": st.column_config.NumberColumn(format="%,d원"),
+                "평가금액": st.column_config.NumberColumn(format="%,d원"),
                 "손익률": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
