@@ -146,7 +146,7 @@ def reset_settings():
     st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td"):
             del st.session_state[k]
 
 
@@ -661,8 +661,9 @@ def build_positions(hold, rules):
                 "꼬리표": r["꼬리표"], "수량": qty, "평균단가": avg, "현재가": price,
                 "평가금액": qty * price, "투자원금": qty * avg, "수익금액": qty * (price - avg),
                 "수익률": (price / avg - 1) * 100 if avg > 0 else float("nan"),
-                "고점 대비(%)": prot["dd"] if prot else float("nan"),
-                "수익 보호선(원)": prot["line"] if prot and prot["active"] else float("nan"),
+                "고점 대비(%)": prot["overall_dd"] if prot else float("nan"),
+                "수익 보호선(원)": prot["line"] if prot and prot["armed"] else float("nan"),
+                "보호선 상태": sg.protect_state(prot),
                 "흐름": sg.flow_of(ind)[0] if ind else "시세 부족",
                 "수급(5일)": flow_txt(fs),
                 "목표가 여력(%)": cups,
@@ -772,7 +773,7 @@ def tab_assets(rules):
         c3.caption("수급(30분 저장)과 증권사 컨센서스(6시간 저장)는 네이버 증권 데이터를 읽어와요. 서버에서 접속이 막히면 표시되지 않아요. 목표가 여력은 평균 목표가가 현재가보다 몇 % 높은지예요.")
         for e in st.session_state.pop("flow_msg", []) or []:
             st.warning(f"수급을 못 가져왔어요 — {e}")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "흐름", "수급(5일)", "목표가 여력(%)", "안전", "판단", "신호"]]
+        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "흐름", "수급(5일)", "목표가 여력(%)", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -785,7 +786,8 @@ def tab_assets(rules):
                 "수익금액": st.column_config.NumberColumn(format="%,d원"),
                 "수익률": st.column_config.NumberColumn(format="%.1f%%"),
                 "고점 대비(%)": st.column_config.NumberColumn(format="%.1f"),
-                "수익 보호선(원)": st.column_config.NumberColumn(format="%,d", help="고점 수익률이 활성 기준을 넘은 종목만 나와요. 현재가가 이 값 이하로 내려가면 수익 보호선 도달이에요."),
+                "수익 보호선(원)": st.column_config.NumberColumn(format="%,d", help="지금 유효한 보호선이에요. 이탈한 적이 있으면 이탈 뒤의 고점 기준으로 다시 잡힌 값이고, 보호선이 꺼져 있으면(수익이 기준 미만) 비어 있어요."),
+                "고점 대비(%)": st.column_config.NumberColumn(format="%.1f", help="최근 1년(또는 매수일 이후) 최고 종가 대비예요."),
                 "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
             },
         )
@@ -1104,10 +1106,13 @@ def tab_report(rules):
         st.write(f"내 평단 {avg:,.0f}원 · 수익률 {pct((ind['price'] / avg - 1) * 100)}")
         prot = sg.protect(ind, tag, avg, rules)
         if prot:
-            if prot["active"]:
-                st.write(f"수익 보호선: 고점 {prot['peak']:,.0f}원({prot['peak_date']}, {prot['basis']}) − {prot['width']:.0f}% = **{prot['line']:,.0f}원** · 지금은 고점 대비 {prot['dd']:.1f}%")
+            if prot["armed"]:
+                st.write(f"수익 보호선: **{prot['line']:,.0f}원** — 기준 고점 {prot['peak']:,.0f}원({prot['peak_date']}) − {prot['width']:.0f}% · 지금은 그 고점 대비 {prot['dd']:.1f}% ({sg.protect_state(prot)})")
             else:
-                st.caption(f"수익 보호선은 아직 꺼져 있어요. 고점 기준 수익률이 +{prot['act']:.0f}%를 넘으면 켜져요(지금 고점 기준 {prot['peak_ret']:+.0f}%).")
+                st.caption(f"수익 보호선은 지금 꺼져 있어요. 기준 고점 {prot['peak']:,.0f}원의 수익률이 +{prot['peak_ret']:.0f}%로 시작 기준(+{prot['act']:.0f}%)에 못 미쳐요. ({sg.protect_state(prot)})")
+            if prot["last"]:
+                l = prot["last"]
+                st.caption(f"지난번 이탈: {l['date']}에 보호선 {l['line']:,.0f}원(고점 {l['peak']:,.0f}원 기준)을 {l['price']:,.0f}원으로 이탈했고, 그 가격에서 보호선을 새로 잡았어요.")
     if sigs:
         for s in sigs:
             icon = {"주의": "⚠️", "매수검토": "🟢", "알림": "🔔"}[s["kind"]]
@@ -1535,6 +1540,8 @@ def tab_rules():
                                             help="고점에서 이만큼 이상 수익이 난 적이 있어야 보호선이 켜져요.")
         r["중장기"]["보호폭"] = st.number_input("수익 보호폭(고점 대비 % 하락)", value=float(r["중장기"]["보호폭"]), step=1.0, key="l_tw",
                                            help="고점 대비 이만큼 내려오면 수익 보호선 도달이에요.")
+        r["중장기"]["보호알림일"] = int(st.number_input("이탈 알림 유지 기간(거래일)", min_value=1, value=int(r["중장기"].get("보호알림일", 10)), step=1, key="l_td",
+                                                help="보호선을 이탈한 뒤 이 기간 동안만 판단에 반영해요. 지나면 이탈 뒤 고점 기준으로 보호선이 다시 잡혀요."))
     with b:
         st.markdown("**스윙**")
         r["스윙"]["손절선"] = st.number_input("손절선(%)", value=r["스윙"]["손절선"], step=0.5)
@@ -1544,6 +1551,7 @@ def tab_rules():
         r["스윙"]["눌림_상단"] = st.number_input("눌림 RSI 상단", value=r["스윙"]["눌림_상단"], step=1.0)
         r["스윙"]["보호활성"] = st.number_input("수익 보호 시작(고점 기준 수익률 % 이상) ", value=float(r["스윙"]["보호활성"]), step=1.0, key="s_ta")
         r["스윙"]["보호폭"] = st.number_input("수익 보호폭(고점 대비 % 하락) ", value=float(r["스윙"]["보호폭"]), step=1.0, key="s_tw")
+        r["스윙"]["보호알림일"] = int(st.number_input("이탈 알림 유지 기간(거래일) ", min_value=1, value=int(r["스윙"].get("보호알림일", 10)), step=1, key="s_td"))
     st.divider()
     st.markdown("**안전 기준** — 켜져 있는 항목만 점검해요. 확인하지 못한 항목은 '확인 불가'로 표시하고 미달로 치지 않아요.")
     s = st.session_state.safe
@@ -1564,7 +1572,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 2}
+REQUIRED_VERSIONS = {"signals": 3}
 
 
 def check_versions():
