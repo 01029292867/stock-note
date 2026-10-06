@@ -800,25 +800,33 @@ def report_flow(code):
         st.info("수급 기록이 너무 적어서 계산하지 못했어요.")
         return
     k = st.columns(4)
-    k[0].metric("외국인 5일", f"{sm['f5']:+,.0f}억", f"20일 {sm['f20']:+,.0f}억", delta_color="off")
-    k[1].metric("기관 5일", f"{sm['i5']:+,.0f}억", f"20일 {sm['i20']:+,.0f}억", delta_color="off")
-    k[2].metric(("개인(추정)" if sm["indiv_est"] else "개인") + " 5일", f"{sm['p5']:+,.0f}억", f"20일 {sm['p20']:+,.0f}억", delta_color="off")
-    k[3].metric("외국인 보유율", "-" if sm["hold_pct"] is None else f"{sm['hold_pct']:.2f}%",
-                None if sm["hold_chg20"] is None else f"{sm['hold_chg20']:+.2f}%p (20일)")
+    k[0].metric("외국인 5일", f"{sm['f5']:+,.0f}억")
+    k[0].caption(f"20일 합계 {sm['f20']:+,.0f}억")
+    k[1].metric("기관 5일", f"{sm['i5']:+,.0f}억")
+    k[1].caption(f"20일 합계 {sm['i20']:+,.0f}억")
+    k[2].metric(("개인(추정)" if sm["indiv_est"] else "개인") + " 5일", f"{sm['p5']:+,.0f}억")
+    k[2].caption(f"20일 합계 {sm['p20']:+,.0f}억")
+    k[3].metric("외국인 보유율", "-" if sm["hold_pct"] is None else f"{sm['hold_pct']:.2f}%")
+    k[3].caption("" if sm["hold_chg20"] is None else f"20일 변화 {sm['hold_chg20']:+.2f}%p")
     cf = flows.chart_frame(df, 20)
     for who in cf["주체"].unique():
         st.caption(f"{who} 일별 순매수(억원, 최근 20거래일) — 빨강은 순매수, 파랑은 순매도")
         st.altair_chart(alt.Chart(cf[cf["주체"] == who]).mark_bar().encode(
-            x=alt.X("날짜:T", title=None), y=alt.Y("순매수(억):Q", title=None),
+            x=alt.X("일:N", sort=None, title=None, axis=alt.Axis(labelAngle=-45)), y=alt.Y("순매수(억):Q", title=None),
             color=alt.condition(alt.datum["순매수(억)"] > 0, alt.value("#D93A33"), alt.value("#2A63D4")),
-            tooltip=["날짜:T", alt.Tooltip("순매수(억):Q", format=",.1f")]).properties(height=90), width="stretch")
+            tooltip=["일:N", alt.Tooltip("순매수(억):Q", format=",.1f")]).properties(height=90), width="stretch")
     st.info(flows.read_text(sm))
     st.caption(f"{sm['last']}까지의 자료예요. 외국인 연속 {abs(sm['f_streak'])}일 {'순매수' if sm['f_streak'] > 0 else '순매도'}, "
                f"기관 연속 {abs(sm['i_streak'])}일 {'순매수' if sm['i_streak'] > 0 else '순매도'}. 금액은 순매매량에 그날 종가를 곱한 추정치이고, "
                + ("개인은 제공되지 않아 기관·외국인의 반대로 계산한 값(기타 법인 등 포함)이에요. " if sm["indiv_est"] else "") + "수급은 참고 자료일 뿐 주가를 보장하지 않아요.")
+    if sm.get("p5_given") is not None and sm["indiv_est"]:
+        st.caption(f"참고: 네이버가 따로 준 개인 값은 5일 {sm['p5_given']:+,.0f}억이에요. 그런데 외국인+기관+개인의 합이 5일 {sm['sum5']:+,.0f}억으로 0에서 멀어서(보통 기타 법인 몫만큼만 벌어져요), "
+                   "증권사 앱 값과 맞는 것이 확인되기 전까지는 개인을 기관·외국인의 반대로 추정해서 써요.")
     with st.expander("수급 원자료 (최근 40거래일)"):
         raw = flows.with_amounts(df).tail(40).iloc[::-1]
-        st.dataframe(raw[["날짜", "종가", "기관", "외국인", "기관(억)", "외국인(억)", "개인(억)", "외국인보유율"]], width="stretch", hide_index=True)
+        cols = [c for c in ["날짜", "종가", "거래량", "기관", "외국인", "개인", "기관(억)", "외국인(억)", "개인제공(억)", "3주체합(억)", "외국인보유율"] if c in raw.columns]
+        st.caption("증권사 앱과 비교할 때는 '기관', '외국인', '개인' 열(순매매량, 단위 주)을 같은 날짜끼리 보세요.")
+        st.dataframe(raw[cols], width="stretch", hide_index=True)
 
 
 def tab_report(rules):

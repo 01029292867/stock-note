@@ -15,6 +15,11 @@ HEADERS = {
 }
 
 
+# 네이버가 주는 '개인' 값은 세 주체의 합이 0에 가깝지 않아서(삼성전자 확인) 검증 전까지는 쓰지 않는다.
+# 증권사 앱 값과 맞는 것이 확인되면 True로 바꾼다.
+USE_PROVIDED_INDIVIDUAL = False
+
+
 class FlowError(Exception):
     pass
 
@@ -166,17 +171,18 @@ def fetch_flow(code, pages=2, get=None, pause=0.3):
 
 
 def with_amounts(df):
-    """순매매량(주)을 종가를 곱해 억원으로 바꾸고, 개인(추정)을 만든다."""
+    """순매매량(주)을 종가를 곱해 억원으로 바꾼다. 개인은 기본적으로 -(기관+외국인)으로 추정한다."""
     d = df.sort_values("날짜").copy()
     d["기관(억)"] = d["기관"] * d["종가"] / 1e8
     d["외국인(억)"] = d["외국인"] * d["종가"] / 1e8
     est = -(d["기관(억)"] + d["외국인(억)"])
-    if "개인" in d.columns and d["개인"].notna().any():
-        d["개인(억)"] = d["개인"] * d["종가"] / 1e8
-        d["개인추정"] = False
+    has = "개인" in d.columns and d["개인"].notna().any()
+    d["개인제공(억)"] = d["개인"] * d["종가"] / 1e8 if has else np.nan
+    d["3주체합(억)"] = (d["기관(억)"] + d["외국인(억)"] + d["개인제공(억)"]) if has else np.nan
+    if has and USE_PROVIDED_INDIVIDUAL:
+        d["개인(억)"], d["개인추정"] = d["개인제공(억)"], False
     else:
-        d["개인(억)"] = est
-        d["개인추정"] = True
+        d["개인(억)"], d["개인추정"] = est, True
     return d
 
 
@@ -204,7 +210,9 @@ def summarize(df):
            "f5": s("외국인(억)", 5), "i5": s("기관(억)", 5), "p5": s("개인(억)", 5),
            "f20": s("외국인(억)", 20), "i20": s("기관(억)", 20), "p20": s("개인(억)", 20),
            "f_streak": _streak(d["외국인(억)"]), "i_streak": _streak(d["기관(억)"]),
-           "indiv_est": bool(d["개인추정"].iloc[-1])}
+           "indiv_est": bool(d["개인추정"].iloc[-1]),
+           "p5_given": float(d["개인제공(억)"].tail(5).sum()) if d["개인제공(억)"].notna().any() else None,
+           "sum5": float(d["3주체합(억)"].tail(5).sum()) if d["3주체합(억)"].notna().any() else None}
     pct = d["외국인보유율"].dropna()
     out["hold_pct"] = float(pct.iloc[-1]) if len(pct) else None
     out["hold_chg20"] = float(pct.iloc[-1] - pct.iloc[-min(20, len(pct))]) if len(pct) >= 2 else None
@@ -239,5 +247,5 @@ def chart_frame(df, n=20):
     rows = []
     ind = "개인(추정)" if bool(d["개인추정"].iloc[-1]) else "개인"
     for name, col in (("외국인", "외국인(억)"), ("기관", "기관(억)"), (ind, "개인(억)")):
-        rows += [{"날짜": a, "주체": name, "순매수(억)": b} for a, b in zip(d["날짜"], d[col])]
+        rows += [{"날짜": a, "일": a.strftime("%m-%d"), "주체": name, "순매수(억)": b} for a, b in zip(d["날짜"], d[col])]
     return pd.DataFrame(rows)
