@@ -15,6 +15,7 @@ import discover
 import flows
 import market
 import perf
+import reports
 import safety
 import signals as sg
 from store import GasStore
@@ -23,7 +24,7 @@ st.set_page_config(page_title="내 투자 노트", page_icon="📈", layout="wid
 
 BROKERS = ["키움", "한국투자", "카카오", "토스"]
 TAGS = ["중장기", "스윙"]
-HOLD_COLS = ["증권사", "종목코드", "종목명", "꼬리표", "수량", "평균단가"]
+HOLD_COLS = ["증권사", "종목코드", "종목명", "꼬리표", "수량", "평균단가", "매수일"]
 KAKAO_COLS = ["종목명", "티커", "하루금액", "시작일"]
 CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
@@ -43,9 +44,9 @@ SAFE_LABELS = {
 
 DEMO_HOLD = pd.DataFrame(
     [
-        ["키움", "005930", "삼성전자", "중장기", 10, 60000],
-        ["키움", "000660", "SK하이닉스", "스윙", 3, 150000],
-        ["한국투자", "005380", "현대차", "중장기", 5, 200000],
+        ["키움", "005930", "삼성전자", "중장기", 10, 60000, ""],
+        ["키움", "000660", "SK하이닉스", "스윙", 3, 150000, ""],
+        ["한국투자", "005380", "현대차", "중장기", 5, 200000, ""],
     ],
     columns=HOLD_COLS,
 )
@@ -145,7 +146,7 @@ def reset_settings():
     st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("l_t", "s_t", "d_maxn"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw"):
             del st.session_state[k]
 
 
@@ -278,6 +279,7 @@ def clean_hold(df: pd.DataFrame) -> pd.DataFrame:
     df["증권사"] = df["증권사"].where(df["증권사"].isin(BROKERS), BROKERS[0])
     df["꼬리표"] = df["꼬리표"].where(df["꼬리표"].isin(TAGS), TAGS[0])
     df["종목명"] = df["종목명"].fillna("").astype(str)
+    df["매수일"] = df["매수일"].fillna("").astype(str).str.slice(0, 10).replace({"None": "", "nan": "", "NaT": ""})
     return df.reset_index(drop=True)
 
 
@@ -634,9 +636,10 @@ def build_positions(hold, rules):
     rows = []
     for r in hold.to_dict("records"):
         df = hist_kr(r["종목코드"])
-        ind = sg.indicators(df)
+        ind = sg.indicators(df, r.get("매수일") or None)
         price = float(df["Close"].iloc[-1]) if len(df) else float("nan")
         qty, avg = float(r["수량"]), float(r["평균단가"])
+        prot = sg.protect(ind, r["꼬리표"], avg, rules) if ind else None
         cdat = cons_for(r["종목코드"])
         cups = consensus.upside(cdat["target"], price) if cdat and cdat.get("has") else float("nan")
         fs = st.session_state.get("flow_sum", {}).get(r["종목코드"])
@@ -658,6 +661,8 @@ def build_positions(hold, rules):
                 "꼬리표": r["꼬리표"], "수량": qty, "평균단가": avg, "현재가": price,
                 "평가금액": qty * price, "투자원금": qty * avg, "수익금액": qty * (price - avg),
                 "수익률": (price / avg - 1) * 100 if avg > 0 else float("nan"),
+                "고점 대비(%)": prot["dd"] if prot else float("nan"),
+                "수익 보호선(원)": prot["line"] if prot and prot["active"] else float("nan"),
                 "흐름": sg.flow_of(ind)[0] if ind else "시세 부족",
                 "수급(5일)": flow_txt(fs),
                 "목표가 여력(%)": cups,
@@ -767,7 +772,7 @@ def tab_assets(rules):
         c3.caption("수급(30분 저장)과 증권사 컨센서스(6시간 저장)는 네이버 증권 데이터를 읽어와요. 서버에서 접속이 막히면 표시되지 않아요. 목표가 여력은 평균 목표가가 현재가보다 몇 % 높은지예요.")
         for e in st.session_state.pop("flow_msg", []) or []:
             st.warning(f"수급을 못 가져왔어요 — {e}")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "흐름", "수급(5일)", "목표가 여력(%)", "안전", "판단", "신호"]]
+        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "흐름", "수급(5일)", "목표가 여력(%)", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -779,6 +784,8 @@ def tab_assets(rules):
                 "평가금액": st.column_config.NumberColumn(format="%,d원"),
                 "수익금액": st.column_config.NumberColumn(format="%,d원"),
                 "수익률": st.column_config.NumberColumn(format="%.1f%%"),
+                "고점 대비(%)": st.column_config.NumberColumn(format="%.1f"),
+                "수익 보호선(원)": st.column_config.NumberColumn(format="%,d", help="고점 수익률이 활성 기준을 넘은 종목만 나와요. 현재가가 이 값 이하로 내려가면 수익 보호선 도달이에요."),
                 "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
             },
         )
@@ -823,6 +830,7 @@ def edit_tables():
             "꼬리표": st.column_config.SelectboxColumn(options=TAGS, required=True),
             "수량": st.column_config.NumberColumn(min_value=0, step=1),
             "평균단가": st.column_config.NumberColumn(min_value=0, step=1),
+            "매수일": st.column_config.TextColumn(help="선택 사항이에요. 2026-03-02 형식. 적어두면 수익 보호선의 고점을 그날 이후로 계산해요."),
         },
     )
     st.markdown("**카카오 소수점 정기매수** — 티커는 미국 종목 약어예요(예: NVDA, AAPL). 시작일은 2026-03-02 형식이에요.")
@@ -986,6 +994,60 @@ def report_consensus(code, price):
     st.caption("평균 목표주가는 증권사들의 전망일 뿐이고 틀리는 경우도 많아요. 증권사 의견은 매수가 대부분이라 점수가 높게 나오는 게 보통이라, 점수 자체보다 목표가가 올라가는지 내려가는지와 의견이 바뀌는지가 더 중요해요. 5점 만점(5 적극매수 ~ 1 적극매도)이고, 네이버 증권 데이터예요.")
 
 
+
+REP_TTL = 21600
+
+
+def get_reports(code, force=False):
+    """반환: (목록, 안내문 리스트, 오류문구). 6시간 동안은 다시 가져오지 않는다."""
+    import time
+    store = st.session_state.setdefault("rep_df", {})
+    now = time.time()
+    if not force and code in store and now - store[code][2] < REP_TTL:
+        return store[code][0], store[code][1], None
+    try:
+        rows, notes = reports.fetch_reports(code)
+    except Exception as e:
+        return None, None, str(e)[:250]
+    store[code] = (rows, notes, now)
+    return rows, notes, None
+
+
+def report_reports(code, price):
+    st.subheader("증권사별 리포트 (최근)")
+    cached = code in st.session_state.get("rep_df", {})
+    if not cached:
+        if not st.button("증권사 리포트 목록 가져오기", key=f"rep_{code}"):
+            st.caption("종목마다 10~20초 걸려서 버튼을 눌렀을 때만 가져와요. 증권사·날짜·투자의견·목표가와 제목만 읽고, 리포트 본문은 가져오지 않아요.")
+            return
+    with st.spinner("리포트 목록을 가져오는 중이에요…"):
+        rows, notes, err = get_reports(code)
+    if err:
+        st.warning(f"리포트 목록을 가져오지 못했어요: {err}")
+        return
+    sm = reports.summarize(rows, price)
+    k = st.columns(4)
+    k[0].metric("최근 리포트", f"{sm['n']}건")
+    k[1].metric("평균 목표가", "-" if not sm["avg"] else f"{sm['avg']:,.0f}원", None if sm["upside"] is None else f"현재가 대비 {sm['upside']:+.1f}%", delta_color="off")
+    k[2].metric("목표가 상향 / 하향", f"{sm['ups']} / {sm['downs']}건")
+    k[3].metric("매수 계열 의견", "-" if not sm["n_op"] else f"{sm['buy']}/{sm['n_op']}건")
+    df = pd.DataFrame([{
+        "날짜": r["date"], "증권사": r["firm"], "의견": r["opinion"] or "-", "목표가(원)": r["target"],
+        "직전 대비(%)": ((r["target"] / r["prev"] - 1) * 100) if r["target"] and r["prev"] else np.nan,
+        "현재가 대비(%)": ((r["target"] / price - 1) * 100) if r["target"] and price else np.nan,
+        "제목": r["title"], "원문": r["url"]} for r in rows])
+    st.dataframe(df, width="stretch", hide_index=True, column_config={
+        "목표가(원)": st.column_config.NumberColumn(format="%,d"), "직전 대비(%)": st.column_config.NumberColumn(format="%.1f"),
+        "현재가 대비(%)": st.column_config.NumberColumn(format="%.1f"),
+        "원문": st.column_config.LinkColumn("원문", display_text="열기")})
+    for n in notes:
+        st.warning(n)
+    if st.button("새로 가져오기", key=f"rep_re_{code}"):
+        get_reports(code, force=True)
+        st.rerun()
+    st.caption("'직전 대비'는 이 목록 안에서 같은 증권사의 바로 앞 리포트와 비교한 값이라, 목록에 이전 리포트가 없으면 비어 있어요. 증권사 의견은 매수가 대부분이라 개수보다 목표가의 방향과 의견이 바뀌는 리포트가 중요해요. 목표가는 증권사의 전망일 뿐이에요. '원문'은 네이버 금융의 리포트 페이지로 연결돼요.")
+
+
 def tab_report(rules):
     hold = st.session_state.hold
     opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · {r['증권사']}": r for r in hold.to_dict("records")}
@@ -1005,7 +1067,7 @@ def tab_report(rules):
     tag = st.radio("보는 관점", TAGS, index=TAGS.index(tag_default), horizontal=True)
 
     df = hist_kr(code)
-    ind = sg.indicators(df)
+    ind = sg.indicators(df, (held or {}).get("매수일") or None)
     if len(df) == 0:
         st.error("시세를 가져오지 못했어요. 종목코드를 확인하거나 잠시 뒤 다시 시도해 보세요.")
         return
@@ -1040,6 +1102,12 @@ def tab_report(rules):
     sigs = sg.signals(ind, tag, avg, rules)
     if avg:
         st.write(f"내 평단 {avg:,.0f}원 · 수익률 {pct((ind['price'] / avg - 1) * 100)}")
+        prot = sg.protect(ind, tag, avg, rules)
+        if prot:
+            if prot["active"]:
+                st.write(f"수익 보호선: 고점 {prot['peak']:,.0f}원({prot['peak_date']}, {prot['basis']}) − {prot['width']:.0f}% = **{prot['line']:,.0f}원** · 지금은 고점 대비 {prot['dd']:.1f}%")
+            else:
+                st.caption(f"수익 보호선은 아직 꺼져 있어요. 고점 기준 수익률이 +{prot['act']:.0f}%를 넘으면 켜져요(지금 고점 기준 {prot['peak_ret']:+.0f}%).")
     if sigs:
         for s in sigs:
             icon = {"주의": "⚠️", "매수검토": "🟢", "알림": "🔔"}[s["kind"]]
@@ -1050,7 +1118,7 @@ def tab_report(rules):
     report_financials(code)
     report_flow(code)
     report_consensus(code, ind["price"])
-    st.caption("개별 증권사 리포트 목록(증권사별 의견·목표가)은 아직 없어요.")
+    report_reports(code, ind["price"])
 
 
 
@@ -1463,6 +1531,10 @@ def tab_rules():
         r["중장기"]["점검선"] = st.number_input("점검선(손실 %)", value=r["중장기"]["점검선"], step=1.0)
         r["중장기"]["목표"] = st.number_input("목표수익률(%)", value=r["중장기"]["목표"], step=1.0, key="l_t")
         r["중장기"]["고점권"] = st.number_input("52주 고점권 기준(%)", value=r["중장기"]["고점권"], step=1.0)
+        r["중장기"]["보호활성"] = st.number_input("수익 보호 시작(고점 기준 수익률 % 이상)", value=float(r["중장기"]["보호활성"]), step=1.0, key="l_ta",
+                                            help="고점에서 이만큼 이상 수익이 난 적이 있어야 보호선이 켜져요.")
+        r["중장기"]["보호폭"] = st.number_input("수익 보호폭(고점 대비 % 하락)", value=float(r["중장기"]["보호폭"]), step=1.0, key="l_tw",
+                                           help="고점 대비 이만큼 내려오면 수익 보호선 도달이에요.")
     with b:
         st.markdown("**스윙**")
         r["스윙"]["손절선"] = st.number_input("손절선(%)", value=r["스윙"]["손절선"], step=0.5)
@@ -1470,6 +1542,8 @@ def tab_rules():
         r["스윙"]["RSI과열"] = st.number_input("RSI 과열(이상)", value=r["스윙"]["RSI과열"], step=1.0)
         r["스윙"]["눌림_하단"] = st.number_input("눌림 RSI 하단", value=r["스윙"]["눌림_하단"], step=1.0)
         r["스윙"]["눌림_상단"] = st.number_input("눌림 RSI 상단", value=r["스윙"]["눌림_상단"], step=1.0)
+        r["스윙"]["보호활성"] = st.number_input("수익 보호 시작(고점 기준 수익률 % 이상) ", value=float(r["스윙"]["보호활성"]), step=1.0, key="s_ta")
+        r["스윙"]["보호폭"] = st.number_input("수익 보호폭(고점 대비 % 하락) ", value=float(r["스윙"]["보호폭"]), step=1.0, key="s_tw")
     st.divider()
     st.markdown("**안전 기준** — 켜져 있는 항목만 점검해요. 확인하지 못한 항목은 '확인 불가'로 표시하고 미달로 치지 않아요.")
     s = st.session_state.safe
