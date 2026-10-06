@@ -4,7 +4,7 @@ import copy
 
 DEFAULT_SAFE = {
     "cap": {"on": True, "v": 1.0},      # 시가총액(조원) 이상
-    "loss": {"on": True, "v": 0},       # 최근 3년 영업적자 횟수 이하
+    "loss": {"on": True, "v": 1},       # 최근 3년 영업적자 횟수 이하
     "cover": {"on": True, "v": 3.0},    # 이자보상배율 이상
     "debt": {"on": True, "v": 200.0},   # 부채비율(%) 이하
     "ocf": {"on": True},                # 영업활동현금흐름 흑자
