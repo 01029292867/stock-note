@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import consensus
 import dart_data
 import discover
 import flows
@@ -28,6 +29,7 @@ CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
 WATCH_COLS = ["종목코드", "종목명"]
+CONS_COLS = ["날짜", "종목코드", "목표가", "의견점수"]
 FRESH_DAYS = 7  # 재무·공시 데이터를 이 기간 안에는 다시 가져오지 않는다
 STATUS_ICON = {"pass": "✅", "fail": "❌", "unknown": "❔", "na": "➖"}
 SAFE_LABELS = {
@@ -516,6 +518,117 @@ def flow_txt(fs):
     return "-" if not fs else f"외국인 {fs['f5']:+,.0f}억 · 기관 {fs['i5']:+,.0f}억"
 
 
+
+# ---------- 증권사 컨센서스 (네이버, 6시간 보관 + 구글 시트에 일별 기록) ----------
+CONS_TTL = 21600
+
+
+def load_cons_hist():
+    if "cons_hist" in st.session_state:
+        return
+    df, err = pd.DataFrame(columns=CONS_COLS), None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("컨센서스기록", CONS_COLS)
+        except Exception as e:
+            err = str(e)  # 읽지 못한 채로 저장하면 기존 기록을 덮어쓰므로 기록을 멈춘다
+    st.session_state.cons_hist, st.session_state.cons_hist_err = df, err
+
+
+def record_cons(items):
+    """items: [(종목코드, 데이터)]. 오늘 값이 아직 없을 때만 한 줄씩 추가한다(하루 한 번)."""
+    h = st.session_state.get("cons_hist")
+    if h is None or st.session_state.get("cons_hist_err"):
+        return
+    today = dt.date.today().isoformat()
+    rows = [[today, c, int(round(d["target"])), d["score"] if d["score"] is not None else ""]
+            for c, d in items if d and d.get("has") and d.get("target") and not ((h["종목코드"] == c) & (h["날짜"] == today)).any()]
+    if not rows:
+        return
+    new = pd.concat([h, pd.DataFrame(rows, columns=CONS_COLS)], ignore_index=True).tail(3000)
+    store = get_store()
+    try:
+        if store is not None:
+            store.write("컨센서스기록", new)
+        st.session_state.cons_hist = new
+    except Exception:
+        pass  # 기록 실패는 화면 표시에 영향을 주지 않는다
+
+
+def get_cons(code, force=False):
+    import time
+    store = st.session_state.setdefault("cons_df", {})
+    errs = st.session_state.setdefault("cons_err", {})
+    now = time.time()
+    if not force and code in store and now - store[code][1] < CONS_TTL:
+        return store[code][0], None
+    if not force and code in errs and now - errs[code][1] < 300:
+        return None, errs[code][0]
+    try:
+        d = consensus.fetch(code)
+    except Exception as e:
+        errs[code] = (str(e)[:250], now)
+        return None, errs[code][0]
+    store[code] = (d, now)
+    errs.pop(code, None)
+    record_cons([(code, d)])
+    return d, None
+
+
+def fetch_cons_bulk(codes, progress=None):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    now = time.time()
+    store = st.session_state.setdefault("cons_df", {})
+    errs = st.session_state.setdefault("cons_err", {})
+    todo = [c for c in dict.fromkeys(codes) if not (c in store and now - store[c][1] < CONS_TTL)]
+    errors, got = [], []
+
+    def one(c):
+        try:
+            return c, consensus.fetch(c), None
+        except Exception as e:
+            return c, None, str(e)[:250]
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for i, (c, d, e) in enumerate(ex.map(one, todo)):
+            if e:
+                errs[c] = (e, now)
+                errors.append(f"{st.session_state.get('disc_names', {}).get(c, c)}: {e}")
+            else:
+                store[c] = (d, now)
+                errs.pop(c, None)
+                got.append((c, d))
+            if progress:
+                progress(i + 1, len(todo))
+    record_cons(got)
+    return errors
+
+
+def cons_for(code):
+    cd = st.session_state.get("cons_df", {}).get(code)
+    return cd[0] if cd else None
+
+
+def cons_change(code):
+    """기록에서 목표가가 며칠 전보다 얼마나 바뀌었는지. 기록이 부족하면 None."""
+    h = st.session_state.get("cons_hist")
+    if h is None or h.empty:
+        return None
+    d = h[h["종목코드"] == code].copy()
+    d["날짜"] = pd.to_datetime(d["날짜"], errors="coerce")
+    d["목표가"] = pd.to_numeric(d["목표가"], errors="coerce")
+    d = d.dropna(subset=["날짜", "목표가"]).sort_values("날짜")
+    if len(d) < 2:
+        return None
+    last = d.iloc[-1]
+    old = d[d["날짜"] <= last["날짜"] - pd.Timedelta(days=25)]
+    base = old.iloc[-1] if len(old) else d.iloc[0]
+    days = (last["날짜"] - base["날짜"]).days
+    return None if days < 7 else (days, float((last["목표가"] / base["목표가"] - 1) * 100))
+
+
 # ---------- 계산 ----------
 def build_positions(hold, rules):
     rows = []
@@ -524,6 +637,8 @@ def build_positions(hold, rules):
         ind = sg.indicators(df)
         price = float(df["Close"].iloc[-1]) if len(df) else float("nan")
         qty, avg = float(r["수량"]), float(r["평균단가"])
+        cdat = cons_for(r["종목코드"])
+        cups = consensus.upside(cdat["target"], price) if cdat and cdat.get("has") else float("nan")
         fs = st.session_state.get("flow_sum", {}).get(r["종목코드"])
         sigs = sg.signals(ind, r["꼬리표"], avg, rules, fs) if ind and avg > 0 else []
         sres = safety_for(r["종목코드"])
@@ -541,10 +656,11 @@ def build_positions(hold, rules):
             {
                 "증권사": r["증권사"], "종목명": r["종목명"] or r["종목코드"], "종목코드": r["종목코드"],
                 "꼬리표": r["꼬리표"], "수량": qty, "평균단가": avg, "현재가": price,
-                "평가금액": qty * price, "투자원금": qty * avg,
+                "평가금액": qty * price, "투자원금": qty * avg, "수익금액": qty * (price - avg),
                 "수익률": (price / avg - 1) * 100 if avg > 0 else float("nan"),
                 "흐름": sg.flow_of(ind)[0] if ind else "시세 부족",
                 "수급(5일)": flow_txt(fs),
+                "목표가 여력(%)": cups,
                 "안전": s_label,
                 "판단": verdict,
                 "신호": sig_txt,
@@ -637,16 +753,21 @@ def tab_assets(rules):
         st.caption("내가 정한 규칙에 해당하는지 정리한 것이에요. 사고팔지는 직접 판단하세요. 판단은 가격 기준 규칙과 안전 점검 결과를 함께 반영해요. 안전 칸이 미조회면 안전 점검 탭에서 재무 데이터를 먼저 가져오세요.")
 
         st.subheader("보유 종목")
-        c1, c2 = st.columns([1, 3])
+        c1, c2, c3 = st.columns([1, 1, 3])
         if c1.button("보유 종목 수급 가져오기", key="flow_all"):
             bar = st.progress(0.0, text="수급을 가져오는 중…")
             errs = fetch_flows_bulk(pos["종목코드"].tolist(), lambda i, n: bar.progress(i / max(n, 1), text=f"수급 가져오는 중… ({i}/{n})"))
             st.session_state["flow_msg"] = errs
             st.rerun()
-        c2.caption("수급은 네이버 금융의 외국인·기관 매매 페이지를 읽어와요(30분 동안 저장). 서버에서 접속이 막히면 표시되지 않아요.")
+        if c2.button("보유 종목 컨센서스 가져오기", key="cons_all"):
+            bar = st.progress(0.0, text="증권사 컨센서스를 가져오는 중…")
+            errs = fetch_cons_bulk(pos["종목코드"].tolist(), lambda i, n: bar.progress(i / max(n, 1), text=f"컨센서스 가져오는 중… ({i}/{n})"))
+            st.session_state["flow_msg"] = [f"컨센서스 {e}" for e in errs]
+            st.rerun()
+        c3.caption("수급(30분 저장)과 증권사 컨센서스(6시간 저장)는 네이버 증권 데이터를 읽어와요. 서버에서 접속이 막히면 표시되지 않아요. 목표가 여력은 평균 목표가가 현재가보다 몇 % 높은지예요.")
         for e in st.session_state.pop("flow_msg", []) or []:
             st.warning(f"수급을 못 가져왔어요 — {e}")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익률", "흐름", "수급(5일)", "안전", "판단", "신호"]]
+        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "흐름", "수급(5일)", "목표가 여력(%)", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -656,18 +777,23 @@ def tab_assets(rules):
                 "평균단가": st.column_config.NumberColumn(format="%,d원"),
                 "현재가": st.column_config.NumberColumn(format="%,d원"),
                 "평가금액": st.column_config.NumberColumn(format="%,d원"),
+                "수익금액": st.column_config.NumberColumn(format="%,d원"),
                 "수익률": st.column_config.NumberColumn(format="%.1f%%"),
+                "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
             },
         )
     if len(kk):
         st.subheader("카카오 소수점 정기매수")
         kk2 = kk.copy()
+        kk2["수익금액"] = kk2["평가금액"] - kk2["투자원금"]
         kk2["손익률"] = (kk2["평가금액"] / kk2["투자원금"] - 1) * 100
+        kk2 = kk2[["증권사", "종목명", "회차", "투자원금", "평가금액", "수익금액", "손익률"]]
         st.dataframe(
             kk2, width="stretch", hide_index=True,
             column_config={
                 "투자원금": st.column_config.NumberColumn(format="%,d원"),
                 "평가금액": st.column_config.NumberColumn(format="%,d원"),
+                "수익금액": st.column_config.NumberColumn(format="%,d원"),
                 "손익률": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
@@ -819,6 +945,8 @@ def report_flow(code):
     st.caption(f"{sm['last']}까지의 자료예요. 외국인 연속 {abs(sm['f_streak'])}일 {'순매수' if sm['f_streak'] > 0 else '순매도'}, "
                f"기관 연속 {abs(sm['i_streak'])}일 {'순매수' if sm['i_streak'] > 0 else '순매도'}. 금액은 순매매량에 그날 종가를 곱한 추정치이고, "
                + ("개인은 제공되지 않아 기관·외국인의 반대로 계산한 값(기타 법인 등 포함)이에요. " if sm["indiv_est"] else "") + "수급은 참고 자료일 뿐 주가를 보장하지 않아요.")
+    if sm.get("sum5") is not None and not sm["indiv_est"]:
+        st.caption(f"외국인+기관+개인의 합이 5일 {sm['sum5']:+,.0f}억으로 0이 아닌 것은 기타 법인, 회사의 자사주 매입 등 나머지 주체가 따로 있기 때문이에요(네이버 금융 화면의 값과 같아요).")
     if sm.get("p5_given") is not None and sm["indiv_est"]:
         st.caption(f"참고: 네이버가 따로 준 개인 값은 5일 {sm['p5_given']:+,.0f}억이에요. 그런데 외국인+기관+개인의 합이 5일 {sm['sum5']:+,.0f}억으로 0에서 멀어서(보통 기타 법인 몫만큼만 벌어져요), "
                    "증권사 앱 값과 맞는 것이 확인되기 전까지는 개인을 기관·외국인의 반대로 추정해서 써요.")
@@ -827,6 +955,35 @@ def report_flow(code):
         cols = [c for c in ["날짜", "종가", "거래량", "기관", "외국인", "개인", "기관(억)", "외국인(억)", "개인제공(억)", "3주체합(억)", "외국인보유율"] if c in raw.columns]
         st.caption("증권사 앱과 비교할 때는 '기관', '외국인', '개인' 열(순매매량, 단위 주)을 같은 날짜끼리 보세요.")
         st.dataframe(raw[cols], width="stretch", hide_index=True)
+
+
+
+def report_consensus(code, price):
+    st.subheader("증권사 컨센서스")
+    d, err = get_cons(code)
+    if err:
+        st.warning(f"컨센서스를 가져오지 못했어요: {err}")
+        if st.button("다시 시도", key=f"cons_retry_{code}"):
+            get_cons(code, force=True)
+            st.rerun()
+        return
+    if not d["has"]:
+        st.info("이 종목은 증권사 컨센서스가 없어요(리포트를 내는 증권사가 없거나 적은 종목일 수 있어요).")
+        return
+    up = consensus.upside(d["target"], price)
+    k = st.columns(4)
+    k[0].metric("평균 목표주가", f"{d['target']:,.0f}원" if d["target"] else "-")
+    k[1].metric("현재가 대비 여력", "-" if up != up else f"{up:+.1f}%")
+    k[2].metric("투자의견 평균", "-" if d["score"] is None else f"{d['score']:.2f}점", consensus.label(d["score"]), delta_color="off")
+    k[3].metric("컨센서스 기준일", d["date"] or "-")
+    ch = cons_change(code)
+    if ch:
+        st.write(f"**{ch[0]}일 전 기록 대비 평균 목표가 {ch[1]:+.1f}%** — 목표가가 {'올라가고' if ch[1] > 0 else '내려가고' if ch[1] < 0 else '그대로이고'} 있어요.")
+    else:
+        st.caption("목표가의 변화는 기록이 쌓이면 보여줘요. 앱에서 컨센서스를 가져올 때마다 하루 한 번 구글 시트(컨센서스기록 탭)에 저장돼요.")
+    if up == up and up < 0:
+        st.warning("현재가가 평균 목표가보다 높아요. 컨센서스는 늦게 갱신돼서 오른 종목에서는 흔한 일이지만, 증권사가 보는 목표 수준을 넘었다는 뜻이에요.")
+    st.caption("평균 목표주가는 증권사들의 전망일 뿐이고 틀리는 경우도 많아요. 증권사 의견은 매수가 대부분이라 점수가 높게 나오는 게 보통이라, 점수 자체보다 목표가가 올라가는지 내려가는지와 의견이 바뀌는지가 더 중요해요. 5점 만점(5 적극매수 ~ 1 적극매도)이고, 네이버 증권 데이터예요.")
 
 
 def tab_report(rules):
@@ -892,7 +1049,8 @@ def tab_report(rules):
         st.write("지금은 내 기준에 걸리는 신호가 없어요.")
     report_financials(code)
     report_flow(code)
-    st.caption("증권사 리포트는 다음 단계에서 이 화면에 붙어요.")
+    report_consensus(code, ind["price"])
+    st.caption("개별 증권사 리포트 목록(증권사별 의견·목표가)은 아직 없어요.")
 
 
 
@@ -976,6 +1134,9 @@ def run_detail(codes):
     fe = fetch_flows_bulk(codes)
     if fe:
         st.warning(f"수급을 가져오지 못한 종목이 {len(fe)}개 있어요(예: {fe[0]})")
+    ce = fetch_cons_bulk(codes)
+    if ce:
+        st.warning(f"컨센서스를 가져오지 못한 종목이 {len(ce)}개 있어요(예: {ce[0]})")
     st.session_state.disc_detail = list(codes)
     if errors:
         st.error("가져오지 못한 종목이 있어요:\n\n" + "\n\n".join(errors))
@@ -1074,6 +1235,7 @@ def tab_discover():
             "종목코드": c, "종목명": st.session_state.disc_names.get(c, c), "안전": safety.headline(items),
             "미달 항목": ", ".join(i["label"] for i in items if i["status"] == "fail") or "-",
             "확인 불가": ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-",
+            "목표가 여력(%)": (consensus.upside(cons_for(c)["target"], float(df["Close"].iloc[-1])) if (cons_for(c) or {}).get("has") and len(df) else np.nan),
             "외국인 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("f5", np.nan),
             "기관 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("i5", np.nan),
             "흐름": sg.flow_of(ind)[0] if ind else "-", "52주 위치(%)": ind["pos"] if ind else np.nan,
@@ -1085,7 +1247,8 @@ def tab_discover():
     st.dataframe(rdf, width="stretch", hide_index=True, column_config={
         "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"), "RSI": st.column_config.NumberColumn(format="%.0f"),
         "3개월(%)": st.column_config.NumberColumn(format="%.1f"),
-        "외국인 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "기관 5일(억)": st.column_config.NumberColumn(format="%+,.0f")})
+        "외국인 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "기관 5일(억)": st.column_config.NumberColumn(format="%+,.0f"),
+        "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f")})
     st.caption("52주 위치가 낮을수록 1년 중 싼 구간이고, RSI가 70 이상이면 단기 과열이에요. 자세한 재무와 근거는 종목 리포트 탭에서 종목코드를 직접 입력해 확인할 수 있어요.")
     names = {f"{r['종목명']} ({r['종목코드']})": (r["종목코드"], r["종목명"]) for r in rows}
     pick = st.multiselect("관심종목에 추가", list(names))
@@ -1340,6 +1503,7 @@ def main():
     load_settings()
     load_watch()
     load_perf()
+    load_cons_hist()
     load_fincache()
     rules = st.session_state.rules
 
