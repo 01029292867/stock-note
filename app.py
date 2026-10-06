@@ -304,11 +304,25 @@ def _admin_cached():
 
 
 def admin_codes():
-    """관리종목 코드 집합. 거래소 목록을 못 불러오면 None(확인 불가)."""
-    try:
-        return set(_admin_cached())
-    except Exception:
+    """관리종목 코드 집합. 거래소 목록을 못 불러오면 None(확인 불가). 실패하면 10분 동안은 다시 시도하지 않는다."""
+    import time
+    if time.time() - st.session_state.get("admin_err_ts", 0) < 600:
         return None
+    try:
+        s = set(_admin_cached())
+        st.session_state.pop("admin_err", None)
+        return s
+    except Exception as e:
+        st.session_state["admin_err"] = str(e)[:300]
+        st.session_state["admin_err_ts"] = time.time()
+        return None
+
+
+def admin_notice():
+    """관리종목 목록을 못 불러왔을 때 안내 문구(아니면 None)."""
+    admin_codes()
+    e = st.session_state.get("admin_err")
+    return None if not e else f"거래소 관리종목 목록을 불러오지 못해서 '관리종목 지정 없음'은 확인 불가로 표시해요. (사유: {e})"
 
 
 def safety_for(code):
@@ -320,6 +334,10 @@ def safety_for(code):
     price = float(df["Close"].iloc[-1]) if len(df) else None
     adm = admin_codes()
     m = safety.derive(d, price, market.avg_trading_value_eok(df), None if adm is None else (code in adm))
+    if m["cap_jo"] is None and not m["is_pref"]:
+        hint = st.session_state.get("disc_cap", {}).get(code)  # DART 주식 수를 못 구했으면 종목 목록의 시가총액을 쓴다
+        if hint and hint == hint:
+            m["cap_jo"] = float(hint)
     return m, safety.evaluate(m, st.session_state.safe)
 
 
@@ -725,6 +743,7 @@ def run_discovery(f, manual_codes=None):
         bar.empty()
         st.session_state.disc_res = {"fail": str(e)}
         return
+    st.session_state.disc_cap = {c: m / 1e12 for c, m in zip(uni["Code"], uni["Marcap"]) if m == m}
     held = set(st.session_state.hold["종목코드"]) if st.session_state.get("disc_excl_held", True) else set()
     s1, notes = discover.stage1(uni, f, exclude=held)
     bar.progress(0.3, text=f"DART 재무 일괄 조회 중… ({len(s1)}개)")
@@ -736,7 +755,8 @@ def run_discovery(f, manual_codes=None):
         return
     tbl = discover.metrics_table(s1, fin)
     st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes,
-                                 "errors": errs, "manual": bool(manual_codes), "ts": dt.datetime.now().strftime("%m-%d %H:%M")}
+                                 "errors": errs, "manual": bool(manual_codes), "ts": dt.datetime.now().strftime("%m-%d %H:%M"),
+                                 "dept": uni["Dept"].replace("", "(비어 있음)").value_counts().head(15).to_dict() if "Dept" in uni else {}}
     bar.progress(1.0, text="완료")
 
 
@@ -822,6 +842,9 @@ def tab_discover():
         st.info("조건을 모두 통과한 종목이 없어요. 위의 발굴 조건에서 ROE·PER 같은 기준을 조금 완화해 보세요.")
         return
 
+    if res.get("dept"):
+        with st.expander("목록 진단 (소속부 분포)"):
+            st.write(res["dept"])
     st.subheader("③ 상위 후보 상세 점검")
     st.caption("안전 기준(DART 공시)과 가격 흐름까지 확인해요. 종목마다 10~30초 걸리고, 가져온 데이터는 7일 동안 저장돼요.")
     n = st.slider("상위 몇 개를 점검할까요", 3, 30, min(10, max(3, min(30, len(cand)))))
@@ -830,6 +853,9 @@ def tab_discover():
     det = [c for c in st.session_state.get("disc_detail", []) if c in set(cand["종목코드"])]
     if not det:
         return
+    note = admin_notice()
+    if note:
+        st.warning(note)
     only_safe = st.checkbox("안전 기준 미달 종목 숨기기", value=False)
     rows = []
     for c in det:
@@ -874,6 +900,9 @@ def tab_safety():
     if dart is None:
         st.warning(f"{err} Streamlit Secrets에 DART_API_KEY를 넣어 주세요.")
         return
+    note = admin_notice()
+    if note:
+        st.warning(note)
     uniq = hold.drop_duplicates("종목코드")[["종목코드", "종목명"]].to_dict("records")
     todo = [r for r in uniq if not (st.session_state.fincache.get(r["종목코드"]) and is_fresh(st.session_state.fincache[r["종목코드"]]))]
     c1, c2 = st.columns([1, 3])

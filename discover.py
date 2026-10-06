@@ -54,21 +54,35 @@ def normalize_listing(df):
         d[c] = pd.to_numeric(d[c], errors="coerce")
     if "Market" not in d.columns:
         d["Market"] = ""
+    if "Dept" not in d.columns:
+        d["Dept"] = ""
+    d["Dept"] = d["Dept"].fillna("").astype(str)
     d["Code"] = d["Code"].astype(str).str.strip().str.upper().str.zfill(6)
     d["Name"] = d["Name"].astype(str)
-    return d[["Code", "Name", "Market", "Close", "Marcap", "Amount"]].drop_duplicates("Code").reset_index(drop=True)
+    return d[["Code", "Name", "Market", "Dept", "Close", "Marcap", "Amount"]].drop_duplicates("Code").reset_index(drop=True)
 
 
 def manual_listing(codes):
     codes = [str(c).strip().upper().zfill(6) for c in codes if str(c).strip()]
-    return pd.DataFrame({"Code": list(dict.fromkeys(codes)), "Name": "", "Market": "", "Close": np.nan, "Marcap": np.nan, "Amount": np.nan})
+    return pd.DataFrame({"Code": list(dict.fromkeys(codes)), "Name": "", "Market": "", "Dept": "", "Close": np.nan, "Marcap": np.nan, "Amount": np.nan})
 
 
-def load_admin_codes():
-    """관리종목으로 지정된 종목코드 집합. 실패하면 예외."""
-    import FinanceDataReader as fdr
-    df = fdr.StockListing("KRX-ADMINISTRATIVE")
-    return set(df["Symbol"].astype(str).str.strip().str.zfill(6))
+def load_admin_codes(timeout=20):
+    """관리종목으로 지정된 종목코드 집합. 실패하거나 오래 걸리면 예외."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FTimeout
+
+    def _go():
+        import FinanceDataReader as fdr
+        df = fdr.StockListing("KRX-ADMINISTRATIVE")
+        return set(df["Symbol"].astype(str).str.strip().str.zfill(6))
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(_go).result(timeout=timeout)
+    except FTimeout:
+        raise RuntimeError(f"{timeout}초 안에 응답이 없었어요")
+    finally:
+        ex.shutdown(wait=False)
 
 
 def is_common_stock(code, name):
