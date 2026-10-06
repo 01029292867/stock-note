@@ -1563,7 +1563,25 @@ def tab_rules():
     st.caption("숫자를 바꾼 뒤 '규칙 저장'을 눌러야 구글 시트에 남아요. 누르지 않으면 이 화면에서만 적용되고 새로고침하면 사라져요.")
 
 
+# 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
+REQUIRED_VERSIONS = {"signals": 2}
+
+
+def check_versions():
+    import importlib
+    old = []
+    for name, need in REQUIRED_VERSIONS.items():
+        mod = importlib.import_module(name)
+        if getattr(mod, "VERSION", 0) < need:
+            old.append(f"{name}.py")
+    if old:
+        st.title("📈 내 투자 노트")
+        st.error("GitHub에 올라간 파일 중 예전 버전이 남아 있어요: **" + ", ".join(old) + "**. 최신 파일을 올린 뒤 앱을 다시 시작(Reboot)해 주세요.")
+        st.stop()
+
+
 def main():
+    check_versions()
     gate()
     load_tables()
     if "rules" not in st.session_state:

@@ -1,10 +1,12 @@
 """가격 기반 신호 계산 (시세만으로 판단 가능한 규칙)."""
+VERSION = 2  # 2: 매수일 이후 고점(indicators의 since), 수익 보호선(protect), 수급 신호
+
 import numpy as np
 import pandas as pd
 
 DEFAULT_RULES = {
-    "중장기": {"점검선": -20.0, "목표": 30.0, "고점권": 90.0},
-    "스윙": {"손절선": -7.0, "목표": 15.0, "RSI과열": 70.0, "눌림_하단": 35.0, "눌림_상단": 55.0},
+    "중장기": {"점검선": -20.0, "목표": 30.0, "고점권": 90.0, "보호활성": 30.0, "보호폭": 20.0},
+    "스윙": {"손절선": -7.0, "목표": 15.0, "RSI과열": 70.0, "눌림_하단": 35.0, "눌림_상단": 55.0, "보호활성": 10.0, "보호폭": 8.0},
 }
 
 
@@ -17,8 +19,8 @@ def rsi(close: pd.Series, n: int = 14) -> float:
     return float(100 - 100 / (1 + gain / loss))
 
 
-def indicators(df: pd.DataFrame) -> dict | None:
-    """df: 날짜 인덱스, 'Close' 컬럼. 최소 61행 필요."""
+def indicators(df: pd.DataFrame, since=None) -> dict | None:
+    """df: 날짜 인덱스, 'Close' 컬럼. 최소 61행 필요. since(매수일)가 있으면 그 이후의 고점을 쓴다."""
     if df is None or df.empty or "Close" not in df or len(df) < 61:
         return None
     c = df["Close"].astype(float).dropna()
@@ -27,7 +29,14 @@ def indicators(df: pd.DataFrame) -> dict | None:
     last = c.iloc[-1]
     yr = c.tail(250)
     hi, lo = yr.max(), yr.min()
+    seg, basis = yr, "최근 1년"
+    ts = pd.to_datetime(since, errors="coerce") if since else pd.NaT
+    if pd.notna(ts):
+        s2 = c[c.index >= ts]
+        if len(s2):
+            seg, basis = s2, "매수일 이후"
     return {
+        "peak": float(seg.max()), "peak_date": seg.idxmax().date().isoformat(), "peak_basis": basis,
         "price": float(last),
         "prev": float(c.iloc[-2]),
         "ma20": float(c.tail(20).mean()),
@@ -40,6 +49,22 @@ def indicators(df: pd.DataFrame) -> dict | None:
         "m3": float((last / c.iloc[-61] - 1) * 100),
         "day": float((last / c.iloc[-2] - 1) * 100),
     }
+
+
+def protect(ind: dict, tag: str, avg, rules: dict) -> dict | None:
+    """수익 보호선: 고점 수익률이 활성 기준 이상이 된 뒤, 고점 대비 보호폭만큼 내려가면 도달."""
+    if not ind or not avg or avg <= 0 or not ind.get("peak"):
+        return None
+    R = rules[tag]
+    act, w = R.get("보호활성"), R.get("보호폭")
+    if act is None or w is None:
+        return None
+    peak_ret = (ind["peak"] / avg - 1) * 100
+    active = peak_ret >= act
+    line = ind["peak"] * (1 - w / 100)
+    return {"active": active, "line": line, "dd": (ind["price"] / ind["peak"] - 1) * 100, "peak": ind["peak"],
+            "peak_date": ind.get("peak_date"), "peak_ret": peak_ret, "width": w, "act": act,
+            "hit": bool(active and ind["price"] <= line), "basis": ind.get("peak_basis")}
 
 
 def flow_of(ind: dict) -> tuple[str, str]:
@@ -66,6 +91,10 @@ def signals(ind: dict, tag: str, avg: float | None, rules: dict, flow: dict | No
             out.append({"kind": "주의", "title": f"{key} 도달", "detail": f"수익률 {ret:.1f}% (기준 {R[key]:.0f}%)"})
         if ret >= R["목표"]:
             out.append({"kind": "알림", "title": "목표수익률 도달", "detail": f"수익률 +{ret:.1f}% (기준 +{R['목표']:.0f}%)"})
+    pr = protect(ind, tag, avg, rules)
+    if pr and pr["hit"]:
+        out.append({"kind": "주의", "title": "수익 보호선 도달",
+                    "detail": f"고점 {pr['peak']:,.0f}원({pr['peak_date']}) 대비 {pr['dd']:.1f}% · 보호폭 {pr['width']:.0f}% · 고점 기준 수익률 +{pr['peak_ret']:.0f}%"})
     if tag == "중장기":
         if ind["pos"] >= R["고점권"]:
             out.append({"kind": "주의", "title": "52주 고점권", "detail": f"52주 범위 중 {ind['pos']:.0f}% 지점"})
