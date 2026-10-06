@@ -5,5 +5,6 @@ altair
 requests
 finance-datareader
 yfinance
-opendartreader
+lxml
+beautifulsoup4
 html5lib

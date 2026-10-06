@@ -234,7 +234,7 @@ def load_tables(force=False):
 
 
 # ---------- DART 재무·공시 (구글 시트에 캐시) ----------
-DART_CLIENT_VER = "3"  # DartClient 코드를 바꾸면 이 숫자를 올려서 예전 객체가 재사용되지 않게 한다
+DART_CLIENT_VER = "4"  # DartClient 코드를 바꾸면 이 숫자를 올려서 예전 객체가 재사용되지 않게 한다
 
 
 @st.cache_resource(show_spinner=False)

@@ -47,21 +47,48 @@ def _call(api_key, endpoint, params, timeout=25):
 
 
 class DartClient:
+    """DART 접속. 종목코드 -> 회사 고유번호 목록(corpCode.xml)을 직접 받아서 쓴다(외부 라이브러리 없음)."""
+
     def __init__(self, api_key):
-        import OpenDartReader  # 이 라이브러리는 import한 이름 자체가 클래스예요
         self.api_key = api_key
-        self._r = OpenDartReader(api_key)
+        self._map = self._load_map()
+
+    def _load_map(self):
+        import io
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        r = requests.get(BASE + "corpCode.xml", params={"crtfc_key": self.api_key}, timeout=60)
+        r.raise_for_status()
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+        except zipfile.BadZipFile:
+            # 인증키 오류 등은 zip이 아니라 XML 오류 문구로 온다
+            try:
+                tree = ET.XML(r.content)
+                raise DartError(f"DART 응답 {tree.findtext('status')}: {tree.findtext('message')}")
+            except ET.ParseError:
+                raise DartError("DART 회사 목록을 읽지 못했어요(응답 형식이 달라요).")
+        root = ET.XML(zf.read("CORPCODE.xml"))
+        m = {}
+        for it in root.findall("list"):
+            sc = (it.findtext("stock_code") or "").strip()
+            if sc:
+                m[sc.zfill(6)] = (it.findtext("corp_code") or "").strip()
+        if not m:
+            raise DartError("DART 회사 목록이 비어 있어요.")
+        return m
 
     def resolve(self, stock_code):
         """종목코드 -> (회사 고유번호, 실제 조회에 쓴 종목코드).
         우선주(코드 끝자리 5·7·9·K·L·M)는 DART에 따로 등록돼 있지 않아서 보통주 회사로 연결한다."""
         code = str(stock_code).zfill(6)
-        c = self._r.find_corp_code(code)
+        c = self._map.get(code)
         if c:
             return c, code
         if code[-1] in "579KLM":
             base = code[:5] + "0"
-            c = self._r.find_corp_code(base)
+            c = self._map.get(base)
             if c:
                 return c, base
         raise DartError("DART에서 이 종목코드의 회사를 찾지 못했어요(상장사가 맞는지 확인하세요).")
@@ -71,10 +98,6 @@ class DartClient:
 
     def corp_map(self):
         """{종목코드: 회사 고유번호} (상장사만)"""
-        if not hasattr(self, "_map"):
-            df = self._r.corp_codes
-            df = df[df["stock_code"].fillna("").astype(str).str.strip().ne("")]
-            self._map = dict(zip(df["stock_code"].astype(str).str.zfill(6), df["corp_code"].astype(str)))
         return self._map
 
 
