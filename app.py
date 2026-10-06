@@ -234,8 +234,11 @@ def load_tables(force=False):
 
 
 # ---------- DART 재무·공시 (구글 시트에 캐시) ----------
+DART_CLIENT_VER = "3"  # DartClient 코드를 바꾸면 이 숫자를 올려서 예전 객체가 재사용되지 않게 한다
+
+
 @st.cache_resource(show_spinner=False)
-def _make_dart(key):
+def _make_dart(key, ver):
     return dart_data.DartClient(key)
 
 
@@ -244,7 +247,7 @@ def get_dart():
     if not key:
         return None, "DART_API_KEY가 설정되어 있지 않아요."
     try:
-        return _make_dart(key), None
+        return _make_dart(key, DART_CLIENT_VER), None
     except Exception as e:
         return None, f"DART 연결에 실패했어요: {e}"
 
