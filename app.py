@@ -1,8 +1,10 @@
 """내 투자 노트 - 2단계: 내 자산 + 안전 점검(DART) + 종목 리포트 (실제 시세, 구글 시트 저장)"""
 import copy
 import datetime as dt
+import hashlib
 import hmac
 import json
+import time
 
 import altair as alt
 import numpy as np
@@ -556,24 +558,62 @@ def safety_for(code):
 
 
 # ---------- 시세(캐시) ----------
-@st.cache_data(ttl=900, show_spinner=False)
+# 화면을 다시 그릴 때마다 이 파일이 처음부터 실행되므로, 시세는 다시 실행돼도 남는 저장소(cache_resource)에 둔다.
+# 이 앱은 사용자가 한 명이라 공유해도 안전하고, 스레드에서 동시에 가져와도 안전하다.
+@st.cache_resource
+def _price_store():
+    return {}
+
+
+_PRICE_CACHE = _price_store()
+PRICE_TTL = 900
+
+
+def _cached(key, fn, ttl=PRICE_TTL):
+    now = time.time()
+    hit = _PRICE_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    df = fn()
+    # 실패(빈 결과)는 1분만 기억해서 곧 다시 시도한다
+    _PRICE_CACHE[key] = (now if len(df) else now - (ttl - 60), df)
+    return df
+
+
 def hist_kr(code):
-    return market.history_kr(code)
+    return _cached(("kr", code), lambda: market.history_kr(code))
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def hist_us(ticker):
-    return market.history_us(ticker)
+    return _cached(("us", ticker), lambda: market.history_us(ticker))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def hist_index():
-    return market.history_index()
+    return _cached(("idx",), lambda: market.history_index(), 3600)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def hist_fx():
-    return market.history_fx()
+    return _cached(("fx",), lambda: market.history_fx())
+
+
+def prefetch_prices():
+    """보유·관심 종목과 정기매수 시세를 동시에 가져와 캐시를 채운다. 하나씩 가져오는 것보다 훨씬 빠르다."""
+    from concurrent.futures import ThreadPoolExecutor
+    now = time.time()
+    jobs = []
+    for c in dict.fromkeys(list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"])):
+        if not (("kr", c) in _PRICE_CACHE and now - _PRICE_CACHE[("kr", c)][0] < PRICE_TTL):
+            jobs.append(lambda c=c: hist_kr(c))
+    for t in dict.fromkeys(st.session_state.kakao["티커"]):
+        if not (("us", t) in _PRICE_CACHE and now - _PRICE_CACHE[("us", t)][0] < PRICE_TTL):
+            jobs.append(lambda t=t: hist_us(t))
+    if len(st.session_state.kakao) and not (("fx",) in _PRICE_CACHE and now - _PRICE_CACHE[("fx",)][0] < PRICE_TTL):
+        jobs.append(hist_fx)
+    if not jobs:
+        return
+    with st.spinner(f"시세 {len(jobs)}개를 가져오는 중이에요…"):
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(lambda f: f(), jobs))
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -827,6 +867,48 @@ def build_kakao(kakao):
     return pd.DataFrame(rows)
 
 
+
+def _sig(*parts):
+    return hashlib.md5("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+
+
+def get_positions(hold, rules):
+    """보유 종목 표 계산(비싼 계산)을 입력이 같으면 다시 하지 않는다."""
+    ss = st.session_state
+    key = _sig(hold.to_json(), json.dumps(rules, sort_keys=True), json.dumps(ss.safe, sort_keys=True),
+               sorted((k, round((v or {}).get("f5", 0)), round((v or {}).get("i5", 0))) for k, v in ss.get("flow_sum", {}).items()),
+               sorted((k, v[1]) for k, v in ss.get("cons_df", {}).items()),
+               sorted((k, d.get("fetched")) for k, d in ss.get("fincache", {}).items()),
+               sorted(ss.get("disc_cap", {}).items())[:1], int(time.time() // 120))
+    c = ss.get("_pos_cache")
+    if c and c[0] == key:
+        return c[1]
+    df = build_positions(hold, rules)
+    ss["_pos_cache"] = (key, df)
+    return df
+
+
+def get_kakao(kakao):
+    key = _sig(kakao.to_json(), int(time.time() // 120))
+    c = st.session_state.get("_kk_cache")
+    if c and c[0] == key:
+        return c[1]
+    df = build_kakao(kakao)
+    st.session_state["_kk_cache"] = (key, df)
+    return df
+
+
+def portfolio_value(rules):
+    """보유 주식 평가금액 합계(시세를 못 가져온 종목은 뺀다). 없으면 None."""
+    hold, kakao = st.session_state.hold, st.session_state.kakao
+    val = 0.0
+    if len(hold):
+        val += float(get_positions(hold, rules)["평가금액"].sum(skipna=True))
+    if len(kakao):
+        val += float(get_kakao(kakao)["평가금액"].sum(skipna=True))
+    return val if val > 0 else None
+
+
 def man(n):
     return "-" if pd.isna(n) else f"{n / 1e4:,.0f}만원"
 
@@ -838,8 +920,8 @@ def pct(n):
 # ---------- 화면 ----------
 def tab_assets(rules):
     hold, kakao = st.session_state.hold, st.session_state.kakao
-    pos = build_positions(hold, rules) if len(hold) else pd.DataFrame()
-    kk = build_kakao(kakao) if len(kakao) else pd.DataFrame()
+    pos = get_positions(hold, rules) if len(hold) else pd.DataFrame()
+    kk = get_kakao(kakao) if len(kakao) else pd.DataFrame()
 
     ok_pos = pos[pos["평가금액"].notna()] if len(pos) else pos
     ok_kk = kk[kk["평가금액"].notna()] if len(kk) else kk
@@ -1332,7 +1414,9 @@ def tab_report(rules):
             opts[f"{w['종목명'] or w['종목코드']} ({w['종목코드']}) · 관심"] = {
                 "증권사": "-", "종목코드": w["종목코드"], "종목명": w["종목명"], "꼬리표": "중장기", "수량": 0, "평균단가": 0}
     labels = list(opts) + ["직접 입력"]
-    pick = st.selectbox("종목 선택", labels)
+    if st.session_state.get("rep_select") not in labels:
+        st.session_state.pop("rep_select", None)
+    pick = st.selectbox("종목 선택", labels, key="rep_select")
     if pick == "직접 입력":
         code = st.text_input("종목코드(6자리)", value="005930").strip().zfill(6)
         held, tag_default, avg = None, "중장기", None
@@ -1614,13 +1698,36 @@ def tab_discover():
 def current_stock_value(rules):
     """지금 보유 주식의 평가금액 합계. 시세를 하나라도 못 가져오면 (None, 못 가져온 종목)."""
     hold, kakao = st.session_state.hold, st.session_state.kakao
-    pos = build_positions(hold, rules) if len(hold) else pd.DataFrame()
-    kk = build_kakao(kakao) if len(kakao) else pd.DataFrame()
+    pos = get_positions(hold, rules) if len(hold) else pd.DataFrame()
+    kk = get_kakao(kakao) if len(kakao) else pd.DataFrame()
     missing = (pos[pos["평가금액"].isna()]["종목명"].tolist() if len(pos) else []) + (kk[kk["평가금액"].isna()]["종목명"].tolist() if len(kk) else [])
     if missing:
         return None, missing
     val = (pos["평가금액"].sum() if len(pos) else 0.0) + (kk["평가금액"].sum() if len(kk) else 0.0)
     return float(val), []
+
+
+
+def maybe_auto_snapshot(rules):
+    """앱을 연 날 하루 한 번 총자산을 자동으로 기록한다(어느 화면을 열든 시작할 때 한 번)."""
+    today = dt.date.today().isoformat()
+    if st.session_state.get("perf_auto") == today or st.session_state.get("perf_err") or st.session_state.get("load_error"):
+        return
+    if not len(st.session_state.hold):
+        return
+    stock_val, missing = current_stock_value(rules)
+    if not stock_val or missing:
+        return  # 시세를 못 가져온 종목이 있으면 자산이 작게 기록되므로 건너뛴다
+    snaps_raw = st.session_state.perf_snaps
+    snaps = perf.clean_snaps(snaps_raw)
+    st.session_state.perf_auto = today
+    if len(snaps) and (snaps["날짜"] == pd.Timestamp(today)).any():
+        return
+    last_cash = float(snaps["현금"].dropna().iloc[-1]) if len(snaps) and snaps["현금"].notna().any() else 0.0
+    row = pd.DataFrame([[today, stock_val, last_cash, stock_val + last_cash, "자동", "현금은 마지막 기록값"]], columns=perf.SNAP_COLS)
+    ok, msg = save_perf(snaps=pd.concat([snaps_view(snaps_raw), row], ignore_index=True))
+    if not ok:
+        st.session_state["auto_snap_err"] = msg
 
 
 def tab_perf(rules):
@@ -1649,20 +1756,12 @@ def tab_perf(rules):
     last_cash = float(snaps["현금"].dropna().iloc[-1]) if len(snaps) and snaps["현금"].notna().any() else 0.0
     today = pd.Timestamp(dt.date.today())
 
-    # 하루 한 번 자동 기록
-    if (stock_val and stock_val > 0 and st.session_state.get("perf_auto") != str(today.date())
-            and not st.session_state.get("perf_err") and not st.session_state.get("load_error")
-            and not (len(snaps) and (snaps["날짜"] == today).any())):
-        st.session_state.perf_auto = str(today.date())
-        row = pd.DataFrame([[str(today.date()), stock_val, last_cash, stock_val + last_cash, "자동", "현금은 마지막 기록값"]], columns=perf.SNAP_COLS)
-        ok, msg = save_perf(snaps=pd.concat([snaps_view(snaps_raw), row], ignore_index=True))
-        if ok:
-            snaps_raw = st.session_state.perf_snaps
-            snaps = perf.clean_snaps(snaps_raw)
-        else:
-            st.error(f"오늘 자산을 자동으로 기록하지 못했어요: {msg}")
+    snaps_raw = st.session_state.perf_snaps
+    snaps = perf.clean_snaps(snaps_raw)
     if missing:
         st.warning("시세를 가져오지 못한 종목이 있어서 오늘 자산을 자동 기록하지 않았어요: " + ", ".join(missing))
+    if st.session_state.get("auto_snap_err"):
+        st.error(f"오늘 자산을 자동으로 기록하지 못했어요: {st.session_state['auto_snap_err']}")
 
     flows = perf.all_flows(st.session_state.perf_flows, st.session_state.kakao, goal["kakao_flow"],
                            snaps["날짜"].min() if len(snaps) else today, snaps["날짜"].max() if len(snaps) else today)
@@ -2009,26 +2108,25 @@ def main():
     load_fincache()
     rules = st.session_state.rules
 
+    for k in ("rep_select", "jr_h", "jm_all", "disc_excl_held"):  # 다른 화면에 갔다 와도 선택을 유지한다
+        if k in st.session_state:
+            st.session_state[k] = st.session_state[k]
+    prefetch_prices()
+    st.session_state["total_val"] = portfolio_value(rules)
+    maybe_auto_snapshot(rules)
+
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
-    t1, t6, t5, t2, t3, t7, t4 = st.tabs(["내 자산", "목표·성과", "종목 발굴", "안전 점검", "종목 리포트", "판단 기록", "규칙"])
-    with t1:
-        tab_assets(rules)
-    with t6:
-        tab_perf(rules)
-    with t5:
-        tab_discover()
-    with t2:
-        tab_safety()
-    with t3:
-        tab_report(rules)
-    with t7:
-        tab_journal(rules)
-    with t4:
-        tab_rules()
+    pages = {"내 자산": lambda: tab_assets(rules), "목표·성과": lambda: tab_perf(rules), "종목 발굴": tab_discover, "안전 점검": tab_safety,
+             "종목 리포트": lambda: tab_report(rules), "판단 기록": lambda: tab_journal(rules), "규칙": tab_rules}
+    page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
+    pages[page]()  # 고른 화면만 계산해서 빠르다
     with st.sidebar:
         if st.button("시세 새로고침"):
             st.cache_data.clear()
+            _price_store().clear()
+            st.session_state.pop("_pos_cache", None)
+            st.session_state.pop("_kk_cache", None)
             st.rerun()
         if get_store() is None:
             st.info("데모 모드")
