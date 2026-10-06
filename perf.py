@@ -33,12 +33,25 @@ def clean_flows(df):
     return d.dropna(subset=["날짜", "금액"]).sort_values("날짜").reset_index(drop=True)
 
 
+def kakao_start(r, today=None):
+    """정기매수 한 줄의 시작일. 횟수와 기준일이 있으면 기준일 기준 (횟수-1) 영업일 전, 없으면 시작일."""
+    cnt = pd.to_numeric(r.get("횟수"), errors="coerce")
+    if pd.notna(cnt):
+        a = pd.to_datetime(r.get("기준일"), errors="coerce")
+        a = (today or pd.Timestamp.today().normalize()) if pd.isna(a) else a
+        c = int(cnt)
+        if c >= 1:
+            return pd.bdate_range(end=a, periods=c)[0]
+        return a + pd.offsets.BDay(1)
+    return pd.to_datetime(r.get("시작일"), errors="coerce")
+
+
 def kakao_flows(kakao_df, start, end):
     """카카오 정기매수를 매 영업일 외부 입금으로 본다. start 다음날부터 end까지."""
     rows = []
     if kakao_df is not None and len(kakao_df):
         for r in kakao_df.to_dict("records"):
-            s = pd.to_datetime(r.get("시작일"), errors="coerce")
+            s = kakao_start(r)
             amt = pd.to_numeric(r.get("하루금액"), errors="coerce")
             if pd.isna(s) or pd.isna(amt) or amt <= 0:
                 continue

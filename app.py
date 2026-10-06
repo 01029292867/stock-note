@@ -25,7 +25,7 @@ st.set_page_config(page_title="내 투자 노트", page_icon="📈", layout="wid
 BROKERS = ["키움", "한국투자", "카카오", "토스"]
 TAGS = ["중장기", "스윙"]
 HOLD_COLS = ["증권사", "종목코드", "종목명", "꼬리표", "수량", "평균단가", "매수일"]
-KAKAO_COLS = ["종목명", "티커", "하루금액", "시작일"]
+KAKAO_COLS = ["종목명", "티커", "하루금액", "횟수", "기준일", "시작일"]
 CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
@@ -50,7 +50,7 @@ DEMO_HOLD = pd.DataFrame(
     ],
     columns=HOLD_COLS,
 )
-DEMO_KAKAO = pd.DataFrame([["엔비디아", "NVDA", 3000, "2026-03-02"]], columns=KAKAO_COLS)
+DEMO_KAKAO = pd.DataFrame([["엔비디아", "NVDA", 3000, None, "", "2026-03-02"]], columns=KAKAO_COLS)
 
 
 # ---------- 설정/보안 ----------
@@ -292,9 +292,32 @@ def clean_kakao(df: pd.DataFrame) -> pd.DataFrame:
     df["티커"] = df["티커"].astype(str).str.strip().str.upper()
     df = df[df["티커"].ne("") & df["티커"].ne("NONE") & df["티커"].ne("NAN")]
     df["하루금액"] = pd.to_numeric(df["하루금액"], errors="coerce").fillna(0)
-    df["시작일"] = df["시작일"].astype(str).str.slice(0, 10)
+    df["횟수"] = pd.to_numeric(df["횟수"], errors="coerce")
+    for c in ("기준일", "시작일"):
+        df[c] = df[c].fillna("").astype(str).str.slice(0, 10).replace({"None": "", "nan": "", "NaT": ""})
     df["종목명"] = df["종목명"].fillna("").astype(str)
     return df.reset_index(drop=True)
+
+
+def kakao_backfill_start(df):
+    """저장할 때: 횟수를 적었으면 시작일을 역산해서 채우고 횟수·기준일 칸은 비운다.
+    횟수도 시작일도 없으면 오늘부터 세기 시작한다. 횟수와 시작일이 둘 다 있으면 횟수가 우선이다."""
+    d = df.copy()
+    today = pd.Timestamp.today().normalize()
+    fx = hist_fx()
+    for i in d.index:
+        cnt, start = d.at[i, "횟수"], d.at[i, "시작일"]
+        if pd.notna(cnt):
+            asof = d.at[i, "기준일"] or today.date().isoformat()
+            res = market.kakao_value(hist_us(d.at[i, "티커"]), fx, 1.0, None, cnt, asof)
+            if res and res["start"]:
+                d.at[i, "시작일"] = res["start"]
+            else:  # 시세를 못 가져왔거나 아직 안 산 경우: 영업일로 추정한다
+                d.at[i, "시작일"] = perf.kakao_start({"횟수": cnt, "기준일": asof, "시작일": ""}).date().isoformat()
+        elif not start:
+            d.at[i, "시작일"] = today.date().isoformat()
+        d.at[i, "횟수"], d.at[i, "기준일"] = np.nan, ""
+    return d
 
 
 def load_tables(force=False):
@@ -679,12 +702,14 @@ def build_kakao(kakao):
     rows = []
     fx = hist_fx()
     for r in kakao.to_dict("records"):
-        res = market.kakao_value(hist_us(r["티커"]), fx, float(r["하루금액"]), r["시작일"])
+        cnt = None if pd.isna(r.get("횟수")) else r["횟수"]
+        res = market.kakao_value(hist_us(r["티커"]), fx, float(r["하루금액"]), r.get("시작일") or None, cnt, r.get("기준일") or None)
+        name = r["종목명"] or r["티커"]
         if res is None:
-            rows.append({"증권사": "카카오", "종목명": r["종목명"] or r["티커"], "투자원금": float("nan"), "평가금액": float("nan"), "회차": 0})
+            rows.append({"증권사": "카카오", "종목명": name, "투자원금": float("nan"), "평가금액": float("nan"), "회차": 0, "시작일(계산)": "-", "모자람": False})
         else:
-            cost, value, n = res
-            rows.append({"증권사": "카카오", "종목명": r["종목명"] or r["티커"], "투자원금": cost, "평가금액": value, "회차": n})
+            rows.append({"증권사": "카카오", "종목명": name, "투자원금": res["cost"], "평가금액": res["value"], "회차": res["n"],
+                         "시작일(계산)": res["start"] or "-", "모자람": res["short"]})
     return pd.DataFrame(rows)
 
 
@@ -796,7 +821,7 @@ def tab_assets(rules):
         kk2 = kk.copy()
         kk2["수익금액"] = kk2["평가금액"] - kk2["투자원금"]
         kk2["손익률"] = (kk2["평가금액"] / kk2["투자원금"] - 1) * 100
-        kk2 = kk2[["증권사", "종목명", "회차", "투자원금", "평가금액", "수익금액", "손익률"]]
+        kk2 = kk2.rename(columns={"회차": "현재 횟수"})[["증권사", "종목명", "현재 횟수", "시작일(계산)", "투자원금", "평가금액", "수익금액", "손익률"]]
         st.dataframe(
             kk2, width="stretch", hide_index=True,
             column_config={
@@ -806,7 +831,10 @@ def tab_assets(rules):
                 "손익률": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
-        st.caption("매 미국 거래일 하루 금액만큼 샀다고 보고 그날 주가·환율로 계산한 추정치예요. 실제 체결 내역과 조금 다를 수 있어요.")
+        for r in kk.to_dict("records"):
+            if r.get("모자람"):
+                st.warning(f"{r['종목명']}: 시세 기록이 짧아서 가장 오래된 회차 일부를 계산에서 뺐어요.")
+        st.caption("미국 거래일마다 하루 금액만큼 샀다고 보고 그날 주가·환율로 계산한 추정치예요. 현재 횟수는 시작일부터 거래일마다 하나씩 자동으로 늘어요. 실제 횟수와 어긋나면(휴장일·중단 등) 보유 종목 편집에서 지금 횟수를 다시 적고 저장하면 시작일이 다시 맞춰져요.")
 
     st.divider()
     with st.expander("보유 종목 편집 (추가·수정·삭제)", expanded=not len(hold)):
@@ -835,13 +863,20 @@ def edit_tables():
             "매수일": st.column_config.TextColumn(help="선택 사항이에요. 2026-03-02 형식. 적어두면 수익 보호선의 고점을 그날 이후로 계산해요."),
         },
     )
-    st.markdown("**카카오 소수점 정기매수** — 티커는 미국 종목 약어예요(예: NVDA, AAPL). 시작일은 2026-03-02 형식이에요.")
+    st.markdown("**카카오 소수점 정기매수** — 티커는 미국 종목 약어예요(예: NVDA). **하루 금액**과 **지금까지 산 횟수**(오늘 포함)를 적고 저장하면, 앱이 **시작일을 역산해서 채워 넣고** 횟수 칸은 비워요. "
+                "그 뒤로는 미국 거래일마다 현재 횟수가 **자동으로 하나씩 늘어요**(내 자산 탭에서 확인). 횟수를 모르면 시작일만 적어도 되고, 둘 다 비우면 오늘부터 세요. "
+                "하루 금액이 바뀌었다면 줄을 하나 더 추가하세요. 실제 횟수와 어긋나면 지금 횟수를 다시 적고 저장하면 시작일이 다시 맞춰져요.")
     ek = st.data_editor(
         st.session_state.kakao, num_rows="dynamic", width="stretch", hide_index=True, key="kakao_editor",
-        column_config={"하루금액": st.column_config.NumberColumn(min_value=0, step=100)},
+        column_config={
+            "하루금액": st.column_config.NumberColumn(min_value=0, step=100),
+            "횟수": st.column_config.NumberColumn(min_value=0, step=1, help="지금까지 산 횟수(오늘 포함). 적고 저장하면 시작일을 역산해서 채워요. 저장 뒤에는 비워져요."),
+            "기준일": st.column_config.TextColumn(help="선택 사항이에요. 횟수를 센 날짜(2026-10-06 형식). 비워두면 저장한 날이에요."),
+            "시작일": st.column_config.TextColumn(help="횟수에서 자동으로 채워져요. 횟수를 모르면 직접 적어도 돼요(2026-03-02 형식)."),
+        },
     )
     if st.button("저장", type="primary"):
-        h, k = clean_hold(ed), clean_kakao(ek)
+        h, k = clean_hold(ed), kakao_backfill_start(clean_kakao(ek))
         try:
             if store is not None:
                 store.write("보유종목", h)

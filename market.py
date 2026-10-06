@@ -43,7 +43,7 @@ def history_kr(code: str, days: int = 420) -> pd.DataFrame:
     return pd.DataFrame(columns=["Close"])
 
 
-def history_us(ticker: str, days: int = 420) -> pd.DataFrame:
+def history_us(ticker: str, days: int = 1000) -> pd.DataFrame:
     try:
         import yfinance as yf
         return _clean(yf.download(ticker.strip().upper(), start=_start(days), progress=False, auto_adjust=True))
@@ -51,7 +51,7 @@ def history_us(ticker: str, days: int = 420) -> pd.DataFrame:
         return pd.DataFrame(columns=["Close"])
 
 
-def history_fx(days: int = 420) -> pd.DataFrame:
+def history_fx(days: int = 1000) -> pd.DataFrame:
     """원/달러 환율."""
     try:
         import yfinance as yf
@@ -60,22 +60,38 @@ def history_fx(days: int = 420) -> pd.DataFrame:
         return pd.DataFrame(columns=["Close"])
 
 
-def kakao_value(px_usd: pd.DataFrame, fx: pd.DataFrame, per_day_krw: float, start: str):
-    """매 거래일 per_day_krw 원어치를 소수점으로 샀다고 보고 원금과 평가액을 계산한다.
-    반환: (원금, 평가액, 회차) 또는 계산 불가 시 None."""
+def kakao_value(px_usd: pd.DataFrame, fx: pd.DataFrame, per_day_krw: float, start=None, count=None, asof=None):
+    """매 미국 거래일 per_day_krw 원어치를 소수점으로 샀다고 보고 원금과 평가액을 계산한다.
+
+    횟수(count)와 기준일(asof)로 시작 시점을 정한다: 기준일까지 count번 샀다면 그 count번째 전 거래일이 시작일이다.
+    기준일 이후에는 거래일마다 횟수가 자동으로 하나씩 늘어난다. count가 없으면 시작일(start)을 쓴다.
+    반환: {'cost','value','n','start','short'} 또는 계산할 수 없으면 None. short=True는 시세 기록이 모자라 일부 회차가 빠졌다는 뜻."""
     if px_usd.empty or fx.empty:
         return None
-    s = pd.to_datetime(start, errors="coerce")
-    if pd.isna(s):
-        return None
-    px = px_usd["Close"][px_usd.index >= s]
-    if px.empty:
-        return None
-    rate = fx["Close"].reindex(px.index, method="ffill").bfill()
-    shares = (per_day_krw / (px * rate)).sum()
-    n = len(px)
-    value = shares * px.iloc[-1] * rate.iloc[-1]
-    return float(per_day_krw * n), float(value), int(n)
+    px = px_usd["Close"]
+    rate_all = fx["Close"].reindex(px.index, method="ffill").bfill()
+    short = False
+    if count is not None and not pd.isna(count):
+        a = pd.to_datetime(asof, errors="coerce")
+        a = pd.Timestamp.today().normalize() if pd.isna(a) else a
+        pos = int(px.index.searchsorted(a, side="right")) - 1          # 기준일 이전(포함) 마지막 거래일
+        c = int(count)
+        i0 = pos - (c - 1) if c >= 1 else pos + 1
+        if i0 < 0:
+            short, i0 = True, 0
+    else:
+        s = pd.to_datetime(start, errors="coerce")
+        if pd.isna(s):
+            return None
+        i0 = int(px.index.searchsorted(s, side="left"))
+    sel = px.iloc[i0:]
+    if sel.empty:
+        return {"cost": 0.0, "value": 0.0, "n": 0, "start": None, "short": short}
+    rate = rate_all.iloc[i0:]
+    shares = (per_day_krw / (sel * rate)).sum()
+    n = len(sel)
+    return {"cost": float(per_day_krw * n), "value": float(shares * sel.iloc[-1] * rate.iloc[-1]), "n": int(n),
+            "start": sel.index[0].date().isoformat(), "short": short}
 
 
 def avg_trading_value_eok(df: pd.DataFrame, n: int = 20):
