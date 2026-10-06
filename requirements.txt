@@ -5,4 +5,4 @@ altair
 requests
 finance-datareader
 yfinance
-opendartreader
+opendartreader==0.2.2
