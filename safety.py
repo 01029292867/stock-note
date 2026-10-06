@@ -75,6 +75,7 @@ def derive(d, price=None, tv_eok=None):
     iss = (d or {}).get("issues")
     m["issue_n"] = sum(iss.values()) if iss else None
     m["issues"] = iss
+    m["issue_detail"] = (d or {}).get("issue_detail") or {}
     ds = (d or {}).get("distress")
     m["distress_n"] = sum(ds.values()) if ds else None
     m["tv"] = tv_eok
@@ -83,6 +84,16 @@ def derive(d, price=None, tv_eok=None):
 
 def _r(key, label, status, detail):
     return {"key": key, "label": label, "status": status, "detail": detail}
+
+
+def _issue_text(m):
+    parts = []
+    for name, lst in (m.get("issue_detail") or {}).items():
+        for x in lst:
+            dtx = x.get("date", "")
+            dtx = f"{dtx[:4]}-{dtx[4:6]}-{dtx[6:8]}" if len(dtx) == 8 else dtx
+            parts.append(f"{dtx} {name}" + (f"({x['method']})" if x.get("method") else ""))
+    return ", ".join(parts)
 
 
 def evaluate(m, rules):
@@ -167,7 +178,7 @@ def evaluate(m, rules):
         v = m["issue_n"]
         lab = f"최근 3년 유상증자·전환사채 등 발행 결정 {f['issue']['v']:g}번 이하"
         out.append(_r("issue", lab, "unknown" if v is None else ("pass" if v <= f["issue"]["v"] else "fail"),
-                      "확인 불가" if v is None else f"{v}건"))
+                      "확인 불가" if v is None else (f"{v}건" + (f": {_issue_text(m)}" if _issue_text(m) else ""))))
     if f["tv"]["on"]:
         v = m["tv"]
         lab = f"일평균 거래대금 {f['tv']['v']:g}억원 이상"

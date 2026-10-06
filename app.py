@@ -22,6 +22,7 @@ HOLD_COLS = ["증권사", "종목코드", "종목명", "꼬리표", "수량", "�
 KAKAO_COLS = ["종목명", "티커", "하루금액", "시작일"]
 CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
+SETTINGS_COLS = ["이름", "값"]
 FRESH_DAYS = 7  # 재무·공시 데이터를 이 기간 안에는 다시 가져오지 않는다
 STATUS_ICON = {"pass": "✅", "fail": "❌", "unknown": "❔", "na": "➖"}
 SAFE_LABELS = {
@@ -80,6 +81,58 @@ def _make_store(url, token):
 def get_store():
     url, token = secret("GAS_URL"), secret("GAS_TOKEN")
     return _make_store(url, token) if url and token else None
+
+
+
+# ---------- 규칙 저장 (구글 시트 '설정' 탭) ----------
+def _merge(base, saved):
+    """저장된 값을 기본값 위에 덮어쓴다. 새로 생긴 항목은 기본값을 유지한다."""
+    for k, v in (saved or {}).items():
+        if k in base:
+            if isinstance(base[k], dict) and isinstance(v, dict):
+                _merge(base[k], v)
+            else:
+                base[k] = v
+
+
+def load_settings():
+    if st.session_state.get("settings_loaded"):
+        return
+    st.session_state.settings_loaded = True
+    store = get_store()
+    if store is None or st.session_state.get("load_error"):
+        return
+    try:
+        df = store.read("설정", SETTINGS_COLS)
+        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe")}
+    except Exception:
+        return  # 설정을 못 읽으면 기본값으로 시작한다(저장된 값을 지우지는 않는다)
+    _merge(st.session_state.rules, saved.get("rules"))
+    _merge(st.session_state.safe, saved.get("safe"))
+
+
+def save_settings():
+    """반환: (성공 여부, 안내 문구)"""
+    store = get_store()
+    if store is None:
+        return True, "임시로 반영했어요(데모 모드라서 저장되지는 않아요)."
+    if st.session_state.get("load_error"):
+        return False, "구글 시트 연결이 불안정해서 저장하지 않았어요."
+    try:
+        rows = [["rules", json.dumps(st.session_state.rules, ensure_ascii=False)],
+                ["safe", json.dumps(st.session_state.safe, ensure_ascii=False)]]
+        store.write("설정", pd.DataFrame(rows, columns=SETTINGS_COLS))
+        return True, "규칙을 저장했어요. 이제 새로고침하거나 폰에서 열어도 그대로예요."
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def reset_settings():
+    st.session_state.rules = copy.deepcopy(sg.DEFAULT_RULES)
+    st.session_state.safe = safety.default_rules()
+    for k in list(st.session_state.keys()):
+        if k.startswith("s_on_") or k.startswith("s_v_") or k in ("l_t", "s_t"):
+            del st.session_state[k]
 
 
 # ---------- 데이터 정리 ----------
@@ -596,7 +649,7 @@ def tab_safety():
 
 
 def tab_rules():
-    st.markdown("규칙 숫자를 바꾸면 신호가 바로 달라져요. 지금은 이 화면을 닫으면 기본값으로 돌아가요(규칙 저장은 다음 단계).")
+    st.markdown("규칙 숫자를 바꾸면 신호가 바로 달라져요. 바꾼 뒤 맨 아래 '규칙 저장'을 눌러야 구글 시트에 저장돼요.")
     r = st.session_state.rules
     a, b = st.columns(2)
     with a:
@@ -619,6 +672,15 @@ def tab_rules():
         s[key]["on"] = a.checkbox(lab, value=s[key]["on"], key=f"s_on_{key}")
         if "v" in s[key] and unit:
             s[key]["v"] = b.number_input(unit, value=float(s[key]["v"]), step=1.0, key=f"s_v_{key}")
+    st.divider()
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("규칙 저장", type="primary"):
+        ok, msg = save_settings()
+        (st.success if ok else st.error)(msg)
+    if c2.button("기본값으로 되돌리기"):
+        reset_settings()
+        st.rerun()
+    st.caption("숫자를 바꾼 뒤 '규칙 저장'을 눌러야 구글 시트에 남아요. 누르지 않으면 이 화면에서만 적용되고 새로고침하면 사라져요.")
 
 
 def main():
@@ -628,6 +690,7 @@ def main():
         st.session_state.rules = copy.deepcopy(sg.DEFAULT_RULES)
     if "safe" not in st.session_state:
         st.session_state.safe = safety.default_rules()
+    load_settings()
     load_fincache()
     rules = st.session_state.rules
 

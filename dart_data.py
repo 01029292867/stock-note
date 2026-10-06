@@ -182,11 +182,18 @@ def _fetch_audit(client, corp, ty):
 
 
 def _count_events(client, corp, keys, start, end):
-    out = {}
+    """공시 건수와, 건별 날짜·방식(있으면)을 함께 돌려준다."""
+    out, detail = {}, {}
     for name, ep in keys.items():
         rows = _call(client.api_key, ep, {"corp_code": corp, "bgn_de": start, "end_de": end}).get("list", [])
         out[name] = len(rows)
-    return out
+        if rows:
+            detail[name] = [
+                {"date": str(r.get("rcept_no", ""))[:8],
+                 "method": str(r.get("ic_mthn") or r.get("bd_knd") or "").strip()}
+                for r in rows[:5]
+            ]
+    return out, detail
 
 
 def _fetch_company(client, corp):
@@ -205,6 +212,13 @@ def fetch_all(client, stock_code, today=None):
         corp, used = client.corp_code(code), code
     start = (today.replace(year=today.year - 3)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
+    issue_detail = {}
+
+    def _issues():
+        counts, detail = _count_events(client, corp, EVENT_KEYS, start, end)
+        issue_detail.update(detail)
+        return counts
+
     tasks = {
         "company": lambda: _fetch_company(client, corp),
         "fin": lambda: _fetch_fin(client, corp, ty),
@@ -212,8 +226,8 @@ def fetch_all(client, stock_code, today=None):
         "major": lambda: _fetch_major(client, corp, ty),
         "shares": lambda: _fetch_shares(client, corp, ty),
         "audit": lambda: _fetch_audit(client, corp, ty),
-        "issues": lambda: _count_events(client, corp, EVENT_KEYS, start, end),
-        "distress": lambda: _count_events(client, corp, DISTRESS_KEYS, start, end),
+        "issues": _issues,
+        "distress": lambda: _count_events(client, corp, DISTRESS_KEYS, start, end)[0],
     }
     result = {"code": code, "fetched": today.isoformat(), "errors": {}}
     if used != code:
@@ -226,4 +240,5 @@ def fetch_all(client, stock_code, today=None):
             except Exception as e:
                 result[k] = None
                 result["errors"][k] = str(e)[:200]
+    result["issue_detail"] = issue_detail
     return result
