@@ -56,7 +56,7 @@ def flow_of(ind: dict) -> tuple[str, str]:
     return "방향 불분명", "이동평균선이 얽혀 있어 뚜렷한 방향이 없어요."
 
 
-def signals(ind: dict, tag: str, avg: float | None, rules: dict) -> list[dict]:
+def signals(ind: dict, tag: str, avg: float | None, rules: dict, flow: dict | None = None) -> list[dict]:
     out = []
     R = rules[tag]
     ret = (ind["price"] / avg - 1) * 100 if avg else None
@@ -75,6 +75,8 @@ def signals(ind: dict, tag: str, avg: float | None, rules: dict) -> list[dict]:
             out.append({"kind": "주의", "title": "20일선 이탈", "detail": f"현재가가 20일선보다 {gap:.1f}% 아래"})
         if ind["rsi"] >= R["RSI과열"]:
             out.append({"kind": "주의", "title": "RSI 과열", "detail": f"RSI {ind['rsi']:.0f} (기준 {R['RSI과열']:.0f} 이상)"})
+        if flow and flow.get("f5") is not None and flow["f5"] < 0 and flow["i5"] < 0:
+            out.append({"kind": "주의", "title": "외국인·기관 동반 순매도", "detail": f"5일 합계 외국인 {flow['f5']:+,.0f}억 · 기관 {flow['i5']:+,.0f}억"})
         if ind["price"] > ind["ma60"] and R["눌림_하단"] <= ind["rsi"] <= R["눌림_상단"] and ind["price"] > ind["prev"]:
             out.append({"kind": "매수검토", "title": "눌림목 반등 후보", "detail": f"60일선 위 · RSI {ind['rsi']:.0f} · 전일 대비 상승"})
     return out

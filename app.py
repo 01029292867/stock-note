@@ -11,6 +11,7 @@ import streamlit as st
 
 import dart_data
 import discover
+import flows
 import market
 import perf
 import safety
@@ -455,6 +456,66 @@ def bulk_cached(codes):
     return fin, errs
 
 
+
+# ---------- 수급 (네이버 금융, 세션에 30분 보관) ----------
+FLOW_TTL = 1800
+
+
+def get_flow(code, force=False):
+    """한 종목의 수급. 반환: (DataFrame, 오류문구). 실패하면 5분 동안은 다시 시도하지 않는다."""
+    import time
+    store = st.session_state.setdefault("flow_df", {})
+    errs = st.session_state.setdefault("flow_err", {})
+    now = time.time()
+    if not force and code in store and now - store[code][1] < FLOW_TTL:
+        return store[code][0], None
+    if not force and code in errs and now - errs[code][1] < 300:
+        return None, errs[code][0]
+    try:
+        df = flows.fetch_flow(code)
+    except Exception as e:
+        errs[code] = (str(e)[:200], now)
+        return None, errs[code][0]
+    store[code] = (df, now)
+    errs.pop(code, None)
+    st.session_state.setdefault("flow_sum", {})[code] = flows.summarize(df)
+    return df, None
+
+
+def fetch_flows_bulk(codes, progress=None):
+    """여러 종목의 수급을 4개씩 동시에 가져온다. 반환: 오류 목록"""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    now = time.time()
+    store = st.session_state.setdefault("flow_df", {})
+    errs = st.session_state.setdefault("flow_err", {})
+    todo = [c for c in dict.fromkeys(codes) if not (c in store and now - store[c][1] < FLOW_TTL)]
+    errors = []
+
+    def one(c):
+        try:
+            return c, flows.fetch_flow(c), None
+        except Exception as e:
+            return c, None, str(e)[:200]
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for i, (c, df, e) in enumerate(ex.map(one, todo)):
+            if e:
+                errs[c] = (e, now)
+                errors.append(f"{st.session_state.get('disc_names', {}).get(c, c)}: {e}")
+            else:
+                store[c] = (df, now)
+                errs.pop(c, None)
+                st.session_state.setdefault("flow_sum", {})[c] = flows.summarize(df)
+            if progress:
+                progress(i + 1, len(todo))
+    return errors
+
+
+def flow_txt(fs):
+    return "-" if not fs else f"외국인 {fs['f5']:+,.0f}억 · 기관 {fs['i5']:+,.0f}억"
+
+
 # ---------- 계산 ----------
 def build_positions(hold, rules):
     rows = []
@@ -463,7 +524,8 @@ def build_positions(hold, rules):
         ind = sg.indicators(df)
         price = float(df["Close"].iloc[-1]) if len(df) else float("nan")
         qty, avg = float(r["수량"]), float(r["평균단가"])
-        sigs = sg.signals(ind, r["꼬리표"], avg, rules) if ind and avg > 0 else []
+        fs = st.session_state.get("flow_sum", {}).get(r["종목코드"])
+        sigs = sg.signals(ind, r["꼬리표"], avg, rules, fs) if ind and avg > 0 else []
         sres = safety_for(r["종목코드"])
         if sres is None:
             s_label, s_fail = "미조회", 0
@@ -482,6 +544,7 @@ def build_positions(hold, rules):
                 "평가금액": qty * price, "투자원금": qty * avg,
                 "수익률": (price / avg - 1) * 100 if avg > 0 else float("nan"),
                 "흐름": sg.flow_of(ind)[0] if ind else "시세 부족",
+                "수급(5일)": flow_txt(fs),
                 "안전": s_label,
                 "판단": verdict,
                 "신호": sig_txt,
@@ -574,7 +637,16 @@ def tab_assets(rules):
         st.caption("내가 정한 규칙에 해당하는지 정리한 것이에요. 사고팔지는 직접 판단하세요. 판단은 가격 기준 규칙과 안전 점검 결과를 함께 반영해요. 안전 칸이 미조회면 안전 점검 탭에서 재무 데이터를 먼저 가져오세요.")
 
         st.subheader("보유 종목")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익률", "흐름", "안전", "판단", "신호"]]
+        c1, c2 = st.columns([1, 3])
+        if c1.button("보유 종목 수급 가져오기", key="flow_all"):
+            bar = st.progress(0.0, text="수급을 가져오는 중…")
+            errs = fetch_flows_bulk(pos["종목코드"].tolist(), lambda i, n: bar.progress(i / max(n, 1), text=f"수급 가져오는 중… ({i}/{n})"))
+            st.session_state["flow_msg"] = errs
+            st.rerun()
+        c2.caption("수급은 네이버 금융의 외국인·기관 매매 페이지를 읽어와요(30분 동안 저장). 서버에서 접속이 막히면 표시되지 않아요.")
+        for e in st.session_state.pop("flow_msg", []) or []:
+            st.warning(f"수급을 못 가져왔어요 — {e}")
+        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익률", "흐름", "수급(5일)", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -713,6 +785,42 @@ def report_financials(code):
         st.json(d)
 
 
+
+def report_flow(code):
+    st.subheader("수급 흐름 (외국인·기관·개인)")
+    df, err = get_flow(code)
+    if err:
+        st.warning(f"수급 데이터를 가져오지 못했어요: {err}")
+        if st.button("다시 시도", key=f"flow_retry_{code}"):
+            get_flow(code, force=True)
+            st.rerun()
+        return
+    sm = flows.summarize(df)
+    if sm is None:
+        st.info("수급 기록이 너무 적어서 계산하지 못했어요.")
+        return
+    k = st.columns(4)
+    k[0].metric("외국인 5일", f"{sm['f5']:+,.0f}억", f"20일 {sm['f20']:+,.0f}억", delta_color="off")
+    k[1].metric("기관 5일", f"{sm['i5']:+,.0f}억", f"20일 {sm['i20']:+,.0f}억", delta_color="off")
+    k[2].metric("개인(추정) 5일", f"{sm['p5']:+,.0f}억", f"20일 {sm['p20']:+,.0f}억", delta_color="off")
+    k[3].metric("외국인 보유율", "-" if sm["hold_pct"] is None else f"{sm['hold_pct']:.2f}%",
+                None if sm["hold_chg20"] is None else f"{sm['hold_chg20']:+.2f}%p (20일)")
+    cf = flows.chart_frame(df, 20)
+    for who in ("외국인", "기관", "개인(추정)"):
+        st.caption(f"{who} 일별 순매수(억원, 최근 20거래일) — 빨강은 순매수, 파랑은 순매도")
+        st.altair_chart(alt.Chart(cf[cf["주체"] == who]).mark_bar().encode(
+            x=alt.X("날짜:T", title=None), y=alt.Y("순매수(억):Q", title=None),
+            color=alt.condition(alt.datum["순매수(억)"] > 0, alt.value("#D93A33"), alt.value("#2A63D4")),
+            tooltip=["날짜:T", alt.Tooltip("순매수(억):Q", format=",.1f")]).properties(height=90), width="stretch")
+    st.info(flows.read_text(sm))
+    st.caption(f"{sm['last']}까지의 자료예요. 외국인 연속 {abs(sm['f_streak'])}일 {'순매수' if sm['f_streak'] > 0 else '순매도'}, "
+               f"기관 연속 {abs(sm['i_streak'])}일 {'순매수' if sm['i_streak'] > 0 else '순매도'}. 금액은 순매매량에 그날 종가를 곱한 추정치이고, "
+               "개인은 제공되지 않아 기관·외국인의 반대로 계산한 값(기타 법인 등 포함)이에요. 수급은 참고 자료일 뿐 주가를 보장하지 않아요.")
+    with st.expander("수급 원자료 (최근 40거래일)"):
+        raw = flows.with_amounts(df).tail(40).iloc[::-1]
+        st.dataframe(raw[["날짜", "종가", "기관", "외국인", "기관(억)", "외국인(억)", "개인(억)", "외국인보유율"]], width="stretch", hide_index=True)
+
+
 def tab_report(rules):
     hold = st.session_state.hold
     opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · {r['증권사']}": r for r in hold.to_dict("records")}
@@ -775,7 +883,8 @@ def tab_report(rules):
     else:
         st.write("지금은 내 기준에 걸리는 신호가 없어요.")
     report_financials(code)
-    st.caption("수급·증권사 리포트는 다음 단계에서 이 화면에 붙어요.")
+    report_flow(code)
+    st.caption("증권사 리포트는 다음 단계에서 이 화면에 붙어요.")
 
 
 
@@ -856,6 +965,9 @@ def run_detail(codes):
                     break
     bar.progress(1.0)
     save_fincache()
+    fe = fetch_flows_bulk(codes)
+    if fe:
+        st.warning(f"수급을 가져오지 못한 종목이 {len(fe)}개 있어요(예: {fe[0]})")
     st.session_state.disc_detail = list(codes)
     if errors:
         st.error("가져오지 못한 종목이 있어요:\n\n" + "\n\n".join(errors))
@@ -954,6 +1066,8 @@ def tab_discover():
             "종목코드": c, "종목명": st.session_state.disc_names.get(c, c), "안전": safety.headline(items),
             "미달 항목": ", ".join(i["label"] for i in items if i["status"] == "fail") or "-",
             "확인 불가": ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-",
+            "외국인 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("f5", np.nan),
+            "기관 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("i5", np.nan),
             "흐름": sg.flow_of(ind)[0] if ind else "-", "52주 위치(%)": ind["pos"] if ind else np.nan,
             "RSI": ind["rsi"] if ind else np.nan, "3개월(%)": ind["m3"] if ind else np.nan})
     if not rows:
@@ -962,7 +1076,8 @@ def tab_discover():
     rdf = pd.DataFrame(rows)
     st.dataframe(rdf, width="stretch", hide_index=True, column_config={
         "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"), "RSI": st.column_config.NumberColumn(format="%.0f"),
-        "3개월(%)": st.column_config.NumberColumn(format="%.1f")})
+        "3개월(%)": st.column_config.NumberColumn(format="%.1f"),
+        "외국인 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "기관 5일(억)": st.column_config.NumberColumn(format="%+,.0f")})
     st.caption("52주 위치가 낮을수록 1년 중 싼 구간이고, RSI가 70 이상이면 단기 과열이에요. 자세한 재무와 근거는 종목 리포트 탭에서 종목코드를 직접 입력해 확인할 수 있어요.")
     names = {f"{r['종목명']} ({r['종목코드']})": (r["종목코드"], r["종목명"]) for r in rows}
     pick = st.multiselect("관심종목에 추가", list(names))
