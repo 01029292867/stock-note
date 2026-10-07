@@ -25,6 +25,7 @@ import perf
 import plan
 import reports
 import safety
+import score
 import signals as sg
 from store import GasStore
 
@@ -38,6 +39,7 @@ CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
 WATCH_COLS = ["종목코드", "종목명"]
+SCORELOG_COLS = ["날짜", "종목코드", "종합점수", "가격", "수급", "재무·안전", "컨센서스", "진입 구조", "근거수", "종가"]
 HYP_COLS = ["실행일", "가설", "종목수", "기간(년)", "보유(일)", "표본", "승률차(%p)", "평균초과수익(%)", "CI하한", "CI상한", "일관", "등급"]
 FLOWLOG_COLS = ["날짜", "종목코드", "기관(주)", "외국인(주)", "개인(주)", "종가", "외국인보유율"]
 FUND_COLS = ["이름", "목표(만원)", "기간(년)", "현재(만원)", "매달 저축(만원)"]
@@ -127,7 +129,7 @@ def load_settings():
         return
     try:
         df = store.read("설정", SETTINGS_COLS)
-        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc", "goal", "risk", "funds")}
+        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc", "goal", "risk", "funds", "weights")}
     except Exception:
         return  # 설정을 못 읽으면 기본값으로 시작한다(저장된 값을 지우지는 않는다)
     _merge(st.session_state.rules, saved.get("rules"))
@@ -135,6 +137,7 @@ def load_settings():
     _merge(st.session_state.disc_f, saved.get("disc"))
     _merge(st.session_state.goal, saved.get("goal"))
     _merge(st.session_state.risk, saved.get("risk"))
+    _merge(st.session_state.weights, saved.get("weights"))
     if isinstance(saved.get("funds"), list) and saved["funds"]:
         st.session_state.funds = saved["funds"]
 
@@ -152,6 +155,7 @@ def save_settings():
                 ["disc", json.dumps(st.session_state.disc_f, ensure_ascii=False)],
                 ["goal", json.dumps(st.session_state.goal, ensure_ascii=False)],
                 ["risk", json.dumps(st.session_state.risk, ensure_ascii=False)],
+                ["weights", json.dumps(st.session_state.weights, ensure_ascii=False)],
                 ["funds", json.dumps(st.session_state.funds, ensure_ascii=False)]]
         store.write("설정", pd.DataFrame(rows, columns=SETTINGS_COLS))
         return True, "규칙을 저장했어요. 이제 새로고침하거나 폰에서 열어도 그대로예요."
@@ -165,8 +169,9 @@ def reset_settings():
     st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
     st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
+    st.session_state.weights = copy.deepcopy(score.DEFAULT_WEIGHTS)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("rk_pt", "rk_mp", "rk_mr", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "rk_pt", "rk_mp", "rk_mr", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
             del st.session_state[k]
 
 
@@ -876,6 +881,66 @@ def cons_change(code):
     return None if days < 7 else (days, float((last["목표가"] / base["목표가"] - 1) * 100))
 
 
+
+# ---------- 종합 점수 ----------
+def evidence_text(h):
+    hyp = st.session_state.get("hyp")
+    if hyp is None or hyp.empty:
+        return "미검증"
+    g = hyp[hyp["가설"] == h]
+    if g.empty:
+        return "미검증"
+    r = g.iloc[-1]
+    return f"{r['등급']} ({r['실행일']})"
+
+
+def score_for(code, tag, avg, qty, since=None, card=None):
+    """종합 점수. 시세가 없으면 None."""
+    ind = sg.indicators(hist_kr(code), since or None)
+    if ind is None:
+        return None
+    if card is None:
+        card = card_for(code, tag, avg, qty, since)
+    sres = safety_for(code)
+    m, items = sres if sres else (None, None)
+    return score.compute(ind, st.session_state.get("flow_sum", {}).get(code), m, items, cons_for(code), cons_change(code), card,
+                         st.session_state.weights, evidence_text)
+
+
+def render_score(sc, name):
+    st.subheader(f"종합 점수 — {name}")
+    if sc is None or sc["total"] is None:
+        st.info("점수를 계산할 근거가 없어요. 수급·컨센서스·재무를 가져오면 근거가 늘어나요.")
+        return
+    k = st.columns(4)
+    k[0].metric("종합 점수", f"{sc['total']:.0f}점", sc["band"], delta_color="off",
+                help="이길 확률이 아니라 근거들이 얼마나 한 방향으로 모이는지를 요약한 숫자예요. 50점이 중립이고 65점 이상이면 우호적인 근거가 모이는 쪽, 35점 미만이면 불리한 근거가 많은 쪽이에요.")
+    k[1].metric("반영한 근거", f"{sc['n_avail']}/{sc['n_total']}", ", ".join(sc["missing"]) + " 없음" if sc["missing"] else "모두 있음", delta_color="off",
+                help="가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조 중 몇 가지를 반영했는지예요. 3가지 미만이면 점수는 참고만 하세요.")
+    ag = sc["agree"]
+    k[2].metric("근거 일치도", "-" if not ag or ag[1] == 0 else f"{ag[0]}/{ag[1]}", help="뚜렷한(±10점 이상) 근거 종류 중 종합 방향과 같은 방향인 개수예요. 낮으면 근거가 엇갈린다는 뜻이에요.")
+    k[3].metric("엇갈리는 근거", f"{len(sc['conflicts'])}쌍", help="한쪽은 +25 이상 우호적인데 다른 쪽은 -25 이하로 불리한 근거 종류의 쌍이에요.")
+    for cf in sc["conflicts"]:
+        st.warning("근거가 엇갈려요: " + cf)
+    fam = pd.DataFrame([{"근거": f["name"], "점수": f["score"], "가중치": f["weight"]} for f in sc["families"] if f["score"] is not None])
+    if len(fam):
+        st.altair_chart(alt.Chart(fam).mark_bar().encode(
+            y=alt.Y("근거:N", sort=score.FAMILIES, title=None), x=alt.X("점수:Q", scale=alt.Scale(domain=[-100, 100]), title="불리 ← 0 → 우호"),
+            color=alt.condition(alt.datum["점수"] > 0, alt.value("#D93A33"), alt.value("#2A63D4")),
+            tooltip=["근거", alt.Tooltip("점수:Q", format="+.0f"), "가중치"]).properties(height=36 * len(fam) + 30), width="stretch")
+    rows = [{"근거": f["name"], "항목": i["항목"], "점수": i["점수"], "설명": i["설명"], "검증 결과": i["검증"]} for f in sc["families"] for i in f["items"]]
+    with st.expander("항목별 점수와 근거 보기", expanded=False):
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, column_config={"점수": st.column_config.NumberColumn(format="%+.0f")})
+        st.caption("'검증 결과'는 가설 실험실에서 그 항목을 시험한 결과예요. '미검증'은 아직 시험하지 못한 항목이에요.")
+    with st.expander("이 점수 읽는 법"):
+        st.markdown("- **이길 확률이 아니에요.** 가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조(손익비)가 **얼마나 한 방향으로 모이는지**를 한 숫자로 요약한 거예요.\n"
+                    "- 근거 종류마다 -100(불리)~+100(우호)으로 점수를 매기고, 규칙 탭의 **가중치**로 평균을 내요. 근거가 빠진 종류는 제외하고, 근거가 적을수록 50점 쪽으로 당겨요.\n"
+                    "- 중요한 건 숫자보다 **근거가 같은 방향인지(일치도)**예요. 한 근거만 매우 좋고 나머지가 나쁘면 점수는 중립에 가깝게 나와요.\n"
+                    "- **가중치와 점수 기준은 제가 정한 시작값이고 검증 전이에요.** 서로 겹치는 근거(예: 추세와 3개월 수익률)가 있어서 같은 이야기를 두 번 세는 효과도 있어요.\n"
+                    "- 판단 기록과 점수 기록이 쌓이면 **점수대별 실제 성과**를 확인해서 가중치를 고쳐 나가요(종합 순위, 판단 기록 화면).\n"
+                    "- 점수가 높다고 사라는 뜻도, 낮다고 팔라는 뜻도 아니에요.")
+
+
 # ---------- 계산 ----------
 def build_positions(hold, rules):
     rows = []
@@ -887,6 +952,7 @@ def build_positions(hold, rules):
         prot = sg.protect(ind, r["꼬리표"], avg, rules) if ind else None
         lvl = sg.structure(ind, r["꼬리표"], rules) if ind else None
         sup0 = lvl["supports"][0] if lvl and lvl["supports"] else None
+        scv = score_for(r["종목코드"], r["꼬리표"], avg, qty, r.get("매수일") or None) if ind else None
         cdat = cons_for(r["종목코드"])
         cups = consensus.upside(cdat["target"], price) if cdat and cdat.get("has") else float("nan")
         fs = st.session_state.get("flow_sum", {}).get(r["종목코드"])
@@ -910,6 +976,8 @@ def build_positions(hold, rules):
                 "수익률": (price / avg - 1) * 100 if avg > 0 else float("nan"),
                 "고점 대비(%)": prot["overall_dd"] if prot else float("nan"),
                 "수익 보호선(원)": prot["line"] if prot and prot["armed"] else float("nan"),
+                "종합점수": scv["total"] if scv and scv["total"] is not None else float("nan"),
+                "근거": f"{scv['n_avail']}/{scv['n_total']}" if scv else "-",
                 "보호선 상태": sg.protect_state(prot),
                 "지지선(원)": sup0["price"] if sup0 else float("nan"),
                 "지지선까지(%)": sup0["dist"] if sup0 else float("nan"),
@@ -948,7 +1016,7 @@ def _sig(*parts):
 def get_positions(hold, rules):
     """보유 종목 표 계산(비싼 계산)을 입력이 같으면 다시 하지 않는다."""
     ss = st.session_state
-    key = _sig(hold.to_json(), json.dumps(rules, sort_keys=True), json.dumps(ss.safe, sort_keys=True),
+    key = _sig(hold.to_json(), json.dumps(rules, sort_keys=True), json.dumps(ss.safe, sort_keys=True), json.dumps(ss.weights, sort_keys=True),
                sorted((k, round((v or {}).get("f5", 0)), round((v or {}).get("i5", 0))) for k, v in ss.get("flow_sum", {}).items()),
                sorted((k, v[1]) for k, v in ss.get("cons_df", {}).items()),
                sorted((k, d.get("fetched")) for k, d in ss.get("fincache", {}).items()),
@@ -1079,7 +1147,7 @@ def tab_assets(rules):
         c3.caption("수급(30분 저장)과 증권사 컨센서스(6시간 저장)는 네이버 증권 데이터를 읽어와요. 서버에서 접속이 막히면 표시되지 않아요. 목표가 여력은 평균 목표가가 현재가보다 몇 % 높은지예요.")
         for e in st.session_state.pop("flow_msg", []) or []:
             st.warning(f"수급을 못 가져왔어요 — {e}")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "지지선(원)", "지지선까지(%)", "평소 되돌림(%)", "흐름", "수급(5일)", "목표가 여력(%)", "안전", "판단", "신호"]]
+        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "지지선(원)", "지지선까지(%)", "평소 되돌림(%)", "흐름", "수급(5일)", "목표가 여력(%)", "종합점수", "근거", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -1096,6 +1164,7 @@ def tab_assets(rules):
                 "고점 대비(%)": st.column_config.NumberColumn(format="%.1f", help="최근 1년(또는 매수일 이후) 최고 종가 대비예요."),
                 "지지선(원)": st.column_config.NumberColumn(format="%,d", help="과거에 밀렸다가 반등한 가격대 중 현재가 바로 아래에 있는 곳이에요. 참고용이에요."),
                 "지지선까지(%)": st.column_config.NumberColumn(format="%.1f"),
+                "종합점수": st.column_config.NumberColumn(format="%.0f", help="가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조를 모은 점수예요(50 중립). 이길 확률이 아니라 근거가 한 방향으로 모이는 정도예요. 근거 칸은 반영한 근거 수예요."),
                 "평소 되돌림(%)": st.column_config.NumberColumn(format="%.1f", help="이 종목이 과거에 고점에서 보통 이만큼 밀렸다가 반등했어요(중간값)."),
                 "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
             },
@@ -1243,7 +1312,7 @@ def report_financials(code):
 
 
 
-def record_form(card, code, name, key, default_decision="보유 유지"):
+def record_form(card, code, name, key, default_decision="보유 유지", score_val=None):
     """판단을 기록한다. 기록하는 순간의 카드 숫자(상승 여력, 하락 위험, 손익비, 등급, 필요 승률)가 함께 저장돼요."""
     c1, c2, c3 = st.columns(3)
     dec = c1.selectbox("결정", journal.DECISIONS, index=journal.DECISIONS.index(default_decision), key=f"{key}_dec")
@@ -1254,18 +1323,18 @@ def record_form(card, code, name, key, default_decision="보유 유지"):
                           help="이 가격 아래로 내려가면 내 판단이 틀렸다고 보는 가격이에요. 0이면 정하지 않은 거예요.")
     memo = d2.text_input("한 줄 메모", key=f"{key}_memo", placeholder="왜 이 결정을 했는지 한 줄로")
     if st.button("이 판단 기록하기", key=f"{key}_save", type="primary"):
-        ok, msg = save_journal([make_record(card, code, name, dec, reason, conf, inv, memo)])
+        ok, msg = save_journal([make_record(card, code, name, dec, reason, conf, inv, memo, score_val)])
         (st.success if ok else st.error)(msg)
         if ok:
             st.rerun()
 
 
-def make_record(card, code, name, decision, reason, conf, invalid, memo):
+def make_record(card, code, name, decision, reason, conf, invalid, memo, score_val=None):
     base = card["base"]
     return {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "날짜": dt.date.today().isoformat(), "종목코드": code, "종목명": name,
             "결정": decision, "이유": reason, "확신도": conf, "기록가": card["price"], "평단": card["avg"], "수량": card["qty"], "꼬리표": card["tag"],
             "상승여력": card["up"], "하락위험": base["pct"] if base else None, "손익비": card["ratio"], "등급": card["grade"],
-            "필요승률": card["need_win"], "무효가격": invalid or None, "메모": memo}
+            "필요승률": card["need_win"], "무효가격": invalid or None, "메모": memo, "종합점수": score_val}
 
 
 
@@ -1282,7 +1351,7 @@ def render_entry(card, price, code, name, held, key):
     k[0].metric("진입 판정", e["verdict"].split("(")[0])
     k[1].metric("진입 손익비", "-" if e["ratio"] is None else f"{e['ratio']:.2f}", help="보수적 상승 여력 ÷ 무효가격까지의 하락폭이에요. 기준(규칙 탭, 기본 2.0) 이상이면 유리로 봐요.")
     k[2].metric("틀렸을 때 손실폭", "-" if e["stop_pct"] is None else f"-{e['stop_pct']:.1f}%", help="현재가에서 무효가격까지의 하락폭이에요.")
-    k[3].metric("살 수 있는 최대", "-" if not e["shares"] else f"{e['shares']:,}주", None if not e["amount"] else f"약 {e['amount'] / 1e4:,.0f}만원 · 총자산의 {e['pct_assets']:.1f}%", delta_color="off",
+    k[3].metric("살 수 있는 최대", "-" if e["shares"] is None else f"{e['shares']:,}주", None if not e["amount"] else f"약 {e['amount'] / 1e4:,.0f}만원 · 총자산의 {e['pct_assets']:.1f}%", delta_color="off",
                 help="틀렸을 때 총자산의 손실 한도(규칙 탭, 기본 1%)만 잃도록 계산한 최대 수량이에요. 한 종목 최대 비중도 넘지 않아요.")
     k[4].metric("기다릴 가격", "-" if not e["wait_price"] else f"{e['wait_price']:,.0f}원", None if not e["wait_price"] else f"{e['wait_pct']:.1f}%", delta_color="off",
                 help="손익비가 기준에 닿는 가격이에요(같은 무효가격과 목표를 가정). 비어 있으면 이미 기준을 넘었거나 계산할 수 없어요.")
@@ -1602,6 +1671,10 @@ def tab_report(rules):
     )
     st.caption("최근 120거래일 종가와 이동평균선")
 
+    qty_ = float(held["수량"]) if held else 0.0
+    card = card_for(code, tag, avg, qty_, (held or {}).get("매수일") or None)
+    sc = score_for(code, tag, avg, qty_, (held or {}).get("매수일") or None, card=card)
+    render_score(sc, (held or {}).get("종목명") or code)
     st.subheader(f"내 기준으로 보면 ({tag})")
     sigs = sg.signals(ind, tag, avg, rules)
     prot = None
@@ -1638,11 +1711,10 @@ def tab_report(rules):
         pass
     else:
         st.write("지금은 내 기준에 걸리는 신호가 없어요.")
-    card = card_for(code, tag, avg, float(held["수량"]) if held else 0.0, (held or {}).get("매수일") or None)
     if card:
         render_card(card, (held or {}).get("종목명") or code)
         with st.expander("이 카드로 판단 기록하기"):
-            record_form(card, code, (held or {}).get("종목명") or code, f"rf_{code}", "보유 유지" if held else "관망(사지 않음)")
+            record_form(card, code, (held or {}).get("종목명") or code, f"rf_{code}", "보유 유지" if held else "관망(사지 않음)", sc["total"] if sc else None)
         render_entry(card, ind["price"], code, (held or {}).get("종목명") or code, bool(held and float(held["수량"]) > 0), f"en_{code}")
     report_structure(ind, tag, ind["price"], df)
     report_financials(code)
@@ -2123,7 +2195,10 @@ def tab_journal(rules):
             if dec != "기록 안 함":
                 pick[code] = (card, ag, dec, conf, memo)
         if targets and st.button(f"선택한 {len(pick)}건 기록하기", type="primary", key="jm_save", disabled=not pick):
-            rows = [make_record(c, code, ag["name"], dec, "월간 점검", conf, c.get("invalid"), memo) for code, (c, ag, dec, conf, memo) in pick.items()]
+            rows = []
+            for code, (c, ag, dec, conf, memo) in pick.items():
+                scx = score_for(code, ag["tag"], ag["avg"], ag["qty"], ag["since"], card=c)
+                rows.append(make_record(c, code, ag["name"], dec, "월간 점검", conf, c.get("invalid"), memo, scx["total"] if scx else None))
             ok, msg = save_journal(rows)
             (st.success if ok else st.error)(msg)
             if ok:
@@ -2150,9 +2225,11 @@ def tab_journal(rules):
     done = int(ev[f"v{h}"].notna().sum())
     st.caption(f"기록 {len(ev)}건 중 {h}일이 지나 결과가 나온 것은 {done}건이에요. 방향은 이렇게 봐요: 사거나 들고 있는 결정은 이후 오르면 맞은 판단, 팔거나 사지 않은 결정은 이후 내리면 맞은 판단이에요(손익은 그 방향으로 계산).")
     if done:
-        for title, by in (("결정 유형별", None), ("확신도별", "확신구분"), ("기록 당시 카드 등급별", "등급"), ("이유별", "이유")):
+        for title, by in (("결정 유형별", None), ("확신도별", "확신구분"), ("기록 당시 카드 등급별", "등급"), ("기록 당시 종합 점수대별", "점수구간"), ("이유별", "이유")):
             e2 = ev.copy()
             e2["확신구분"] = e2["확신도"].map(journal.confidence_bucket)
+            e2["점수구간"] = e2["종합점수"].map(score.bucket)
+            e2.loc[e2["점수구간"] == "-", "점수구간"] = np.nan
             s = journal.summarize(e2, h, by)
             if len(s) > 1 or by is None:
                 st.markdown(f"**{title}**")
@@ -2579,6 +2656,57 @@ def tab_lab():
             st.caption("조합을 여러 번 시험할수록 우연히 좋은 결과가 나오기 쉬워서, 시험한 횟수만큼 기준을 더 엄격하게 올려요.")
 
     st.divider()
+    st.subheader("요인 검증 — 종목의 성격이 이후 수익과 관련 있었나")
+    st.markdown("매번 전 종목을 **요인 값 순서로 5등분**해서, 윗그룹이 아랫그룹보다 이후 수익이 더 컸는지 비교해요(모멘텀, 단기 반전, 변동성, 52주 위치, 거래대금). "
+                "신호가 켜진 날만 보는 위 검증과 달리 **모든 종목을 한꺼번에 비교**해서 더 힘 있게 가려내요. 위의 종목 수·기간·보유 기간 설정을 그대로 써요.")
+    if st.button("요인 검증 실행", key="lab_factor_run"):
+        bar = st.progress(0.0, text="준비 중…")
+        codes, note = lab_universe(n_uni)
+        if note:
+            st.warning(note)
+        P = lab_panel(codes, years, h, bar)
+        if P is None or "V" not in P:
+            bar.empty()
+            st.error("검증할 가격 자료를 가져오지 못했어요. 잠시 뒤 다시 시도해 주세요.")
+        else:
+            fres = {}
+            for i, (k, (_, fn)) in enumerate(lab.FACTORS.items()):
+                bar.progress(i / len(lab.FACTORS), text=f"{k} 검증 중…")
+                fres[k] = lab.factor_study(fn(P["C"], P["V"]), P, n_tests=len(lab.FACTORS))
+            bar.empty()
+            st.session_state["lab_fres"] = {"res": fres, "meta": (len(P["C"].columns), years, h)}
+            ok, msg = save_hyp([[dt.date.today().isoformat(), "요인: " + k, len(P["C"].columns), years, h, o.get("n_dates", 0), None, o.get("spread"), o.get("ci_lo"), o.get("ci_hi"),
+                                 "Y" if o.get("consistent") else "N", o["grade"]] for k, o in fres.items()])
+            if not ok:
+                st.warning(msg)
+    fr = st.session_state.get("lab_fres")
+    if fr:
+        nu, yy, hh = fr["meta"]
+        st.markdown(f"**{nu}종목 · 최근 {yy}년 · {hh}거래일 보유 · 5일마다 5등분**")
+        rows = []
+        for k, o in fr["res"].items():
+            r = {"요인": k, "설명": lab.FACTORS[k][0], "날짜 수": o.get("n_dates"), "윗-아랫(%)": o.get("spread"), "신뢰구간(하한)": o.get("ci_lo"), "신뢰구간(상한)": o.get("ci_hi"),
+                 "앞 절반": o.get("half1"), "뒤 절반": o.get("half2"), "단조성": o.get("mono"), "등급": o["grade"]}
+            if "q" in o:
+                for g in range(5):
+                    r[f"{g + 1}분위(%)"] = o["q"][g]
+            rows.append(r)
+        fdf = pd.DataFrame(rows)
+        st.dataframe(fdf, width="stretch", hide_index=True, column_config={
+            "윗-아랫(%)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(하한)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(상한)": st.column_config.NumberColumn(format="%+.2f"),
+            "앞 절반": st.column_config.NumberColumn(format="%+.2f"), "뒤 절반": st.column_config.NumberColumn(format="%+.2f"), "단조성": st.column_config.NumberColumn(format="%+.2f"),
+            **{f"{g}분위(%)": st.column_config.NumberColumn(format="%+.2f") for g in range(1, 6)}})
+        st.caption("1분위는 요인 값이 가장 낮은 그룹, 5분위는 가장 높은 그룹이에요. '윗-아랫'은 5분위 − 1분위의 평균 이후 수익(한 번 보유할 때마다)이고, 단조성이 +1에 가까우면 분위가 올라갈수록 수익도 일정하게 올라간다는 뜻이에요. "
+                   "비용은 반영하지 않았어요(실제로 사고팔면 비용이 들고 윗그룹·아랫그룹을 동시에 거래하는 것은 개인이 하기 어려워요). 등급의 의미는 위 가설 검증과 같고, 생존 편향 한계도 같아요.")
+        sel = st.selectbox("분위별 평균 수익 보기", [k for k, o in fr["res"].items() if "q" in o], key="lab_fsel") if any("q" in o for o in fr["res"].values()) else None
+        if sel:
+            q = fr["res"][sel]["q"]
+            cdf = pd.DataFrame({"분위": [f"{g + 1}분위" for g in range(5)], "평균 이후 수익(%)": q})
+            st.altair_chart(alt.Chart(cdf).mark_bar().encode(x=alt.X("분위:N", title=None, sort=None), y=alt.Y("평균 이후 수익(%):Q", title=None),
+                                                           color=alt.condition(alt.datum["평균 이후 수익(%)"] > 0, alt.value("#D93A33"), alt.value("#2A63D4")),
+                                                           tooltip=["분위", alt.Tooltip("평균 이후 수익(%):Q", format=".2f")]).properties(height=220), width="stretch")
+
+    st.divider()
     st.subheader("수급 기록 쌓기 (수급 가설 검증을 위한 자료)")
     st.markdown("한국 시장은 외국인·기관 수급의 영향이 크다는 가설을 검증하려면 **수급의 과거 기록이 길게** 필요한데, 지금은 최근 약 40거래일만 가져올 수 있어요. "
                 "그래서 보유·관심 종목의 수급을 **구글 시트의 `수급기록` 탭에 쌓아둬요.** 한 번 가져올 때 약 40거래일이 들어오므로 **한 달에 한 번 이상** 누르면 빈틈없이 이어져요.")
@@ -2598,6 +2726,153 @@ def tab_lab():
                  + ("수급 가설을 검증하기에는 아직 짧아요(최소 6개월, 약 120거래일 이상을 권해요)." if per.max() < 120 else "수급 가설을 시험해 볼 만한 길이가 쌓였어요."))
     else:
         st.info("아직 기록이 없어요. 위 버튼을 눌러 오늘부터 쌓기 시작하세요.")
+
+
+
+# ---------- 종합 순위 ----------
+def load_scorelog():
+    if "scorelog" in st.session_state:
+        return
+    df, err = pd.DataFrame(columns=SCORELOG_COLS), None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("점수기록", SCORELOG_COLS)
+        except Exception as e:
+            err = str(e)
+    for c in SCORELOG_COLS[2:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
+    st.session_state.scorelog, st.session_state.scorelog_err = df, err
+
+
+def record_scores(rows):
+    """오늘 점수를 '점수기록' 탭에 이어 붙인다(같은 날짜·종목은 건너뜀). 반환: (성공, 문구)"""
+    store = get_store()
+    if store is not None and (st.session_state.get("load_error") or st.session_state.get("scorelog_err")):
+        return False, "구글 시트에서 점수 기록을 읽지 못한 상태라 저장을 막았어요."
+    cur = st.session_state.scorelog
+    have = set(zip(cur["날짜"].astype(str), cur["종목코드"]))
+    new = [r for r in rows if (r[0], r[1]) not in have]
+    if not new:
+        return True, "오늘 점수는 이미 기록돼 있어요."
+    df = pd.concat([cur, pd.DataFrame(new, columns=SCORELOG_COLS)], ignore_index=True).tail(8000)
+    try:
+        if store is not None:
+            store.write("점수기록", df)
+        st.session_state.scorelog = df
+        return True, f"{len(new)}종목의 오늘 점수를 기록했어요."
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def tab_rank(rules):
+    st.markdown("**흩어진 근거를 하나의 점수로 모아서** 한눈에 비교해요. 가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조(손익비)를 각각 -100~+100으로 매기고 가중치(규칙 탭)로 모은 종합 점수예요(50 중립). "
+                "점수는 **이길 확률이 아니라 근거가 얼마나 한 방향으로 모이는지**예요. 근거 칸이 3/5 미만이면 참고만 하세요.")
+    hold, watch = st.session_state.hold, st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))
+    kinds = {}
+    for c in hold["종목코드"].drop_duplicates():
+        kinds[c] = "보유"
+    for c in watch["종목코드"]:
+        kinds.setdefault(c, "관심")
+    extra = st.text_input("함께 비교할 종목코드(쉼표로 구분, 선택)", key="rank_extra", placeholder="예: 005930, 000660")
+    for c in [x.strip().zfill(6) for x in extra.split(",") if x.strip()]:
+        kinds.setdefault(c, "추가")
+    codes = list(kinds)
+    if not codes:
+        st.info("보유 종목이나 관심종목을 먼저 입력하세요.")
+        return
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("수급 가져오기", key="rank_flow"):
+        with st.spinner("수급을 가져오는 중이에요…"):
+            errs = fetch_flows_bulk(codes)
+        st.session_state["flow_msg"] = errs
+        st.rerun()
+    if b2.button("컨센서스 가져오기", key="rank_cons"):
+        with st.spinner("컨센서스를 가져오는 중이에요…"):
+            errs = fetch_cons_bulk(codes)
+        st.session_state["flow_msg"] = [f"컨센서스 {e}" for e in errs]
+        st.rerun()
+    for e in st.session_state.pop("flow_msg", []) or []:
+        st.warning(f"못 가져왔어요 — {e}")
+    rows, log = [], []
+    today = dt.date.today().isoformat()
+    for code in codes:
+        ag = holding_agg(code)
+        tag = ag["tag"] if ag else "중장기"
+        card = card_for(code, tag, ag["avg"] if ag else None, ag["qty"] if ag else 0.0, ag["since"] if ag else None)
+        sc = score_for(code, tag, ag["avg"] if ag else None, ag["qty"] if ag else 0.0, ag["since"] if ag else None, card=card)
+        df_ = hist_kr(code)
+        if sc is None or not len(df_):
+            continue
+        price = float(df_["Close"].iloc[-1])
+        fam = {f["name"]: f["score"] for f in sc["families"]}
+        flags = []
+        if any(i["항목"] == "개인 주도 경고" for f in sc["families"] for i in f["items"]):
+            flags.append("개인 주도")
+        if any(i["항목"] == "안전 기준" and i["점수"] < 0 for f in sc["families"] for i in f["items"]):
+            flags.append("안전 미달")
+        if sc["conflicts"]:
+            flags.append(f"근거 엇갈림 {len(sc['conflicts'])}쌍")
+        name = (ag or {}).get("name") or (watch[watch["종목코드"] == code]["종목명"].iloc[0] if (watch["종목코드"] == code).any() else code)
+        rows.append({"종목": name, "코드": code, "구분": kinds[code], "종합점수": sc["total"], "판정": sc["band"], "가격 흐름": fam["가격 흐름"], "수급": fam["수급"],
+                     "재무·안전": fam["재무·안전"], "컨센서스": fam["컨센서스"], "진입 구조": fam["진입 구조"], "근거": f"{sc['n_avail']}/{sc['n_total']}",
+                     "일치": "-" if not sc["agree"] or sc["agree"][1] == 0 else f"{sc['agree'][0]}/{sc['agree'][1]}", "주의": ", ".join(flags),
+                     "수익률(%)": (price / ag["avg"] - 1) * 100 if ag and ag["avg"] else np.nan, "_n": sc["n_avail"]})
+        if sc["total"] is not None:
+            log.append([today, code, sc["total"], fam["가격 흐름"], fam["수급"], fam["재무·안전"], fam["컨센서스"], fam["진입 구조"], sc["n_avail"], price])
+    if not rows:
+        st.warning("시세를 가져오지 못해서 점수를 계산하지 못했어요.")
+        return
+    view = st.radio("보기", ["전체 순위", "보유 종목 점검(점수 낮은 순)", "매수 후보(미보유, 점수 높은 순)"], horizontal=True, key="rank_view")
+    df = pd.DataFrame(rows)
+    if view.startswith("보유"):
+        df = df[df["구분"] == "보유"].sort_values("종합점수", ascending=True)
+    elif view.startswith("매수"):
+        df = df[df["구분"] != "보유"].sort_values("종합점수", ascending=False)
+    else:
+        df = df.sort_values("종합점수", ascending=False)
+    cc = {c: st.column_config.NumberColumn(format="%+.0f") for c in ("가격 흐름", "수급", "재무·안전", "컨센서스", "진입 구조")}
+    cc["종합점수"] = st.column_config.NumberColumn(format="%.0f")
+    cc["수익률(%)"] = st.column_config.NumberColumn(format="%+.1f")
+    st.dataframe(df.drop(columns=["_n"]), width="stretch", hide_index=True, column_config=cc)
+    low = int((df["_n"] < 3).sum())
+    if low:
+        st.caption(f"근거가 3가지 미만인 종목이 {low}개 있어요. 위 버튼으로 수급·컨센서스를 가져오고, 재무는 안전 점검 탭에서 가져오면 근거가 늘어요.")
+    st.caption("각 칸은 근거 종류별 점수(-100 불리 ~ +100 우호)이고 비어 있으면 그 근거가 없는 거예요. 점수가 높다고 사라는 뜻도, 낮다고 팔라는 뜻도 아니에요. 점수는 아래 기록으로 실제 성과와 비교해서 고쳐 나가요.")
+
+    ok_log = [r for r in log if r[8] >= 3]
+    sl0 = st.session_state.scorelog
+    logged_today = set(sl0[sl0["날짜"].astype(str) == today]["종목코드"]) if sl0 is not None and len(sl0) else set()
+    todo = [r for r in ok_log if r[1] not in logged_today]
+    if todo:
+        ok, msg = record_scores(todo)
+        st.caption(f"오늘의 점수를 자동으로 기록했어요(근거 3가지 이상인 종목만). {msg}" if ok else msg)
+    else:
+        st.caption("오늘 점수는 기록돼 있어요(근거 3가지 이상인 종목만 기록해요). 수급·컨센서스를 늦게 가져온 종목은 다음에 이 화면을 열 때 기록돼요.")
+
+    with st.expander("점수의 실제 성과 확인 (기록이 쌓이면)"):
+        sl = st.session_state.scorelog
+        if sl is None or sl.empty:
+            st.info("아직 점수 기록이 없어요. 이 화면을 여는 날마다 근거 3가지 이상인 종목의 점수가 자동으로 쌓여요.")
+        else:
+            res = []
+            for r in sl.to_dict("records"):
+                d = hist_kr(r["종목코드"])
+                if not len(d) or r["종합점수"] != r["종합점수"]:
+                    continue
+                s = d["Close"]
+                i0 = int(s.index.searchsorted(pd.to_datetime(r["날짜"]), side="right")) - 1
+                if i0 < 0 or i0 + 20 >= len(s) or not r["종가"] or r["종가"] != r["종가"]:
+                    continue
+                res.append({"구간": score.bucket(r["종합점수"]), "수익률": (float(s.iloc[i0 + 20]) / float(r["종가"]) - 1) * 100})
+            n_all = len(sl)
+            st.write(f"기록 {n_all:,}건 중 20거래일이 지나 결과가 나온 것은 **{len(res):,}건**이에요.")
+            if res:
+                rd = pd.DataFrame(res)
+                g = rd.groupby("구간")["수익률"].agg(건수="count", 평균수익률="mean", 승률=lambda x: (x > 0).mean() * 100).reindex(["65 이상", "55~65", "45~55", "35~45", "35 미만"]).dropna(how="all").reset_index()
+                st.dataframe(g, width="stretch", hide_index=True, column_config={"평균수익률": st.column_config.NumberColumn(format="%+.2f"), "승률": st.column_config.NumberColumn(format="%.0f")})
+                st.caption("점수가 높은 구간의 이후 20거래일 수익이 실제로 더 컸는지 보는 표예요. 같은 날 같은 종목이 겹치고 시장 전체의 움직임도 섞여 있어서, 건수가 수백 건이 되기 전에는 우연일 수 있어요. 가중치를 바꾸기 전에 이 표와 판단 기록의 점수대별 통계를 같이 보세요.")
 
 
 def tab_rules():
@@ -2636,6 +2911,12 @@ def tab_rules():
         s[key]["on"] = a.checkbox(lab, value=s[key]["on"], key=f"s_on_{key}")
         if "v" in s[key] and unit:
             s[key]["v"] = b.number_input(unit, value=float(s[key]["v"]), step=1.0, key=f"s_v_{key}")
+    st.divider()
+    st.markdown("**종합 점수 가중치** — 근거 종류별로 얼마나 비중을 둘지예요(합계는 자동으로 100% 기준으로 계산해요). 0으로 두면 그 근거는 점수에서 빠져요. 모두 같게 두면 '그대로 평가'예요.")
+    wt = st.session_state.weights
+    wcols = st.columns(5)
+    for i, fam in enumerate(score.FAMILIES):
+        wt[fam] = wcols[i].number_input(fam, min_value=0, max_value=100, value=int(wt.get(fam, score.DEFAULT_WEIGHTS[fam])), step=5, key=f"wt_{i}")
     st.divider()
     st.markdown("**위험 한도** — 살 때 크기를 계산하는 기준이에요(종목 리포트의 진입 평가, 종목 발굴의 최대 매수)")
     rk = st.session_state.risk
@@ -2684,7 +2965,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 2}
 
 
 def check_versions():
@@ -2718,6 +2999,8 @@ def main():
         st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
     if "risk" not in st.session_state:
         st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
+    if "weights" not in st.session_state:
+        st.session_state.weights = copy.deepcopy(score.DEFAULT_WEIGHTS)
     if "funds" not in st.session_state:
         st.session_state.funds = copy.deepcopy(DEFAULT_FUNDS)
     load_settings()
@@ -2727,6 +3010,7 @@ def main():
     load_journal()
     load_plans()
     load_hyp()
+    load_scorelog()
     load_flowlog()
     load_fincache()
     rules = st.session_state.rules
@@ -2740,7 +3024,7 @@ def main():
 
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
-    pages = {"내 자산": lambda: tab_assets(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
+    pages = {"내 자산": lambda: tab_assets(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
              "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
     pages[page]()  # 고른 화면만 계산해서 빠르다
