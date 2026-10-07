@@ -168,6 +168,33 @@ def bulk_financials(client, codes, today=None, progress=None):
     return result, errors
 
 
+def bulk_financials_naver(codes, progress=None, workers=8):
+    """네이버 금융에서 종목별 연간 재무를 가져온다(DART가 안 될 때의 대체). 반환: (결과 dict, 오류 목록)"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    import naverfin
+    result, errors = {}, []
+
+    def one(c):
+        try:
+            return c, naverfin.to_fin(naverfin.fetch_annual(c)), None
+        except Exception as e:
+            return c, None, str(e)[:120]
+
+    codes = list(dict.fromkeys(codes))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(one, c) for c in codes]
+        for i, f in enumerate(as_completed(futs)):
+            c, rec, e = f.result()
+            if rec:
+                result[c] = rec
+            elif len(errors) < 5:
+                errors.append(f"{c}: {e}")
+            if progress and (i % 10 == 0 or i + 1 == len(codes)):
+                progress(f"네이버 금융에서 재무 조회 중… ({i + 1}/{len(codes)})")
+    return result, errors
+
+
 def metrics_table(stage1_df, fin):
     rows = []
     for r in stage1_df.itertuples():
@@ -188,6 +215,13 @@ def metrics_table(stage1_df, fin):
         rec["PER"] = (r.Marcap / ni) if (pd.notna(r.Marcap) and ni and ni > 0) else np.nan
         rec["PBR"] = (r.Marcap / eq) if (pd.notna(r.Marcap) and eq and eq > 0) else np.nan
         rec["영업이익률"] = (op[2] / rv * 100) if (op and op[2] is not None and rv and rv > 0) else np.nan
+        if f:  # 자기자본·부채 금액이 없는 자료(네이버 대체)는 비율을 직접 쓴다
+            if rec["ROE"] != rec["ROE"] and f.get("roe") is not None:
+                rec["ROE"] = f["roe"]
+            if rec["부채비율"] != rec["부채비율"] and f.get("debt") is not None:
+                rec["부채비율"] = f["debt"]
+            if rec["PBR"] != rec["PBR"] and f.get("pbr") and f["pbr"] > 0:
+                rec["PBR"] = f["pbr"]
         rec["금융업의심"] = any(w in (r.Name or "") for w in FIN_WORDS)
         rec["재무연도"] = (f or {}).get("year")
         rows.append(rec)

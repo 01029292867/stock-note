@@ -576,20 +576,38 @@ def is_fresh(d):
         age = (dt.date.today() - dt.date.fromisoformat(d["fetched"])).days
     except Exception:
         return False
+    if d.get("source") == "naver":
+        return age <= 0
     return age <= (0 if d.get("errors") else FRESH_DAYS)
 
 
 def fetch_company(code):
-    """한 종목을 DART에서 가져와 캐시에 넣는다. 반환: (데이터, 오류문구)"""
+    """한 종목의 재무를 가져와 캐시에 넣는다. DART를 먼저 쓰고, 안 되면 네이버 금융의 재무로 대신한다. 반환: (데이터, 오류문구)"""
     dart, err = get_dart()
-    if dart is None:
-        return None, err
-    try:
-        d = dart_data.fetch_all(dart, code)
-    except Exception as e:
-        return None, dart_data.redact(e)
-    st.session_state.fincache[code] = d
-    return d, None
+    d, e = None, err
+    if dart is not None:
+        try:
+            d = dart_data.fetch_all(dart, code)
+        except Exception as ex:
+            d, e = None, dart_data.redact(ex)
+    if d is not None and not (d.get("fin") is None and d.get("errors")):
+        st.session_state.fincache[code] = d
+        return d, None
+    try:  # DART가 안 되거나 재무를 못 받았으면 네이버로 대신한다
+        import naverfin
+        nf = naverfin.fetch_annual(code)
+    except Exception as ex2:
+        if d is not None:
+            st.session_state.fincache[code] = d
+            return d, None
+        return None, f"{e or 'DART 연결 실패'} / 네이버 대체도 실패: {dart_data.redact(ex2)[:120]}"
+    name = st.session_state.get("disc_names", {}).get(code, "")
+    if not name:
+        hs = st.session_state.hold[st.session_state.hold["종목코드"] == code]
+        name = hs["종목명"].iloc[0] if len(hs) else ""
+    fd = {"code": code, "fetched": dt.date.today().isoformat(), "source": "naver", "naver": nf, "name": name, "errors": {}, "dart_error": (e or "")[:200]}
+    st.session_state.fincache[code] = fd
+    return fd, None
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -627,7 +645,10 @@ def safety_for(code):
     df = hist_kr(code)
     price = float(df["Close"].iloc[-1]) if len(df) else None
     adm = admin_codes()
-    m = safety.derive(d, price, market.avg_trading_value_eok(df), None if adm is None else (code in adm))
+    if d.get("source") == "naver":
+        m = safety.derive_naver(d, price, market.avg_trading_value_eok(df), None if adm is None else (code in adm))
+    else:
+        m = safety.derive(d, price, market.avg_trading_value_eok(df), None if adm is None else (code in adm))
     if m["cap_jo"] is None and not m["is_pref"]:
         hint = st.session_state.get("disc_cap", {}).get(code)  # DART 주식 수를 못 구했으면 종목 목록의 시가총액을 쓴다
         if hint and hint == hint:
@@ -710,6 +731,14 @@ def bulk_cached(codes):
         raise RuntimeError(errs[0])  # 실패한 결과는 캐시에 남기지 않는다
     return fin, errs
 
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def bulk_naver_cached(codes):
+    fin, errs = discover.bulk_financials_naver(list(codes))
+    if not fin:
+        raise RuntimeError(errs[0] if errs else "네이버 금융에서 재무를 가져오지 못했어요")  # 실패한 결과는 캐시에 남기지 않는다
+    return fin, errs
 
 
 # ---------- 수급 (네이버 금융, 세션에 30분 보관) ----------
@@ -1278,12 +1307,13 @@ def render_safety(items):
 
 
 def report_financials(code):
-    st.subheader("재무와 안전 점검 (DART)")
+    st.subheader("재무와 안전 점검 (DART, 안 되면 네이버 금융)")
     dart, err = get_dart()
     if dart is None:
-        st.info(err)
-        return
+        st.info((err or "DART에 연결하지 못했어요.") + " 아래 버튼을 누르면 네이버 금융의 재무로 대신 가져와요(영업이익·부채비율·ROE·배당만 확인돼요).")
     d = st.session_state.fincache.get(code)
+    if d is not None and d.get("source") == "naver":
+        st.warning("지금 보이는 재무는 DART가 아니라 **네이버 금융**에서 가져온 거예요. 영업이익 흐름, 부채비율, ROE, 배당만 확인되고 이자보상배율·영업현금흐름·자본잠식·감사의견·최대주주·증자·부도 공시는 '확인 불가'로 나와요.")
     c1, c2 = st.columns([1, 3])
     label = "재무·공시 가져오기" if d is None else "새로 가져오기"
     if c1.button(label, key=f"fetch_{code}"):
@@ -1797,15 +1827,30 @@ def run_discovery(f, manual_codes=None):
     st.session_state.disc_cap = {c: m / 1e12 for c, m in zip(uni["Code"], uni["Marcap"]) if m == m}
     held = set(st.session_state.hold["종목코드"]) if st.session_state.get("disc_excl_held", True) else set()
     s1, notes = discover.stage1(uni, f, exclude=held)
-    bar.progress(0.3, text=f"DART 재무 일괄 조회 중… ({len(s1)}개)")
-    try:
-        fin, errs = bulk_cached(tuple(s1["Code"]))
-    except Exception as e:
-        bar.empty()
-        st.session_state.disc_res = {"fail": f"DART 재무 조회에 실패했어요: {e}", "uni_n": len(uni), "s1_n": len(s1)}
-        return
+    src = st.session_state.get("disc_src", "자동(DART 우선)")
+    fin, errs, used, dart_fail = None, [], None, None
+    if src != "네이버 금융":
+        bar.progress(0.3, text=f"DART 재무 일괄 조회 중… ({len(s1)}개)")
+        try:
+            fin, errs = bulk_cached(tuple(s1["Code"]))
+            used = "DART"
+        except Exception as e:
+            dart_fail = dart_data.redact(e)
+    if used is None:
+        if src == "DART":
+            bar.empty()
+            st.session_state.disc_res = {"fail": f"DART 재무 조회에 실패했어요: {dart_fail}", "uni_n": len(uni), "s1_n": len(s1)}
+            return
+        bar.progress(0.35, text=("DART가 안 돼서 " if dart_fail else "") + f"네이버 금융의 재무로 조회하는 중… ({len(s1)}개, 1~2분 걸려요)")
+        try:
+            fin, errs = bulk_naver_cached(tuple(s1["Code"]))
+            used = "네이버"
+        except Exception as e:
+            bar.empty()
+            st.session_state.disc_res = {"fail": f"재무 조회에 실패했어요. DART: {dart_fail or '시도하지 않음'} / 네이버: {dart_data.redact(e)}", "uni_n": len(uni), "s1_n": len(s1)}
+            return
     tbl = discover.metrics_table(s1, fin)
-    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes,
+    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes, "source": used, "dart_fail": dart_fail,
                                  "errors": errs, "manual": bool(manual_codes), "ts": dt.datetime.now().strftime("%m-%d %H:%M"),
                                  "dept": uni["Dept"].replace("", "(비어 있음)").value_counts().head(15).to_dict() if "Dept" in uni else {}}
     bar.progress(1.0, text="완료")
@@ -1855,9 +1900,8 @@ def _entry_cells(code, ind):
 def tab_discover():
     st.markdown("시장 전체에서 후보를 좁히는 깔때기예요. **① 시가총액·거래대금 → ② DART 재무 → ③ 남은 상위 후보만 안전 기준·가격 흐름까지 상세 점검**해요. 통과했다고 사라는 뜻은 아니고, 더 살펴볼 후보라는 뜻이에요.")
     dart, err = get_dart()
-    if dart is None:
-        st.warning(err)
-        return
+    if dart is None:  # DART가 안 돼도 멈추지 않고 네이버 금융의 재무로 대신한다
+        st.info((err or "DART에 연결하지 못했어요.") + " 재무는 네이버 금융으로 대신 가져와요(영업이익·영업적자 횟수·부채비율·ROE·PER/PBR만 확인돼요).")
     f = st.session_state.disc_f
     with st.expander("발굴 조건", expanded=False):
         disc_filters_ui(f)
@@ -1874,6 +1918,8 @@ def tab_discover():
         st.info("종목 목록 출처에 접속하지 못했어요. 대신 살펴볼 종목코드를 직접 붙여넣어 재무 조건만 적용할 수 있어요(시가총액이 없어서 PER·PBR·시가총액 조건은 빠져요).")
         txt = st.text_area("종목코드 목록 (쉼표나 줄바꿈으로 구분)", key="disc_manual", placeholder="005930, 000660, 035420")
         manual_codes = [x for x in txt.replace("\n", ",").replace(" ", ",").split(",") if x.strip()] or None
+    st.radio("재무 자료 출처", ["자동(DART 우선)", "네이버 금융", "DART"], horizontal=True, key="disc_src",
+             help="자동: DART를 먼저 쓰고 안 되면 네이버 금융으로 대신해요. 네이버 금융은 영업이익·부채비율·ROE·PER/PBR만 있어서 이자보상배율·영업현금흐름·감사의견·증자 이력 같은 안전 기준은 상세 점검에서 '확인 불가'로 나와요.")
     if st.button("시장 데이터 불러오기", type="primary"):
         with st.spinner("시장 데이터를 불러오는 중이에요(1~3분 걸릴 수 있어요)…"):
             run_discovery(f, manual_codes)
@@ -1896,6 +1942,9 @@ def tab_discover():
     k[2].metric("② 재무 조회됨", f"{res['fin_n']:,}")
     k[3].metric("② 재무 조건 통과", f"{len(cand):,}")
     st.caption(f"{res['ts']}에 불러온 데이터예요.")
+    if res.get("source") == "네이버":
+        st.warning("재무 자료 출처: **네이버 금융**" + (f" (DART 연결 실패: {res['dart_fail'][:80]})" if res.get("dart_fail") else "") +
+                   ". 영업이익, 영업적자 횟수, 부채비율, ROE, PER/PBR만 있어요. 이자보상배율, 영업현금흐름, 자본잠식, 감사의견, 최대주주, 증자·CB 이력, 부도 공시는 확인하지 못해서 상세 점검에서 '확인 불가'로 나와요.")
     for n in res.get("notes", []):
         st.warning(n)
     if res.get("errors"):
@@ -2139,9 +2188,8 @@ def tab_safety():
         st.info("보유 종목을 먼저 등록해 주세요.")
         return
     dart, err = get_dart()
-    if dart is None:
-        st.warning(err)
-        return
+    if dart is None:  # DART가 안 돼도 멈추지 않고 네이버 금융의 재무로 대신한다
+        st.info((err or "DART에 연결하지 못했어요.") + " 재무는 네이버 금융으로 대신 가져와요(영업이익·부채비율·ROE·배당만 확인되고, 나머지 안전 기준은 '확인 불가'로 나와요).")
     note = admin_notice()
     if note:
         st.warning(note)
@@ -3237,7 +3285,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1, "naverfin": 1}
 
 
 def check_versions():

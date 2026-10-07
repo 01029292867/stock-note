@@ -76,7 +76,7 @@ def rows(url=""):
 
     s = "6. 앱 코드를 고칠 때 반영 순서"
     add(s, "순서", "① 새 파일을 GitHub 저장소 맨 위(폴더 없이)에 Add file > Upload files로 올리고 Commit changes ② 앱 오른쪽 아래 Manage app > ⋮ > Reboot app ③ 1~3분 뒤 새로고침")
-    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, guide.py, requirements.txt")
+    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, guide.py, requirements.txt")
     add(s, "파일 버전이 안 맞으면", "앱이 어느 파일이 예전 버전인지 알려줘요. 그 파일을 최신으로 올리고 Reboot 하세요.")
 
     s = "7. 문제가 생기면"
@@ -84,7 +84,7 @@ def rows(url=""):
                  ("시세를 못 가져옴", "종목코드 6자리 확인 후 사이드바의 '시세 새로고침'. 무료 시세라 일시적으로 막힐 수 있어요."),
                  ("구글 시트를 못 불러옴", "Secrets의 GAS_URL(/exec로 끝나야 함)과 GAS_TOKEN이 Apps Script의 TOKEN과 같은지, 배포 접근 권한이 '모든 사용자'인지 확인"),
                  ("수급·컨센서스·리포트가 안 나옴", "네이버 증권 데이터를 읽어오는 방식이라 막히거나 형식이 바뀔 수 있어요. 화면에 나온 이유 문구를 확인"),
-                 ("DART 연결 시간 초과", "DART 서버가 일시적으로 응답하지 않는 경우예요. 5분 뒤 자동으로 다시 시도하고, 회사 목록은 이 시트의 '회사코드' 탭에 보관해둔 것을 써요. 계속되면 잠시 뒤 다시 열어보세요."),
+                 ("DART 연결 시간 초과", "DART 서버가 응답하지 않거나 클라우드 서버의 접속을 막는 경우예요. 종목 발굴·안전 점검·리포트는 멈추지 않고 네이버 금융의 재무(영업이익·영업적자 횟수·부채비율·ROE·PER/PBR·배당)로 자동 대체해요. 이자보상배율·영업현금흐름·자본잠식·감사의견·최대주주·증자 이력·부도 공시는 DART에만 있어서 대체 중에는 '확인 불가'로 나와요. DART가 다시 되면 자동으로 DART를 써요(종목 발굴의 '재무 자료 출처'에서 고를 수도 있어요)."),
                  ("DART 오류 010/011/020", "010·011은 인증키 문제, 020은 하루 사용 한도 초과예요. 내일 다시 시도"),
                  ("앱이 오류 화면(Traceback)", "화면을 캡처해서 개발 도우미에게 보여주세요. 이때 Secrets나 비밀번호가 보이지 않게 가려주세요.")):
         add(s, k, t)

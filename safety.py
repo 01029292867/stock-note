@@ -83,6 +83,32 @@ def derive(d, price=None, tv_eok=None, admin=None):
     return m
 
 
+def derive_naver(d, price=None, tv_eok=None, admin=None):
+    """네이버 금융 재무(d['naver'])로 판단용 지표를 만든다. 영업이익 흐름, 부채비율, ROE, 배당만 알 수 있고
+    이자보상배율·영업현금흐름·자본잠식·감사의견·최대주주·증자·부도 공시는 알 수 없어서 '확인 불가'로 남긴다."""
+    import naverfin
+    f = naverfin.to_fin(d["naver"])
+    name = (d or {}).get("name") or ""
+    m = {"is_fin": any(w in name for w in ("금융", "은행", "증권", "보험", "캐피탈", "카드", "화재", "생명")), "admin": admin,
+         "is_pref": False, "resolved_code": None, "name": name, "fin_year": f["year"], "fs": "NAVER"}
+    op = f["op"]
+    m["op3"] = op
+    known = [x for x in (op or []) if x is not None]
+    m["loss_n"] = sum(1 for x in known if x <= 0) if known else None
+    m["loss_known"] = len(known)
+    m["equity"], m["liab"] = None, None
+    m["debt"], m["roe"] = f["debt"], f["roe"]
+    m["ni"] = (f["ni"] or [None, None, None])[2] if f.get("ni") else None
+    m["interest"], m["interest_basis"], m["cover"], m["ocf"], m["impair"] = None, None, None, None, None
+    m["div_list"] = f["div_list"]
+    m["div_years"] = sum(1 for x in f["div_list"] if x and x > 0) if f["div_list"] else None
+    m["major"], m["shares"], m["cap_jo"] = None, None, None
+    m["audit"], m["audit_ok"] = None, None
+    m["issue_n"], m["issues"], m["issue_detail"], m["distress_n"] = None, None, {}, None
+    m["tv"] = tv_eok
+    return m
+
+
 def _r(key, label, status, detail):
     return {"key": key, "label": label, "status": status, "detail": detail}
 
