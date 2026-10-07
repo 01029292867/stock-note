@@ -5,7 +5,7 @@ import pandas as pd
 
 SNAP_COLS = ["날짜", "주식", "현금", "총자산", "구분", "메모"]
 FLOW_COLS = ["날짜", "금액", "메모"]
-DEFAULT_GOAL = {"min": 3.0, "max": 8.0, "dd": 15.0, "kakao_flow": True}
+DEFAULT_GOAL = {"min": 3.0, "max": 8.0, "dd": 15.0, "kakao_flow": True, "inflation": 2.5, "infl_on": True}
 
 
 def clean_snaps(df):

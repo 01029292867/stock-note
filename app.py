@@ -14,11 +14,14 @@ import streamlit as st
 import consensus
 import dart_data
 import discover
+import entry
 import flows
+import fund
 import journal
 import judge
 import market
 import perf
+import plan
 import reports
 import safety
 import signals as sg
@@ -34,6 +37,9 @@ CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
 WATCH_COLS = ["종목코드", "종목명"]
+FUND_COLS = ["이름", "목표(만원)", "기간(년)", "현재(만원)", "매달 저축(만원)"]
+DEFAULT_FUNDS = [{"이름": "자녀 분가 자금", "목표(만원)": 0.0, "기간(년)": 5.0, "현재(만원)": 0.0, "매달 저축(만원)": 0.0},
+                 {"이름": "노후 자금", "목표(만원)": 0.0, "기간(년)": 15.0, "현재(만원)": 0.0, "매달 저축(만원)": 0.0}]
 JOURNAL_DUE_DAYS = 30  # 이 기간 넘게 판단 기록이 없는 보유 종목은 점검 대상으로 안내한다
 CONS_COLS = ["날짜", "종목코드", "목표가", "의견점수"]
 FRESH_DAYS = 7  # 재무·공시 데이터를 이 기간 안에는 다시 가져오지 않는다
@@ -118,13 +124,16 @@ def load_settings():
         return
     try:
         df = store.read("설정", SETTINGS_COLS)
-        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc", "goal")}
+        saved = {r["이름"]: json.loads(r["값"]) for r in df.to_dict("records") if r.get("이름") in ("rules", "safe", "disc", "goal", "risk", "funds")}
     except Exception:
         return  # 설정을 못 읽으면 기본값으로 시작한다(저장된 값을 지우지는 않는다)
     _merge(st.session_state.rules, saved.get("rules"))
     _merge(st.session_state.safe, saved.get("safe"))
     _merge(st.session_state.disc_f, saved.get("disc"))
     _merge(st.session_state.goal, saved.get("goal"))
+    _merge(st.session_state.risk, saved.get("risk"))
+    if isinstance(saved.get("funds"), list) and saved["funds"]:
+        st.session_state.funds = saved["funds"]
 
 
 def save_settings():
@@ -138,7 +147,9 @@ def save_settings():
         rows = [["rules", json.dumps(st.session_state.rules, ensure_ascii=False)],
                 ["safe", json.dumps(st.session_state.safe, ensure_ascii=False)],
                 ["disc", json.dumps(st.session_state.disc_f, ensure_ascii=False)],
-                ["goal", json.dumps(st.session_state.goal, ensure_ascii=False)]]
+                ["goal", json.dumps(st.session_state.goal, ensure_ascii=False)],
+                ["risk", json.dumps(st.session_state.risk, ensure_ascii=False)],
+                ["funds", json.dumps(st.session_state.funds, ensure_ascii=False)]]
         store.write("설정", pd.DataFrame(rows, columns=SETTINGS_COLS))
         return True, "규칙을 저장했어요. 이제 새로고침하거나 폰에서 열어도 그대로예요."
     except Exception as e:
@@ -150,8 +161,9 @@ def reset_settings():
     st.session_state.safe = safety.default_rules()
     st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
+    st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("rk_pt", "rk_mp", "rk_mr", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
             del st.session_state[k]
 
 
@@ -341,6 +353,63 @@ def journal_due():
         if g is None or g.empty or (today - g["날짜"].max()).days > JOURNAL_DUE_DAYS:
             due.append(code)
     return last, due
+
+
+
+# ---------- 매매 계획 (구글 시트 '매매계획' 탭) ----------
+def load_plans():
+    if "plans" in st.session_state:
+        return
+    df, err = pd.DataFrame(columns=plan.COLS), None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("매매계획", plan.COLS)
+        except Exception as e:
+            err = str(e)  # 읽지 못한 채로 저장하면 기존 계획을 덮어쓰므로 저장을 막는다
+    st.session_state.plans, st.session_state.plans_err = plan.clean(df), err
+
+
+def save_plans(df):
+    """df: 전체 계획 표. 반환: (성공, 문구)"""
+    store = get_store()
+    if store is not None and (st.session_state.get("load_error") or st.session_state.get("plans_err")):
+        return False, "구글 시트에서 매매 계획을 읽지 못한 상태라 저장을 막았어요."
+    clean_df = plan.clean(df)
+    out = clean_df.copy()
+    out["생성일"] = out["생성일"].dt.strftime("%Y-%m-%d")
+    try:
+        if store is not None:
+            store.write("매매계획", out)
+        st.session_state.plans = clean_df
+        return True, "저장했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def sizing_assets():
+    """매수 크기 계산에 쓰는 총자산(주식 평가금액 + 마지막으로 기록한 현금). 없으면 None."""
+    val = st.session_state.get("total_val") or 0.0
+    snaps = perf.clean_snaps(st.session_state.get("perf_snaps", pd.DataFrame(columns=perf.SNAP_COLS)))
+    cash = float(snaps["현금"].dropna().iloc[-1]) if len(snaps) and snaps["현금"].notna().any() else 0.0
+    return (val + cash) if (val + cash) > 0 else None
+
+
+def entry_for(card, price, invalid=None):
+    return entry.plan_entry(price, card, sizing_assets(), st.session_state.risk, invalid)
+
+
+def plan_rows(rules):
+    """진행 중인 계획의 점검 결과 목록. 각 항목: (계획 dict, 평가 dict)"""
+    pl = st.session_state.get("plans")
+    out = []
+    if pl is None or pl.empty:
+        return out
+    for p in pl[pl["상태"] == "진행"].to_dict("records"):
+        df = hist_kr(p["종목코드"])
+        closes = df["Close"][df.index >= p["생성일"]] if len(df) else None
+        out.append((p, plan.evaluate(p, closes)))
+    return out
 
 
 # ---------- 데이터 정리 ----------
@@ -601,7 +670,8 @@ def prefetch_prices():
     from concurrent.futures import ThreadPoolExecutor
     now = time.time()
     jobs = []
-    for c in dict.fromkeys(list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"])):
+    plan_codes = list(st.session_state["plans"]["종목코드"]) if "plans" in st.session_state else []
+    for c in dict.fromkeys(list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"]) + plan_codes):
         if not (("kr", c) in _PRICE_CACHE and now - _PRICE_CACHE[("kr", c)][0] < PRICE_TTL):
             jobs.append(lambda c=c: hist_kr(c))
     for t in dict.fromkeys(st.session_state.kakao["티커"]):
@@ -933,6 +1003,13 @@ def tab_assets(rules):
     if len(hold) and due:
         st.info(f"판단 기록이 {JOURNAL_DUE_DAYS}일 넘게 없는 보유 종목이 {len(due)}개 있어요"
                 + ("" if last_d is None else f"(마지막 기록은 {last_d}일 전)") + ". **판단 기록 탭의 월간 점검**에서 한 번에 남길 수 있어요.")
+    pr_rows = plan_rows(rules)
+    hit = [p["종목명"] or p["종목코드"] for p, ev in pr_rows if ev["level"] == "warn"]
+    hit_info = [p["종목명"] or p["종목코드"] for p, ev in pr_rows if ev["level"] == "info"]
+    if hit:
+        st.warning("매매 계획의 기준에 닿은 종목(무효가격·보호선 이탈): **" + ", ".join(hit) + "** — 매매 계획 화면에서 확인하세요.")
+    if hit_info:
+        st.info("목표에 도달한 계획: **" + ", ".join(hit_info) + "** — 계획대로 정리할지 점검해 보세요.")
     if val == 0 and not len(hold) and not len(kakao):
         st.info("아직 등록한 종목이 없어요. 아래 '보유 종목 편집'에서 종목을 추가해 보세요.")
     c1, c2, c3, c4 = st.columns(4)
@@ -1188,15 +1265,80 @@ def make_record(card, code, name, decision, reason, conf, invalid, memo):
             "필요승률": card["need_win"], "무효가격": invalid or None, "메모": memo}
 
 
+
+def render_entry(card, price, code, name, held, key):
+    st.subheader("추가로 산다면: 진입 평가" if held else "새로 산다면: 진입 평가")
+    st.caption("살 때의 구조를 정리해요. '잃지 않는 종목'을 찾는 게 아니라 **틀렸을 때 잃는 크기를 미리 정하는** 도구예요.")
+    e = entry_for(card, price)
+    default_inv = float(round(e["invalid"])) if e.get("invalid") else 0.0
+    inv_in = st.number_input("무효가격(손실 한도) — 바꾸면 아래가 다시 계산돼요", min_value=0.0, value=default_inv, step=100.0, key=f"{key}_einv",
+                             help="이 가격 아래로 내려가면 내 판단이 틀렸다고 보는 가격이에요. 기본값은 가까운 지지선보다 2% 아래예요.")
+    if inv_in and inv_in != default_inv:
+        e = entry_for(card, price, inv_in)
+    k = st.columns(5)
+    k[0].metric("진입 판정", e["verdict"].split("(")[0])
+    k[1].metric("진입 손익비", "-" if e["ratio"] is None else f"{e['ratio']:.2f}", help="보수적 상승 여력 ÷ 무효가격까지의 하락폭이에요. 기준(규칙 탭, 기본 2.0) 이상이면 유리로 봐요.")
+    k[2].metric("틀렸을 때 손실폭", "-" if e["stop_pct"] is None else f"-{e['stop_pct']:.1f}%", help="현재가에서 무효가격까지의 하락폭이에요.")
+    k[3].metric("살 수 있는 최대", "-" if not e["shares"] else f"{e['shares']:,}주", None if not e["amount"] else f"약 {e['amount'] / 1e4:,.0f}만원 · 총자산의 {e['pct_assets']:.1f}%", delta_color="off",
+                help="틀렸을 때 총자산의 손실 한도(규칙 탭, 기본 1%)만 잃도록 계산한 최대 수량이에요. 한 종목 최대 비중도 넘지 않아요.")
+    k[4].metric("기다릴 가격", "-" if not e["wait_price"] else f"{e['wait_price']:,.0f}원", None if not e["wait_price"] else f"{e['wait_pct']:.1f}%", delta_color="off",
+                help="손익비가 기준에 닿는 가격이에요(같은 무효가격과 목표를 가정). 비어 있으면 이미 기준을 넘었거나 계산할 수 없어요.")
+    st.markdown(entry.entry_text(e))
+    if sizing_assets() is None:
+        st.warning("총자산을 알 수 없어서 살 수 있는 크기를 계산하지 못했어요(보유 종목 입력 후, 목표·성과 탭에서 현금을 기록하면 계산돼요).")
+    cons = cons_for(code)
+    t2 = (cons or {}).get("target") if (cons and cons.get("has")) else None
+    if st.button("이 조건으로 매매 계획 만들기", key=f"{key}_mkplan"):
+        pl = st.session_state.plans
+        if len(pl[(pl["종목코드"] == code) & (pl["상태"] == "진행")]):
+            st.warning("이 종목은 이미 진행 중인 계획이 있어요. 매매 계획 화면에서 확인하세요.")
+        elif not e.get("invalid"):
+            st.error("무효가격을 먼저 정해 주세요.")
+        else:
+            tag = card["tag"]
+            row = {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "종목코드": code, "종목명": name, "생성일": dt.date.today().isoformat(), "상태": "진행", "꼬리표": tag,
+                   "기준가": price, "수량": e["shares"] or 0, "무효가격": e["invalid"], "목표1": e["up_price"] or price * 1.15,
+                   "비율1": 30, "목표2": t2 or (card["ups"][0]["price"] if card["ups"] else price * 1.3), "비율2": 30,
+                   "보호폭": st.session_state.rules.get(tag, {}).get("보호폭", 15), "완료1": "", "완료2": "", "메모": ""}
+            ok, msg = save_plans(pd.concat([pl, pd.DataFrame([row])], ignore_index=True))
+            (st.success if ok else st.error)(msg + (" 매매 계획 화면에서 목표와 정리 비율을 다듬을 수 있어요." if ok else ""))
+
+
 def render_card(card, name):
     g = card["grade"]
     st.subheader(f"종합 판단 카드 — {name}")
     k = st.columns(5)
-    k[0].metric("보수적 상승 여력", "-" if card["up"] is None else f"+{card['up']:.1f}%")
-    k[1].metric("하락 위험(중기)", "-" if not card["base"] else f"{card['base']['pct']:.1f}%")
-    k[2].metric("손익비", "-" if card["ratio"] is None else f"{card['ratio']:.2f}", g, delta_color="off")
-    k[3].metric("필요 승률", "-" if card["need_win"] is None else f"{card['need_win']:.0f}%", help="이 손익비에서 본전이 되려면 이 정도 이상 맞혀야 해요. 51%보다 높으면 구조적으로 불리해요.")
-    k[4].metric("근거 충족도", f"{card['n_have']}/4", " · ".join(n for n, v in card["have"].items() if not v) or "모두 있음", delta_color="off")
+    k[0].metric("보수적 상승 여력", "-" if card["up"] is None else f"+{card['up']:.1f}%",
+                help="앞으로 오를 수 있는 폭을 일부러 작게 잡은 값이에요. 컨센서스 목표가 여력의 절반과 가까운 저항선 중 작은 값을 써요.")
+    k[1].metric("하락 위험(중기)", "-" if not card["base"] else f"{card['base']['pct']:.1f}%",
+                help="내려갈 수 있는 폭을 넉넉하게 잡은 값이에요. 중기 지지선이나 이 종목이 과거 큰 조정에서 밀렸던 수준이에요. 반드시 거기까지 간다는 뜻은 아니에요.")
+    k[2].metric("손익비", "-" if card["ratio"] is None else f"{card['ratio']:.2f}", g, delta_color="off",
+                help="오를 폭 ÷ 내릴 폭이에요. 1이면 같고, 1보다 작으면 내릴 폭이 더 커요. 1.2 이상 보통, 2 이상 유리로 봐요.")
+    k[3].metric("필요 승률", "-" if card["need_win"] is None else f"{card['need_win']:.0f}%",
+                help="이 손익비로 같은 판단을 여러 번 반복할 때 본전이 되려면 맞혀야 하는 비율이에요. 계산은 내릴 폭 ÷ (오를 폭 + 내릴 폭). 50% 안팎이면 균형, 60%를 넘으면 불리해요.")
+    k[4].metric("근거 충족도", f"{card['n_have']}/4", " · ".join(n for n, v in card["have"].items() if not v) or "모두 있음", delta_color="off",
+                help="가격 흐름, 컨센서스, 수급, 안전·재무 중 몇 개를 반영했는지예요. 빠진 근거가 있으면 숫자가 덜 정확해요.")
+    rows_p = []
+    if card["ratio"] is not None:
+        rows_p.append({"기간": "가장 보수적(맨 위 숫자)", "오를 폭(%)": card["up"], "내릴 폭(%)": abs(card["base"]["pct"]), "손익비": card["ratio"], "필요 승률(%)": card["need_win"], "등급": g})
+    for nm, key in (("단기: 가까운 저항선 ↔ 가까운 지지선", "pair_short"), ("중기: 컨센서스 절반 ↔ 중기 하락", "pair_mid")):
+        pr_ = card.get(key)
+        if pr_:
+            rows_p.append({"기간": nm, "오를 폭(%)": pr_["up"], "내릴 폭(%)": pr_["down"], "손익비": pr_["ratio"], "필요 승률(%)": pr_["need"], "등급": pr_["grade"]})
+    if rows_p:
+        st.markdown("**기간별 손익비** — 오를 폭과 내릴 폭의 기간을 맞춰서 본 값이에요")
+        st.dataframe(pd.DataFrame(rows_p), width="stretch", hide_index=True, column_config={
+            "오를 폭(%)": st.column_config.NumberColumn(format="%+.1f"), "내릴 폭(%)": st.column_config.NumberColumn(format="-%.1f"),
+            "손익비": st.column_config.NumberColumn(format="%.2f"), "필요 승률(%)": st.column_config.NumberColumn(format="%.0f")})
+    try:
+        import explain
+        with st.expander("이 카드 읽는 법 — 이번 숫자로 풀어쓰기", expanded=True):
+            for title, md in explain.card_blocks(card):
+                st.markdown(f"**{title}**")
+                st.markdown(md)
+                st.divider()
+    except ImportError:
+        pass
     if card["n_have"] < 3:
         st.warning("근거가 부족해요. 수급·컨센서스·안전 점검을 가져오면 더 정확해져요(내 자산 탭의 가져오기 버튼, 안전 점검 탭).")
     for w in card["warns"]:
@@ -1459,6 +1601,7 @@ def tab_report(rules):
 
     st.subheader(f"내 기준으로 보면 ({tag})")
     sigs = sg.signals(ind, tag, avg, rules)
+    prot = None
     if avg:
         st.write(f"내 평단 {avg:,.0f}원 · 수익률 {pct((ind['price'] / avg - 1) * 100)}")
         prot = sg.protect(ind, tag, avg, rules)
@@ -1475,6 +1618,21 @@ def tab_report(rules):
             icon = {"주의": "⚠️", "매수검토": "🟢", "알림": "🔔"}[s["kind"]]
             st.markdown(f"{icon} **{s['title']}** — {s['detail']}")
         st.markdown(f"정리: **{sg.verdict(sigs)}**")
+    try:
+        import explain
+        if sigs or prot:
+            with st.expander("신호와 보호선 읽는 법 — 이번 숫자로 풀어쓰기"):
+                if prot:
+                    st.markdown(explain.protect_text(prot, ind["price"]))
+                for s in sigs:
+                    hlp = explain.SIGNAL_HELP.get(s["title"])
+                    if hlp:
+                        st.markdown(f"- **{s['title']}**: {hlp}")
+                if sigs:
+                    v = sg.verdict(sigs)
+                    st.markdown(f"- **정리: {v}**: {explain.VERDICT_HELP.get(v, '')} (신호가 걸렸다는 뜻이지 사고팔라는 뜻은 아니에요.)")
+    except ImportError:
+        pass
     else:
         st.write("지금은 내 기준에 걸리는 신호가 없어요.")
     card = card_for(code, tag, avg, float(held["수량"]) if held else 0.0, (held or {}).get("매수일") or None)
@@ -1482,6 +1640,7 @@ def tab_report(rules):
         render_card(card, (held or {}).get("종목명") or code)
         with st.expander("이 카드로 판단 기록하기"):
             record_form(card, code, (held or {}).get("종목명") or code, f"rf_{code}", "보유 유지" if held else "관망(사지 않음)")
+        render_entry(card, ind["price"], code, (held or {}).get("종목명") or code, bool(held and float(held["수량"]) > 0), f"en_{code}")
     report_structure(ind, tag, ind["price"], df)
     report_financials(code)
     report_flow(code)
@@ -1578,6 +1737,22 @@ def run_detail(codes):
         st.error("가져오지 못한 종목이 있어요:\n\n" + "\n\n".join(errors))
 
 
+
+def _entry_cells(code, ind):
+    """종목 발굴 표용: 진입 판정, 손익비, 무효가격, 최대 매수 수량, 기다릴 가격."""
+    try:
+        if not ind:
+            return ("-", np.nan, np.nan, np.nan, np.nan)
+        card = card_for(code, "중장기", None, None, None)
+        if not card:
+            return ("-", np.nan, np.nan, np.nan, np.nan)
+        e = entry_for(card, ind["price"])
+        return (e["verdict"].split("(")[0], e["ratio"] if e["ratio"] is not None else np.nan, e["invalid"] or np.nan,
+                e["shares"] if e["shares"] else np.nan, e["wait_price"] or np.nan)
+    except Exception:
+        return ("-", np.nan, np.nan, np.nan, np.nan)
+
+
 def tab_discover():
     st.markdown("시장 전체에서 후보를 좁히는 깔때기예요. **① 시가총액·거래대금 → ② DART 재무 → ③ 남은 상위 후보만 안전 기준·가격 흐름까지 상세 점검**해요. 통과했다고 사라는 뜻은 아니고, 더 살펴볼 후보라는 뜻이에요.")
     dart, err = get_dart()
@@ -1591,7 +1766,8 @@ def tab_discover():
         if a.button("조건 저장", key="d_save"):
             ok, msg = save_settings()
             (st.success if ok else st.error)(msg)
-    st.checkbox("이미 보유한 종목은 제외", value=True, key="disc_excl_held")
+    st.session_state.setdefault("disc_excl_held", True)
+    st.checkbox("이미 보유한 종목은 제외", key="disc_excl_held")
     res = st.session_state.get("disc_res")
     manual_codes = None
     if res and res.get("fail") and "종목 목록" in res["fail"]:
@@ -1672,6 +1848,7 @@ def tab_discover():
             "미달 항목": ", ".join(i["label"] for i in items if i["status"] == "fail") or "-",
             "확인 불가": ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-",
             "목표가 여력(%)": (consensus.upside(cons_for(c)["target"], float(df["Close"].iloc[-1])) if (cons_for(c) or {}).get("has") and len(df) else np.nan),
+            **dict(zip(("진입 판정", "진입 손익비", "무효가격(원)", "최대 매수(주)", "기다릴 가격(원)"), _entry_cells(c, ind))),
             "외국인 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("f5", np.nan),
             "기관 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("i5", np.nan),
             "흐름": sg.flow_of(ind)[0] if ind else "-", "52주 위치(%)": ind["pos"] if ind else np.nan,
@@ -1684,7 +1861,10 @@ def tab_discover():
         "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"), "RSI": st.column_config.NumberColumn(format="%.0f"),
         "3개월(%)": st.column_config.NumberColumn(format="%.1f"),
         "외국인 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "기관 5일(억)": st.column_config.NumberColumn(format="%+,.0f"),
-        "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f")})
+        "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
+        "진입 손익비": st.column_config.NumberColumn(format="%.2f"), "무효가격(원)": st.column_config.NumberColumn(format="%,d"),
+        "최대 매수(주)": st.column_config.NumberColumn(format="%,d"), "기다릴 가격(원)": st.column_config.NumberColumn(format="%,d")})
+    st.caption("진입 판정은 '지금 이 가격에서 새로 산다면' 구조가 괜찮은지를 봐요(손익비가 기준 이상이면 유리). 무효가격과 최대 매수 수량은 틀렸을 때 총자산의 손실 한도(규칙 탭)만 잃도록 계산한 값이에요. 후보 하나를 자세히 보려면 종목 리포트 탭에서 종목코드를 직접 입력하세요. ")
     st.caption("52주 위치가 낮을수록 1년 중 싼 구간이고, RSI가 70 이상이면 단기 과열이에요. 자세한 재무와 근거는 종목 리포트 탭에서 종목코드를 직접 입력해 확인할 수 있어요.")
     names = {f"{r['종목명']} ({r['종목코드']})": (r["종목코드"], r["종목명"]) for r in rows}
     pick = st.multiselect("관심종목에 추가", list(names))
@@ -1920,7 +2100,7 @@ def tab_journal(rules):
 
     with st.expander("월간 점검: 보유 종목을 한 번에 기록", expanded=bool(due)):
         codes = list(hold["종목코드"].drop_duplicates())
-        show_all = st.checkbox("점검 대상이 아닌 종목도 보기", value=False, key="jm_all")
+        show_all = st.checkbox("점검 대상이 아닌 종목도 보기", key="jm_all")
         targets = [c for c in codes if show_all or c in due]
         if not targets:
             st.success("점검할 종목이 없어요.")
@@ -1962,7 +2142,8 @@ def tab_journal(rules):
     bidx = hist_index()
     ev = journal.evaluate(jr, closes, bidx["Close"] if len(bidx) else None)
     st.subheader("내 판단의 결과")
-    h = st.radio("몇 거래일 뒤 결과로 볼까요", list(journal.HORIZONS), index=1, horizontal=True, format_func=lambda x: f"{x}일(약 {x // 20}개월)", key="jr_h")
+    st.session_state.setdefault("jr_h", 60)
+    h = st.radio("몇 거래일 뒤 결과로 볼까요", list(journal.HORIZONS), horizontal=True, format_func=lambda x: f"{x}일(약 {x // 20}개월)", key="jr_h")
     done = int(ev[f"v{h}"].notna().sum())
     st.caption(f"기록 {len(ev)}건 중 {h}일이 지나 결과가 나온 것은 {done}건이에요. 방향은 이렇게 봐요: 사거나 들고 있는 결정은 이후 오르면 맞은 판단, 팔거나 사지 않은 결정은 이후 내리면 맞은 판단이에요(손익은 그 방향으로 계산).")
     if done:
@@ -1990,6 +2171,188 @@ def tab_journal(rules):
             "20일 결정손익(%)": st.column_config.NumberColumn(format="%+.1f"), "60일 결정손익(%)": st.column_config.NumberColumn(format="%+.1f"),
             "120일 결정손익(%)": st.column_config.NumberColumn(format="%+.1f"), "60일 코스피 대비(%)": st.column_config.NumberColumn(format="%+.1f"),
             "60일 최대 하락(%)": st.column_config.NumberColumn(format="%.1f"), "필요 승률(%)": st.column_config.NumberColumn(format="%.0f")})
+
+
+
+# ---------- 목적 자금 ----------
+def tab_fund():
+    st.markdown("노후·자녀 분가처럼 **금액과 시점이 정해진 돈**이 목표에 닿으려면 **연 몇 %의 수익이 필요한지** 계산해요. 이 숫자는 예측이 아니라 **필요한 조건**이에요. "
+                "필요한 수익률이 높을수록 큰 위험을 져야 한다는 뜻이라서, 종목을 고르기 전에 이 숫자부터 보는 게 좋아요.")
+    goal = st.session_state.goal
+    c1, c2 = st.columns(2)
+    goal["inflation"] = c1.number_input("물가 상승률(연 %)", min_value=0.0, value=float(goal.get("inflation", 2.5)), step=0.5, key="g_infl",
+                                        help="목표 금액을 오늘 가치로 적었을 때, 그 가치를 지키려면 미래에 더 큰 금액이 필요해요.")
+    goal["infl_on"] = c2.checkbox("목표 금액을 오늘 가치로 보고 물가만큼 키워서 계산", value=bool(goal.get("infl_on", True)), key="g_inflon")
+    fdf = pd.DataFrame(st.session_state.funds)
+    for c in FUND_COLS:
+        if c not in fdf.columns:
+            fdf[c] = 0.0 if c != "이름" else ""
+    st.markdown("**목적별 목표** — 금액은 모두 **만원 단위**예요. 목표는 오늘 가치로 적으세요.")
+    ed = st.data_editor(fdf[FUND_COLS], num_rows="dynamic", width="stretch", hide_index=True, key="fund_editor", column_config={
+        "목표(만원)": st.column_config.NumberColumn(min_value=0, step=100, format="%,d"), "기간(년)": st.column_config.NumberColumn(min_value=0.5, step=0.5),
+        "현재(만원)": st.column_config.NumberColumn(min_value=0, step=100, format="%,d", help="이 목적을 위해 지금 모아둔(또는 투자 중인) 금액"),
+        "매달 저축(만원)": st.column_config.NumberColumn(min_value=0, step=10, format="%,d")})
+    if st.button("목적 자금 저장", type="primary", key="fund_save"):
+        st.session_state.funds = ed.fillna(0).to_dict("records")
+        ok, msg = save_settings()
+        (st.success if ok else st.error)(msg)
+    sz = sizing_assets()
+    if sz:
+        st.caption(f"참고: 지금 보유 주식과 마지막으로 기록한 현금을 합친 총자산은 약 {sz / 1e4:,.0f}만원이에요(노후·분가 자금뿐 아니라 다른 용도의 돈도 섞여 있을 수 있어요).")
+    infl = goal["inflation"] / 100 if goal.get("infl_on", True) else 0.0
+    shown = 0
+    for row in ed.fillna(0).to_dict("records"):
+        tgt, yrs, cur, mo = float(row["목표(만원)"]), float(row["기간(년)"]), float(row["현재(만원)"]), float(row["매달 저축(만원)"])
+        if tgt <= 0 or yrs <= 0:
+            continue
+        shown += 1
+        adj = fund.future_target(tgt, infl, yrs)
+        r = fund.required_return(adj, cur, mo, yrs)
+        lvl, desc = fund.level(r)
+        st.subheader(f"{row['이름'] or '이름 없음'}")
+        k = st.columns(4)
+        k[0].metric("목표(오늘 가치)", f"{tgt:,.0f}만원", f"{yrs:g}년 뒤", delta_color="off")
+        k[1].metric("그때 필요한 금액", f"{adj:,.0f}만원", None if infl == 0 else f"물가 {goal['inflation']:.1f}% 반영", delta_color="off")
+        k[2].metric("필요한 연 수익률", "불가능" if r is None else ("0% 이하" if r <= 0 else f"{r * 100:.1f}%"),
+                    help="지금 모은 돈과 매달 저축을 이 수익률로 굴리면 목표에 닿는다는 뜻이에요. 매년 이 수익이 나온다는 보장은 없어요.")
+        k[3].metric("부담 정도", lvl)
+        st.write(desc)
+        rows = []
+        for rt in fund.SCENARIOS:
+            end = fund.fv(cur, mo, rt, yrs)
+            need_mo = fund.required_monthly(adj, cur, rt, yrs)
+            rows.append({"가정 수익률": f"연 {rt * 100:.0f}%", f"{yrs:g}년 뒤 예상 금액(만원)": end, "목표 대비(만원)": end - adj,
+                         "목표에 닿는 매달 저축(만원)": need_mo})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, column_config={
+            f"{yrs:g}년 뒤 예상 금액(만원)": st.column_config.NumberColumn(format="%,d"), "목표 대비(만원)": st.column_config.NumberColumn(format="%+,d"),
+            "목표에 닿는 매달 저축(만원)": st.column_config.NumberColumn(format="%,d")})
+        lever = []
+        for add in (0, 10, 30, 50):
+            rr = fund.required_return(adj, cur, mo + add, yrs)
+            lever.append({"매달 저축": f"{mo + add:,.0f}만원" + ("" if add == 0 else f" (+{add})"), "필요한 연 수익률": "불가능" if rr is None else ("0% 이하" if rr <= 0 else f"{rr * 100:.1f}%")})
+        st.markdown("**매달 저축을 늘리면 필요한 수익률이 이렇게 내려가요**")
+        st.dataframe(pd.DataFrame(lever), width="stretch", hide_index=True)
+    if not shown:
+        st.info("위 표에 목표 금액과 기간을 적고 저장하면 계산해 드려요.")
+    st.caption("수익률 숫자는 가정이에요. 실제 수익은 해마다 크게 달라지고 손실이 날 수도 있어요. 주식에 얼마를 둘지(자산 배분)는 종목 선택보다 큰 결정이라서, 인증된 재무설계사와 상담해서 정하는 것을 권해요. 이 앱은 투자 자문이 아니에요.")
+
+
+# ---------- 매매 계획 ----------
+def tab_plan(rules):
+    st.markdown("사기 전이나 보유 중에 **무효가격, 1·2차 목표와 정리 비율, 보호폭**을 미리 정해두고, 앱이 **현재 가격과 비교해서 점검 시점을 알려줘요.** "
+                "타이밍을 맞히는 게 아니라 **미리 정한 기준에 닿았을 때 감정이 아니라 계획으로 판단**하게 하는 도구예요. 정리는 앱이 대신 하지 않고, 계획대로 실행하면 직접 '완료'로 표시하세요.")
+    if st.session_state.get("plans_err"):
+        st.error(f"구글 시트에서 매매 계획을 읽지 못해서 저장을 막았어요. ({st.session_state['plans_err']})")
+    if get_store() is None:
+        st.warning("데모 모드라서 계획이 저장되지 않아요.")
+    rows = plan_rows(rules)
+    if rows:
+        tbl = []
+        for p, ev in rows:
+            st_ = {s["단계"].split("(")[0]: s for s in ev["steps"]}
+            tbl.append({"종목": p["종목명"] or p["종목코드"], "현재가": ev["price"], "기준가 대비(%)": ev["pl_pct"], "점검 결과": ev["action"],
+                        "무효가격까지(%)": st_.get("무효가격", {}).get("현재가 대비(%)"), "1차 목표까지(%)": st_.get("1차 목표", {}).get("현재가 대비(%)"),
+                        "2차 목표까지(%)": st_.get("2차 목표", {}).get("현재가 대비(%)")})
+        st.dataframe(pd.DataFrame(tbl), width="stretch", hide_index=True, column_config={
+            "현재가": st.column_config.NumberColumn(format="%,d"), "기준가 대비(%)": st.column_config.NumberColumn(format="%+.1f"),
+            "무효가격까지(%)": st.column_config.NumberColumn(format="%+.1f"), "1차 목표까지(%)": st.column_config.NumberColumn(format="%+.1f"),
+            "2차 목표까지(%)": st.column_config.NumberColumn(format="%+.1f")})
+    else:
+        st.info("진행 중인 계획이 없어요. 종목 리포트의 진입 평가에서 '이 조건으로 매매 계획 만들기'를 누르거나, 아래에서 새로 만드세요.")
+
+    for p, ev in rows:
+        icon = {"warn": "⚠️", "info": "🔔", "ok": "✅"}[ev["level"]]
+        with st.expander(f"{icon} {p['종목명'] or p['종목코드']} — {ev['action']}", expanded=ev["level"] == "warn"):
+            if ev["price"] is not None:
+                st.dataframe(pd.DataFrame(ev["steps"]), width="stretch", hide_index=True, column_config={
+                    "가격": st.column_config.NumberColumn(format="%,d"), "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
+                st.caption(f"계획을 만든 날({p['생성일'].date()}) 이후 최고가 {ev['peak']:,.0f}원, 현재가 {ev['price']:,.0f}원")
+            pid = p["id"]
+            c1, c2, c3, c4 = st.columns(4)
+            inv = c1.number_input("무효가격", min_value=0.0, value=float(p["무효가격"] or 0), step=100.0, key=f"pl_inv_{pid}")
+            t1 = c2.number_input("1차 목표", min_value=0.0, value=float(p["목표1"] or 0), step=100.0, key=f"pl_t1_{pid}")
+            t2 = c3.number_input("2차 목표", min_value=0.0, value=float(p["목표2"] or 0), step=100.0, key=f"pl_t2_{pid}")
+            w = c4.number_input("보호폭(%)", min_value=0.0, value=float(p["보호폭"] or 0), step=1.0, key=f"pl_w_{pid}")
+            d1, d2, d3 = st.columns([1, 1, 3])
+            r1 = d1.number_input("1차 정리 비율(%)", min_value=0.0, max_value=100.0, value=float(p["비율1"] or 0), step=5.0, key=f"pl_r1_{pid}")
+            r2 = d2.number_input("2차 정리 비율(%)", min_value=0.0, max_value=100.0, value=float(p["비율2"] or 0), step=5.0, key=f"pl_r2_{pid}")
+            memo = d3.text_input("메모", value=p["메모"], key=f"pl_memo_{pid}")
+            b1, b2, b3, b4 = st.columns(4)
+            pl = st.session_state.plans.copy()
+            idx = pl.index[pl["id"] == pid]
+            if b1.button("수정 저장", key=f"pl_save_{pid}"):
+                pl.loc[idx, ["무효가격", "목표1", "목표2", "보호폭", "비율1", "비율2", "메모"]] = [inv, t1, t2, w, r1, r2, memo]
+                ok, msg = save_plans(pl)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            if b2.button("1차 정리 완료 표시", key=f"pl_d1_{pid}", disabled=p["완료1"] == "Y"):
+                pl.loc[idx, "완료1"] = "Y"
+                ok, msg = save_plans(pl)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            if b3.button("2차 정리 완료 표시", key=f"pl_d2_{pid}", disabled=p["완료2"] == "Y"):
+                pl.loc[idx, "완료2"] = "Y"
+                ok, msg = save_plans(pl)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            if b4.button("계획 종료", key=f"pl_end_{pid}"):
+                pl.loc[idx, "상태"] = "종료"
+                ok, msg = save_plans(pl)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+            st.caption("정리를 실행했다면 판단 기록 탭에도 한 줄 남겨 두면, 계획대로 했을 때의 결과를 나중에 비교할 수 있어요.")
+
+    with st.expander("새 계획 만들기"):
+        hold = st.session_state.hold
+        opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · 보유": r["종목코드"] for r in hold.drop_duplicates("종목코드").to_dict("records")}
+        for w_ in st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS)).to_dict("records"):
+            opts.setdefault(f"{w_['종목명'] or w_['종목코드']} ({w_['종목코드']}) · 관심", w_["종목코드"])
+        opts["직접 입력"] = ""
+        pick = st.selectbox("종목", list(opts), key="np_pick")
+        code = opts[pick] or st.text_input("종목코드(6자리)", key="np_code").strip().zfill(6)
+        ag = holding_agg(code) if code else None
+        df_ = hist_kr(code) if code else pd.DataFrame()
+        if code and len(df_):
+            tag = (ag or {}).get("tag", "중장기")
+            card = card_for(code, tag, (ag or {}).get("avg"), (ag or {}).get("qty"), (ag or {}).get("since"))
+            price = float(df_["Close"].iloc[-1])
+            st.caption(f"현재가 {price:,.0f}원" + ("" if not card else " · 아래 기본값은 종합 판단 카드가 제안한 값이에요(바꿔도 돼요)."))
+            e = entry_for(card, price) if card else None
+            c1, c2, c3 = st.columns(3)
+            base = c1.number_input("기준가(내 평단 또는 살 가격)", min_value=0.0, value=float((ag or {}).get("avg") or price), step=100.0, key=f"np_base_{code}")
+            qty = c2.number_input("수량", min_value=0.0, value=float((ag or {}).get("qty") or (e["shares"] if e and e["shares"] else 0)), step=1.0, key=f"np_qty_{code}")
+            tg = c3.selectbox("꼬리표", ["중장기", "스윙"], index=0 if tag == "중장기" else 1, key=f"np_tag_{code}")
+            d1, d2, d3, d4 = st.columns(4)
+            inv = d1.number_input("무효가격", min_value=0.0, value=float(round(e["invalid"])) if e and e["invalid"] else 0.0, step=100.0, key=f"np_inv_{code}")
+            t1 = d2.number_input("1차 목표", min_value=0.0, value=float(round(card["up_price"])) if card and card.get("up_price") else float(round(price * 1.15)), step=100.0, key=f"np_t1_{code}")
+            cons = cons_for(code)
+            t2d = (cons["target"] if cons and cons.get("has") and cons.get("target") else (card["ups"][0]["price"] if card and card["ups"] else price * 1.3))
+            t2 = d3.number_input("2차 목표", min_value=0.0, value=float(round(t2d)), step=100.0, key=f"np_t2_{code}")
+            w = d4.number_input("보호폭(%)", min_value=0.0, value=float(rules.get(tg, {}).get("보호폭", 15)), step=1.0, key=f"np_w_{code}")
+            f1, f2, f3 = st.columns([1, 1, 3])
+            r1 = f1.number_input("1차 정리 비율(%)", min_value=0.0, max_value=100.0, value=30.0, step=5.0, key=f"np_r1_{code}")
+            r2 = f2.number_input("2차 정리 비율(%)", min_value=0.0, max_value=100.0, value=30.0, step=5.0, key=f"np_r2_{code}")
+            memo = f3.text_input("메모(계획의 이유)", key=f"np_memo_{code}")
+            if st.button("계획 저장", type="primary", key=f"np_save_{code}"):
+                pl = st.session_state.plans
+                if not inv or inv >= price and not ag:
+                    st.error("무효가격은 현재가보다 낮게 정해 주세요.")
+                elif len(pl[(pl["종목코드"] == code) & (pl["상태"] == "진행")]):
+                    st.warning("이 종목은 이미 진행 중인 계획이 있어요. 위에서 수정하거나 종료한 뒤 새로 만드세요.")
+                else:
+                    name = (ag or {}).get("name") or (card and code) or code
+                    row = {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "종목코드": code, "종목명": name, "생성일": dt.date.today().isoformat(), "상태": "진행",
+                           "꼬리표": tg, "기준가": base, "수량": qty, "무효가격": inv, "목표1": t1, "비율1": r1, "목표2": t2, "비율2": r2, "보호폭": w, "완료1": "", "완료2": "", "메모": memo}
+                    ok, msg = save_plans(pd.concat([pl, pd.DataFrame([row])], ignore_index=True))
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+        elif code:
+            st.warning("시세를 가져오지 못했어요. 종목코드를 확인하세요.")
 
 
 def tab_rules():
@@ -2028,6 +2391,14 @@ def tab_rules():
         s[key]["on"] = a.checkbox(lab, value=s[key]["on"], key=f"s_on_{key}")
         if "v" in s[key] and unit:
             s[key]["v"] = b.number_input(unit, value=float(s[key]["v"]), step=1.0, key=f"s_v_{key}")
+    st.divider()
+    st.markdown("**위험 한도** — 살 때 크기를 계산하는 기준이에요(종목 리포트의 진입 평가, 종목 발굴의 최대 매수)")
+    rk = st.session_state.risk
+    ra, rb, rc = st.columns(3)
+    rk["per_trade"] = ra.number_input("한 번 틀렸을 때 총자산 대비 손실 한도(%)", min_value=0.1, max_value=10.0, value=float(rk["per_trade"]), step=0.25, key="rk_pt",
+                                      help="무효가격까지 내려갔을 때 총자산의 이 비율만 잃도록 살 수량을 계산해요. 보통 1~2%를 많이 써요.")
+    rk["max_pos"] = rb.number_input("한 종목 최대 비중(총자산 대비 %)", min_value=1.0, max_value=100.0, value=float(rk["max_pos"]), step=1.0, key="rk_mp")
+    rk["min_ratio"] = rc.number_input("진입 손익비 기준(이 이상이면 유리)", min_value=1.0, max_value=5.0, value=float(rk["min_ratio"]), step=0.5, key="rk_mr")
     st.divider()
     c1, c2, _ = st.columns([1, 1, 3])
     if c1.button("규칙 저장", type="primary"):
@@ -2068,7 +2439,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1}
 
 
 def check_versions():
@@ -2100,11 +2471,16 @@ def main():
         st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
     if "goal" not in st.session_state:
         st.session_state.goal = copy.deepcopy(perf.DEFAULT_GOAL)
+    if "risk" not in st.session_state:
+        st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
+    if "funds" not in st.session_state:
+        st.session_state.funds = copy.deepcopy(DEFAULT_FUNDS)
     load_settings()
     load_watch()
     load_perf()
     load_cons_hist()
     load_journal()
+    load_plans()
     load_fincache()
     rules = st.session_state.rules
 
@@ -2117,8 +2493,8 @@ def main():
 
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
-    pages = {"내 자산": lambda: tab_assets(rules), "목표·성과": lambda: tab_perf(rules), "종목 발굴": tab_discover, "안전 점검": tab_safety,
-             "종목 리포트": lambda: tab_report(rules), "판단 기록": lambda: tab_journal(rules), "규칙": tab_rules}
+    pages = {"내 자산": lambda: tab_assets(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
+             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "규칙": tab_rules}
     page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
     pages[page]()  # 고른 화면만 계산해서 빠르다
     with st.sidebar:
