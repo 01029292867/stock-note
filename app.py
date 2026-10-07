@@ -43,9 +43,9 @@ WATCH_COLS = ["종목코드", "종목명"]
 SCORELOG_COLS = ["날짜", "종목코드", "종합점수", "가격", "수급", "재무·안전", "컨센서스", "진입 구조", "근거수", "종가"]
 HYP_COLS = ["실행일", "가설", "종목수", "기간(년)", "보유(일)", "표본", "승률차(%p)", "평균초과수익(%)", "CI하한", "CI상한", "일관", "등급"]
 FLOWLOG_COLS = ["날짜", "종목코드", "기관(주)", "외국인(주)", "개인(주)", "종가", "외국인보유율"]
-FUND_COLS = ["이름", "목표(만원)", "기간(년)", "현재(만원)", "매달 저축(만원)"]
-DEFAULT_FUNDS = [{"이름": "자녀 분가 자금", "목표(만원)": 0.0, "기간(년)": 5.0, "현재(만원)": 0.0, "매달 저축(만원)": 0.0},
-                 {"이름": "노후 자금", "목표(만원)": 0.0, "기간(년)": 15.0, "현재(만원)": 0.0, "매달 저축(만원)": 0.0}]
+FUND_COLS = ["이름", "목표(만원)", "기간(년)", "배분(%)", "매달 투입(만원)"]
+DEFAULT_FUNDS = [{"이름": "자녀 분가 자금", "목표(만원)": 0.0, "기간(년)": 5.0, "배분(%)": 40.0, "매달 투입(만원)": 0.0},
+                 {"이름": "노후 자금", "목표(만원)": 0.0, "기간(년)": 15.0, "배분(%)": 60.0, "매달 투입(만원)": 0.0}]
 JOURNAL_DUE_DAYS = 30  # 이 기간 넘게 판단 기록이 없는 보유 종목은 점검 대상으로 안내한다
 CONS_COLS = ["날짜", "종목코드", "목표가", "의견점수"]
 FRESH_DAYS = 7  # 재무·공시 데이터를 이 기간 안에는 다시 가져오지 않는다
@@ -2256,34 +2256,68 @@ def tab_journal(rules):
 
 
 # ---------- 목적 자금 ----------
+def stock_value_parts():
+    """주식 잔고(평가금액) 합계: (보유 종목, 카카오 정기매수). 시세를 못 가져온 종목은 뺀다."""
+    hold, kakao, rules = st.session_state.hold, st.session_state.kakao, st.session_state.rules
+    a_ = float(get_positions(hold, rules)["평가금액"].sum(skipna=True)) if len(hold) else 0.0
+    b_ = float(get_kakao(kakao)["평가금액"].sum(skipna=True)) if len(kakao) else 0.0
+    return a_, b_
+
+
 def tab_fund():
-    st.markdown("노후·자녀 분가처럼 **금액과 시점이 정해진 돈**이 목표에 닿으려면 **연 몇 %의 수익이 필요한지** 계산해요. 이 숫자는 예측이 아니라 **필요한 조건**이에요. "
-                "필요한 수익률이 높을수록 큰 위험을 져야 한다는 뜻이라서, 종목을 고르기 전에 이 숫자부터 보는 게 좋아요.")
+    st.markdown("노후·자녀 분가처럼 **금액과 시점이 정해진 돈**이 목표에 닿으려면 **연 몇 %의 수익이 필요한지** 계산해요. 이 앱은 **주식 투자금액만** 관리하므로, "
+                "**현재 금액은 이 앱의 주식 잔고(평가금액)를 합산해서 자동으로** 쓰고, 목적마다 **배분 비율**로 나눠요. 이 숫자는 예측이 아니라 **필요한 조건**이에요.")
     goal = st.session_state.goal
+    a_, b_ = stock_value_parts()
     c1, c2 = st.columns(2)
+    inc_cash = c2.checkbox("증권 계좌 현금(목표·성과에서 마지막으로 기록한 값)도 투자금액에 포함", value=False, key="fund_cash",
+                           help="기본은 주식 평가금액만 써요. 투자하려고 계좌에 둔 현금까지 목적 자금으로 보고 싶을 때 켜세요.")
+    snaps = perf.clean_snaps(st.session_state.get("perf_snaps", pd.DataFrame(columns=perf.SNAP_COLS)))
+    cash = float(snaps["현금"].dropna().iloc[-1]) if (inc_cash and len(snaps) and snaps["현금"].notna().any()) else 0.0
+    total = a_ + b_ + cash
+    k0 = st.columns(4)
+    k0[0].metric("현재 주식 투자금액", f"{total / 1e4:,.0f}만원", "잔고 합산(자동)", delta_color="off",
+                 help="내 자산 화면의 보유 종목 평가금액과 카카오 정기매수 평가금액을 합친 값이에요. 시세에 따라 매일 바뀌고, 아래 목적별 현재 금액에 자동으로 반영돼요.")
+    k0[1].metric("보유 종목", f"{a_ / 1e4:,.0f}만원")
+    k0[2].metric("카카오 정기매수", f"{b_ / 1e4:,.0f}만원")
+    k0[3].metric("계좌 현금(포함 시)", f"{cash / 1e4:,.0f}만원" if inc_cash else "미포함")
+    if total <= 0:
+        st.warning("주식 평가금액을 계산하지 못했어요. 보유 종목을 입력하고 시세가 들어오면 자동으로 채워져요.")
     goal["inflation"] = c1.number_input("물가 상승률(연 %)", min_value=0.0, value=float(goal.get("inflation", 2.5)), step=0.5, key="g_infl",
                                         help="목표 금액을 오늘 가치로 적었을 때, 그 가치를 지키려면 미래에 더 큰 금액이 필요해요.")
-    goal["infl_on"] = c2.checkbox("목표 금액을 오늘 가치로 보고 물가만큼 키워서 계산", value=bool(goal.get("infl_on", True)), key="g_inflon")
+    goal["infl_on"] = st.checkbox("목표 금액을 오늘 가치로 보고 물가만큼 키워서 계산", value=bool(goal.get("infl_on", True)), key="g_inflon")
+
     fdf = pd.DataFrame(st.session_state.funds)
+    if "매달 저축(만원)" in fdf.columns and "매달 투입(만원)" not in fdf.columns:      # 옛 형식으로 저장된 값을 새 열 이름으로 옮긴다
+        fdf = fdf.rename(columns={"매달 저축(만원)": "매달 투입(만원)"})
+    if "배분(%)" not in fdf.columns:
+        fdf["배분(%)"] = 100.0 / max(len(fdf), 1)
     for c in FUND_COLS:
         if c not in fdf.columns:
-            fdf[c] = 0.0 if c != "이름" else ""
-    st.markdown("**목적별 목표** — 금액은 모두 **만원 단위**예요. 목표는 오늘 가치로 적으세요.")
+            fdf[c] = "" if c == "이름" else 0.0
+    st.markdown("**목적별 목표** — 금액은 **만원 단위**예요. 목표는 오늘 가치로 적고, **배분(%)**은 위의 주식 투자금액 중 그 목적에 속한 비율이에요(합계 100% 이하). "
+                "**매달 투입**은 매달 주식에 새로 넣는 돈이에요.")
     ed = st.data_editor(fdf[FUND_COLS], num_rows="dynamic", width="stretch", hide_index=True, key="fund_editor", column_config={
         "목표(만원)": st.column_config.NumberColumn(min_value=0, step=100, format="%,d"), "기간(년)": st.column_config.NumberColumn(min_value=0.5, step=0.5),
-        "현재(만원)": st.column_config.NumberColumn(min_value=0, step=100, format="%,d", help="이 목적을 위해 지금 모아둔(또는 투자 중인) 금액"),
-        "매달 저축(만원)": st.column_config.NumberColumn(min_value=0, step=10, format="%,d")})
+        "배분(%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=5, format="%.0f", help="현재 주식 투자금액 중 이 목적에 배정하는 비율이에요."),
+        "매달 투입(만원)": st.column_config.NumberColumn(min_value=0, step=10, format="%,d")})
     if st.button("목적 자금 저장", type="primary", key="fund_save"):
         st.session_state.funds = ed.fillna(0).to_dict("records")
         ok, msg = save_settings()
         (st.success if ok else st.error)(msg)
-    sz = sizing_assets()
-    if sz:
-        st.caption(f"참고: 지금 보유 주식과 마지막으로 기록한 현금을 합친 총자산은 약 {sz / 1e4:,.0f}만원이에요(노후·분가 자금뿐 아니라 다른 용도의 돈도 섞여 있을 수 있어요).")
+    rows_ = ed.fillna(0).to_dict("records")
+    share_sum = sum(float(r["배분(%)"]) for r in rows_)
+    scale = 100.0 / share_sum if share_sum > 100 else 1.0
+    if share_sum > 100:
+        st.warning(f"배분 합계가 {share_sum:.0f}%로 100%를 넘었어요. 계산에서는 100%에 맞춰 비율을 줄여서 썼어요.")
+    elif share_sum < 100 and share_sum > 0:
+        st.caption(f"배분 합계가 {share_sum:.0f}%예요. 나머지 {100 - share_sum:.0f}%({total * (100 - share_sum) / 100 / 1e4:,.0f}만원)는 어느 목적에도 속하지 않은 투자금액이에요.")
     infl = goal["inflation"] / 100 if goal.get("infl_on", True) else 0.0
     shown = 0
-    for row in ed.fillna(0).to_dict("records"):
-        tgt, yrs, cur, mo = float(row["목표(만원)"]), float(row["기간(년)"]), float(row["현재(만원)"]), float(row["매달 저축(만원)"])
+    for row in rows_:
+        tgt, yrs, mo = float(row["목표(만원)"]), float(row["기간(년)"]), float(row["매달 투입(만원)"])
+        share = float(row["배분(%)"]) * scale
+        cur = total / 1e4 * share / 100
         if tgt <= 0 or yrs <= 0:
             continue
         shown += 1
@@ -2291,31 +2325,34 @@ def tab_fund():
         r = fund.required_return(adj, cur, mo, yrs)
         lvl, desc = fund.level(r)
         st.subheader(f"{row['이름'] or '이름 없음'}")
-        k = st.columns(4)
+        k = st.columns(5)
         k[0].metric("목표(오늘 가치)", f"{tgt:,.0f}만원", f"{yrs:g}년 뒤", delta_color="off")
         k[1].metric("그때 필요한 금액", f"{adj:,.0f}만원", None if infl == 0 else f"물가 {goal['inflation']:.1f}% 반영", delta_color="off")
-        k[2].metric("필요한 연 수익률", "불가능" if r is None else ("0% 이하" if r <= 0 else f"{r * 100:.1f}%"),
-                    help="지금 모은 돈과 매달 저축을 이 수익률로 굴리면 목표에 닿는다는 뜻이에요. 매년 이 수익이 나온다는 보장은 없어요.")
-        k[3].metric("부담 정도", lvl)
+        k[2].metric("현재 배분 금액", f"{cur:,.0f}만원", f"배분 {share:.0f}% · 목표의 {cur / adj * 100:.0f}%" if adj else None, delta_color="off",
+                    help="주식 잔고에 배분 비율을 곱한 값이에요. 시세에 따라 매일 바뀌어요.")
+        k[3].metric("필요한 연 수익률", "불가능" if r is None else ("0% 이하" if r <= 0 else f"{r * 100:.1f}%"),
+                    help="지금 배정된 금액과 매달 투입을 이 수익률로 굴리면 목표에 닿는다는 뜻이에요. 매년 이 수익이 나온다는 보장은 없어요.")
+        k[4].metric("부담 정도", lvl)
         st.write(desc)
         rows = []
         for rt in fund.SCENARIOS:
             end = fund.fv(cur, mo, rt, yrs)
             need_mo = fund.required_monthly(adj, cur, rt, yrs)
             rows.append({"가정 수익률": f"연 {rt * 100:.0f}%", f"{yrs:g}년 뒤 예상 금액(만원)": end, "목표 대비(만원)": end - adj,
-                         "목표에 닿는 매달 저축(만원)": need_mo})
+                         "목표에 닿는 매달 투입(만원)": need_mo})
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, column_config={
             f"{yrs:g}년 뒤 예상 금액(만원)": st.column_config.NumberColumn(format="%,d"), "목표 대비(만원)": st.column_config.NumberColumn(format="%+,d"),
-            "목표에 닿는 매달 저축(만원)": st.column_config.NumberColumn(format="%,d")})
+            "목표에 닿는 매달 투입(만원)": st.column_config.NumberColumn(format="%,d")})
         lever = []
         for add in (0, 10, 30, 50):
             rr = fund.required_return(adj, cur, mo + add, yrs)
-            lever.append({"매달 저축": f"{mo + add:,.0f}만원" + ("" if add == 0 else f" (+{add})"), "필요한 연 수익률": "불가능" if rr is None else ("0% 이하" if rr <= 0 else f"{rr * 100:.1f}%")})
-        st.markdown("**매달 저축을 늘리면 필요한 수익률이 이렇게 내려가요**")
+            lever.append({"매달 투입": f"{mo + add:,.0f}만원" + ("" if add == 0 else f" (+{add})"), "필요한 연 수익률": "불가능" if rr is None else ("0% 이하" if rr <= 0 else f"{rr * 100:.1f}%")})
+        st.markdown("**매달 투입을 늘리면 필요한 수익률이 이렇게 내려가요**")
         st.dataframe(pd.DataFrame(lever), width="stretch", hide_index=True)
     if not shown:
         st.info("위 표에 목표 금액과 기간을 적고 저장하면 계산해 드려요.")
-    st.caption("수익률 숫자는 가정이에요. 실제 수익은 해마다 크게 달라지고 손실이 날 수도 있어요. 주식에 얼마를 둘지(자산 배분)는 종목 선택보다 큰 결정이라서, 인증된 재무설계사와 상담해서 정하는 것을 권해요. 이 앱은 투자 자문이 아니에요.")
+    st.caption("수익률 숫자는 가정이에요. 실제 수익은 해마다 크게 달라지고 손실이 날 수도 있어요. 이 앱은 주식 투자금액만 보기 때문에 예금·부동산·연금 등 다른 자산은 반영하지 않아요. "
+               "주식에 얼마를 둘지(자산 배분)는 종목 선택보다 큰 결정이라서, 인증된 재무설계사와 상담해서 정하는 것을 권해요. 이 앱은 투자 자문이 아니에요.")
 
 
 # ---------- 매매 계획 ----------
