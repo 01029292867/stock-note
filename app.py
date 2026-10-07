@@ -172,7 +172,7 @@ def reset_settings():
     st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
     st.session_state.weights = copy.deepcopy(score.DEFAULT_WEIGHTS)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "rk_pt", "rk_mp", "rk_mr", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "wt_ev", "rk_pt", "rk_mp", "rk_mr", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
             del st.session_state[k]
 
 
@@ -895,6 +895,22 @@ def evidence_text(h):
     return f"{r['등급']} ({r['실행일']})"
 
 
+def evidence_row(h):
+    """가설 실험실에서 가장 최근에 시험한 결과: (등급, 평균 초과수익). 없으면 None."""
+    hyp = st.session_state.get("hyp")
+    if hyp is None or hyp.empty:
+        return None
+    g = hyp[hyp["가설"] == h]
+    if g.empty:
+        return None
+    r = g.iloc[-1]
+    try:
+        mean = float(r["평균초과수익(%)"])
+    except (TypeError, ValueError):
+        mean = None
+    return str(r["등급"]), mean
+
+
 def score_for(code, tag, avg, qty, since=None, card=None):
     """종합 점수. 시세가 없으면 None."""
     ind = sg.indicators(hist_kr(code), since or None)
@@ -905,7 +921,7 @@ def score_for(code, tag, avg, qty, since=None, card=None):
     sres = safety_for(code)
     m, items = sres if sres else (None, None)
     return score.compute(ind, st.session_state.get("flow_sum", {}).get(code), m, items, cons_for(code), cons_change(code), card,
-                         st.session_state.weights, evidence_text)
+                         st.session_state.weights, evidence_row=evidence_row)
 
 
 def render_score(sc, name):
@@ -913,7 +929,7 @@ def render_score(sc, name):
     if sc is None or sc["total"] is None:
         st.info("점수를 계산할 근거가 없어요. 수급·컨센서스·재무를 가져오면 근거가 늘어나요.")
         return
-    k = st.columns(4)
+    k = st.columns(5)
     k[0].metric("종합 점수", f"{sc['total']:.0f}점", sc["band"], delta_color="off",
                 help="이길 확률이 아니라 근거들이 얼마나 한 방향으로 모이는지를 요약한 숫자예요. 50점이 중립이고 65점 이상이면 우호적인 근거가 모이는 쪽, 35점 미만이면 불리한 근거가 많은 쪽이에요.")
     k[1].metric("반영한 근거", f"{sc['n_avail']}/{sc['n_total']}", ", ".join(sc["missing"]) + " 없음" if sc["missing"] else "모두 있음", delta_color="off",
@@ -921,6 +937,9 @@ def render_score(sc, name):
     ag = sc["agree"]
     k[2].metric("근거 일치도", "-" if not ag or ag[1] == 0 else f"{ag[0]}/{ag[1]}", help="뚜렷한(±10점 이상) 근거 종류 중 종합 방향과 같은 방향인 개수예요. 낮으면 근거가 엇갈린다는 뜻이에요.")
     k[3].metric("엇갈리는 근거", f"{len(sc['conflicts'])}쌍", help="한쪽은 +25 이상 우호적인데 다른 쪽은 -25 이하로 불리한 근거 종류의 쌍이에요.")
+    rel = sc.get("reliability")
+    k[4].metric("근거 검증 수준", "-" if rel is None else f"{rel * 100:.0f}%", score.reliability_label(rel) if sc.get("use_evidence", True) else "검증 반영 꺼짐", delta_color="off",
+                help="이 점수가 가설 실험실에서 검증된 근거에 얼마나 기대고 있는지예요. 100%에 가까울수록 검증된 근거 중심이고, 50% 안팎이면 아직 시험하지 않았거나 효과를 가려내지 못한 근거가 많다는 뜻이에요.")
     for cf in sc["conflicts"]:
         st.warning("근거가 엇갈려요: " + cf)
     fam = pd.DataFrame([{"근거": f["name"], "점수": f["score"], "가중치": f["weight"]} for f in sc["families"] if f["score"] is not None])
@@ -929,15 +948,19 @@ def render_score(sc, name):
             y=alt.Y("근거:N", sort=score.FAMILIES, title=None), x=alt.X("점수:Q", scale=alt.Scale(domain=[-100, 100]), title="불리 ← 0 → 우호"),
             color=alt.condition(alt.datum["점수"] > 0, alt.value("#D93A33"), alt.value("#2A63D4")),
             tooltip=["근거", alt.Tooltip("점수:Q", format="+.0f"), "가중치"]).properties(height=36 * len(fam) + 30), width="stretch")
-    rows = [{"근거": f["name"], "항목": i["항목"], "점수": i["점수"], "설명": i["설명"], "검증 결과": i["검증"]} for f in sc["families"] for i in f["items"]]
+    rows = [{"근거": f["name"], "항목": i["항목"], "원점수": i.get("원점수", i["점수"]), "반영 점수": i["점수"], "반영 배율": i.get("반영 배율", 1.0), "설명": i["설명"], "검증 결과": i["검증"]}
+            for f in sc["families"] for i in f["items"]]
     with st.expander("항목별 점수와 근거 보기", expanded=False):
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, column_config={"점수": st.column_config.NumberColumn(format="%+.0f")})
-        st.caption("'검증 결과'는 가설 실험실에서 그 항목을 시험한 결과예요. '미검증'은 아직 시험하지 못한 항목이에요.")
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, column_config={
+            "원점수": st.column_config.NumberColumn(format="%+.0f"), "반영 점수": st.column_config.NumberColumn(format="%+.0f", help="검증 결과가 반대로 나온 항목은 방향을 뒤집은 점수예요."),
+            "반영 배율": st.column_config.NumberColumn(format="%.1f", help="가설 실험실 결과로 정한 비중이에요. 검증됨 1.0, 가설(방향만) 0.7, 시험 안 함·표본 부족 0.5, 효과 구분 안 됨 0.3.")})
+        st.caption("'검증 결과'는 가설 실험실에서 그 항목을 시험한 결과이고, '반영 배율'이 낮을수록 그 근거를 덜 믿고 점수를 계산했다는 뜻이에요. 규칙 탭에서 '검증 결과로 근거 비중 조정'을 끄면 모두 1.0으로 계산해요.")
     with st.expander("이 점수 읽는 법"):
         st.markdown("- **이길 확률이 아니에요.** 가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조(손익비)가 **얼마나 한 방향으로 모이는지**를 한 숫자로 요약한 거예요.\n"
                     "- 근거 종류마다 -100(불리)~+100(우호)으로 점수를 매기고, 규칙 탭의 **가중치**로 평균을 내요. 근거가 빠진 종류는 제외하고, 근거가 적을수록 50점 쪽으로 당겨요.\n"
                     "- 중요한 건 숫자보다 **근거가 같은 방향인지(일치도)**예요. 한 근거만 매우 좋고 나머지가 나쁘면 점수는 중립에 가깝게 나와요.\n"
                     "- **가중치와 점수 기준은 제가 정한 시작값이고 검증 전이에요.** 서로 겹치는 근거(예: 추세와 3개월 수익률)가 있어서 같은 이야기를 두 번 세는 효과도 있어요.\n"
+                    "- **검증 결과가 점수에 반영돼요.** 가설 실험실에서 검증된 근거는 그대로, 효과를 가려내지 못한 근거는 30%, 시험하지 않았거나 표본이 부족한 근거는 50%만 반영하고, 결과가 반대로 나온 근거는 방향을 뒤집어요. '근거 검증 수준'이 낮으면 이 점수가 아직 검증이 덜 된 근거에 기대고 있다는 뜻이에요.\n"
                     "- 판단 기록과 점수 기록이 쌓이면 **점수대별 실제 성과**를 확인해서 가중치를 고쳐 나가요(종합 순위, 판단 기록 화면).\n"
                     "- 점수가 높다고 사라는 뜻도, 낮다고 팔라는 뜻도 아니에요.")
 
@@ -3063,7 +3086,7 @@ def tab_rank(rules):
         name = (ag or {}).get("name") or (watch[watch["종목코드"] == code]["종목명"].iloc[0] if (watch["종목코드"] == code).any() else code)
         rows.append({"종목": name, "코드": code, "구분": kinds[code], "종합점수": sc["total"], "판정": sc["band"], "가격 흐름": fam["가격 흐름"], "수급": fam["수급"],
                      "재무·안전": fam["재무·안전"], "컨센서스": fam["컨센서스"], "진입 구조": fam["진입 구조"], "근거": f"{sc['n_avail']}/{sc['n_total']}",
-                     "일치": "-" if not sc["agree"] or sc["agree"][1] == 0 else f"{sc['agree'][0]}/{sc['agree'][1]}", "주의": ", ".join(flags),
+                     "일치": "-" if not sc["agree"] or sc["agree"][1] == 0 else f"{sc['agree'][0]}/{sc['agree'][1]}", "검증 수준(%)": (sc["reliability"] * 100) if sc.get("reliability") is not None else np.nan, "주의": ", ".join(flags),
                      "수익률(%)": (price / ag["avg"] - 1) * 100 if ag and ag["avg"] else np.nan, "_n": sc["n_avail"]})
         if sc["total"] is not None:
             log.append([today, code, sc["total"], fam["가격 흐름"], fam["수급"], fam["재무·안전"], fam["컨센서스"], fam["진입 구조"], sc["n_avail"], price])
@@ -3081,6 +3104,7 @@ def tab_rank(rules):
     cc = {c: st.column_config.NumberColumn(format="%+.0f") for c in ("가격 흐름", "수급", "재무·안전", "컨센서스", "진입 구조")}
     cc["종합점수"] = st.column_config.NumberColumn(format="%.0f")
     cc["수익률(%)"] = st.column_config.NumberColumn(format="%+.1f")
+    cc["검증 수준(%)"] = st.column_config.NumberColumn(format="%.0f", help="이 점수가 가설 실험실에서 검증된 근거에 얼마나 기대는지예요. 낮으면 점수를 덜 믿으세요.")
     st.dataframe(df.drop(columns=["_n"]), width="stretch", hide_index=True, column_config=cc)
     low = int((df["_n"] < 3).sum())
     if low:
@@ -3163,6 +3187,8 @@ def tab_rules():
     wcols = st.columns(5)
     for i, fam in enumerate(score.FAMILIES):
         wt[fam] = wcols[i].number_input(fam, min_value=0, max_value=100, value=int(wt.get(fam, score.DEFAULT_WEIGHTS[fam])), step=5, key=f"wt_{i}")
+    wt["검증 반영"] = int(st.checkbox("검증 결과로 근거 비중·방향을 자동 조정 (가설 실험실 결과 반영)", value=bool(wt.get("검증 반영", 1)), key="wt_ev",
+                                  help="켜면 가설 실험실에서 검증된 근거는 그대로, 효과를 가려내지 못한 근거는 30%, 시험하지 않았거나 표본이 부족한 근거는 50%만 반영하고, 반대로 확인된 근거는 방향을 뒤집어요. 끄면 모든 근거를 그대로 평가해요."))
     st.divider()
     st.markdown("**위험 한도** — 살 때 크기를 계산하는 기준이에요(종목 리포트의 진입 평가, 종목 발굴의 최대 매수)")
     rk = st.session_state.risk
@@ -3211,7 +3237,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1}
 
 
 def check_versions():
