@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import consensus
+import brief
 import dart_data
 import discover
 import entry
@@ -2766,6 +2767,142 @@ def record_scores(rows):
         return False, f"저장에 실패했어요: {e}"
 
 
+
+def score_flags(sc):
+    flags = []
+    if any(i["항목"] == "개인 주도 경고" for f in sc["families"] for i in f["items"]):
+        flags.append("개인 주도")
+    if any(i["항목"] == "안전 기준" and i["점수"] < 0 for f in sc["families"] for i in f["items"]):
+        flags.append("안전 미달")
+    if sc["conflicts"]:
+        flags.append(f"근거 엇갈림 {len(sc['conflicts'])}쌍")
+    return flags
+
+
+def prev_score(code, days=5):
+    """점수 기록에서 days일 이상 전의 가장 최근 점수. 없으면 None."""
+    sl = st.session_state.get("scorelog")
+    if sl is None or sl.empty:
+        return None
+    cut = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    g = sl[(sl["종목코드"] == code) & (sl["날짜"].astype(str) <= cut)].sort_values("날짜")
+    return float(g["종합점수"].iloc[-1]) if len(g) and g["종합점수"].iloc[-1] == g["종합점수"].iloc[-1] else None
+
+
+VERDICT_ORDER = ["매도·비중 축소 검토", "수익실현 검토", "추가매수 검토", "지켜보기", "보유 유지"]
+
+
+def tab_brief(rules):
+    st.markdown("**이번 주에 무엇부터 볼지**를 한 장으로 모았어요. 점수, 신호, 매매 계획, 기록 상태를 합쳐서 우선순위로 정리하고, **10분 안에 읽도록** 만들었어요. "
+                "점검할 곳을 알려줄 뿐이고, 사고팔지는 직접 판단하세요.")
+    hold = st.session_state.hold
+    watch = st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))
+    if not len(hold):
+        st.info("보유 종목을 먼저 입력하세요(내 자산 화면).")
+        return
+    codes_all = list(dict.fromkeys(list(hold["종목코드"]) + list(watch["종목코드"])))
+    if st.button("수급·컨센서스 새로 가져오기 (보유·관심 종목)", key="brief_fetch"):
+        with st.spinner("수급과 컨센서스를 가져오는 중이에요(조금 걸려요)…"):
+            e1 = fetch_flows_bulk(codes_all)
+            e2 = fetch_cons_bulk(codes_all)
+        st.session_state["flow_msg"] = e1 + [f"컨센서스 {e}" for e in e2]
+        st.rerun()
+    for e in st.session_state.pop("flow_msg", []) or []:
+        st.warning(f"못 가져왔어요 — {e}")
+    pos = get_positions(hold, rules)
+    total_assets = sizing_assets()
+    plans = {}
+    for p, ev in plan_rows(rules):
+        cur = plans.get(p["종목코드"])
+        order = {"warn": 0, "info": 1, "ok": 2}
+        if cur is None or order[ev["level"]] < order[cur[1]]:
+            plans[p["종목코드"]] = (ev["action"], ev["level"])
+    holds, missing_price = [], 0
+    for code in hold["종목코드"].drop_duplicates():
+        ag = holding_agg(code)
+        rows_ = pos[pos["종목코드"] == code]
+        d_ = hist_kr(code)
+        if not len(d_) or rows_.empty:
+            missing_price += 1
+            continue
+        price = float(d_["Close"].iloc[-1])
+        value = float(rows_["평가금액"].sum(skipna=True))
+        card = card_for(code, ag["tag"], ag["avg"], ag["qty"], ag["since"])
+        sc = score_for(code, ag["tag"], ag["avg"], ag["qty"], ag["since"], card=card)
+        verdicts = [v for v in rows_["판단"].tolist() if v in VERDICT_ORDER]
+        verdict = min(verdicts, key=VERDICT_ORDER.index) if verdicts else "보유 유지"
+        sigs = []
+        for s_ in rows_["신호"].tolist():
+            sigs += [x.strip() for x in str(s_).split(",") if x.strip() and x.strip() != "-"]
+        plan_a = plans.get(code)
+        holds.append({"name": ag["name"], "code": code, "weight": (value / total_assets * 100) if total_assets else None,
+                      "ret": ((price / ag["avg"] - 1) * 100) if ag["avg"] else None, "score": sc["total"] if sc else None,
+                      "score_prev": prev_score(code), "n_avail": sc["n_avail"] if sc else 0, "verdict": verdict, "signals": list(dict.fromkeys(sigs)),
+                      "flags": score_flags(sc) if sc else [], "plan_level": plan_a[1] if plan_a else None, "plan_action": plan_a[0] if plan_a else None})
+    cands = []
+    for code in watch["종목코드"]:
+        if code in set(hold["종목코드"]):
+            continue
+        d_ = hist_kr(code)
+        if not len(d_):
+            continue
+        price = float(d_["Close"].iloc[-1])
+        card = card_for(code, "중장기", None, None, None)
+        sc = score_for(code, "중장기", None, None, None, card=card)
+        if not card or not sc:
+            continue
+        e = entry_for(card, price)
+        nm = watch[watch["종목코드"] == code]["종목명"].iloc[0] or code
+        cands.append({"name": nm, "code": code, "score": sc["total"], "n_avail": sc["n_avail"], "entry_verdict": e["verdict"].split("(")[0], "ratio": e["ratio"],
+                      "invalid": e["invalid"], "shares": e["shares"], "wait_price": e["wait_price"]})
+    last_d, due = journal_due()
+    fl = st.session_state.get("flowlog")
+    fl_days = None if fl is None or fl.empty else int((pd.Timestamp.today().normalize() - pd.to_datetime(fl["날짜"]).max()).days)
+    snaps = perf.clean_snaps(st.session_state.get("perf_snaps", pd.DataFrame(columns=perf.SNAP_COLS)))
+    manual = snaps[snaps["구분"] != "자동"] if len(snaps) else snaps
+    cash_days = int((pd.Timestamp.today().normalize() - manual["날짜"].max()).days) if len(manual) else None
+    fc = st.session_state.get("fincache", {})
+    stale = sum(1 for c in hold["종목코드"].drop_duplicates() if c not in fc or (dt.date.today() - dt.date.fromisoformat(str(fc[c].get("fetched", "2000-01-01")))).days > FRESH_DAYS)
+    top = max(holds, key=lambda h: h["weight"] or 0) if holds else None
+    res = brief.build(holds, cands, {"due_n": len(due), "flowlog_days": fl_days, "cash_days": cash_days, "stale_fin_n": stale, "missing_price_n": missing_price},
+                      {"top_name": top["name"] if top else None, "top_weight": top["weight"] if top else None, "max_pos": st.session_state.risk.get("max_pos")})
+    st.subheader(f"이번 주 브리핑 — {dt.date.today().isoformat()}")
+    k = st.columns(4)
+    k[0].metric("먼저 확인", f"{res['counts'][1]}건")
+    k[1].metric("이번 주 안에", f"{res['counts'][2]}건")
+    k[2].metric("여유 있을 때", f"{res['counts'][3]}건")
+    k[3].metric("매수 후보", f"{len(res['cands'])}개", help="관심종목 중 종합 점수 55점 이상, 근거 3가지 이상, 진입 구조가 유리·보통인 종목이에요(최대 3개).")
+    top_rows = [a for a in res["actions"] if a["우선순위"] <= 2]
+    if top_rows:
+        st.dataframe(pd.DataFrame(top_rows)[["구분", "종목", "내용", "볼 곳"]], width="stretch", hide_index=True)
+    else:
+        st.success("이번 주에 급하게 볼 것은 없어요.")
+    low_rows = [a for a in res["actions"] if a["우선순위"] == 3]
+    if low_rows:
+        with st.expander(f"여유 있을 때 확인 ({len(low_rows)}건)"):
+            st.dataframe(pd.DataFrame(low_rows)[["종목", "내용", "볼 곳"]], width="stretch", hide_index=True)
+
+    st.markdown("**보유 종목 현황** (비중은 총자산 기준)")
+    if holds:
+        order = {"매도·비중 축소 검토": 0, "수익실현 검토": 1, "추가매수 검토": 2, "지켜보기": 3, "보유 유지": 4}
+        hdf = pd.DataFrame([{"종목": h["name"], "비중(%)": h["weight"], "수익률(%)": h["ret"], "종합점수": h["score"], "지난주 대비": (h["score"] - h["score_prev"]) if h["score"] is not None and h["score_prev"] is not None else None,
+                             "근거": f"{h['n_avail']}/5", "판정": h["verdict"], "주의": ", ".join(h["flags"]), "계획": h["plan_action"] or "-", "_o": order.get(h["verdict"], 5)} for h in holds])
+        hdf = hdf.sort_values(["_o", "비중(%)"], ascending=[True, False]).drop(columns=["_o"])
+        st.dataframe(hdf, width="stretch", hide_index=True, column_config={
+            "비중(%)": st.column_config.NumberColumn(format="%.1f"), "수익률(%)": st.column_config.NumberColumn(format="%+.1f"),
+            "종합점수": st.column_config.NumberColumn(format="%.0f"), "지난주 대비": st.column_config.NumberColumn(format="%+.0f", help="5일 이상 전에 기록한 점수와의 차이예요. 점수 기록이 쌓이면 나와요.")})
+    if res["cands"]:
+        st.markdown("**매수 후보** — 종합 점수가 높고 틀렸을 때의 손실 한도 안에서 살 수 있는 관심종목")
+        st.dataframe(pd.DataFrame([{"종목": c["name"], "종합점수": c["score"], "진입 손익비": c["ratio"], "무효가격(원)": c["invalid"], "최대 매수(주)": c["shares"]} for c in res["cands"]]),
+                     width="stretch", hide_index=True, column_config={"종합점수": st.column_config.NumberColumn(format="%.0f"), "진입 손익비": st.column_config.NumberColumn(format="%.2f"),
+                                                                       "무효가격(원)": st.column_config.NumberColumn(format="%,d"), "최대 매수(주)": st.column_config.NumberColumn(format="%,d")})
+        st.caption("후보는 '사라'는 뜻이 아니라 먼저 볼 만한 종목이에요. 종목 리포트의 진입 평가에서 구조를 확인하고, 사기로 정했다면 매매 계획을 먼저 만드세요.")
+    elif not len(watch):
+        st.caption("관심종목(종목 발굴에서 추가)이 있어야 매수 후보를 골라줘요.")
+    with st.expander("텍스트로 복사해서 보관하기"):
+        st.code(brief.to_text(res, dt.date.today().isoformat()), language=None)
+
+
 def tab_rank(rules):
     st.markdown("**흩어진 근거를 하나의 점수로 모아서** 한눈에 비교해요. 가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조(손익비)를 각각 -100~+100으로 매기고 가중치(규칙 탭)로 모은 종합 점수예요(50 중립). "
                 "점수는 **이길 확률이 아니라 근거가 얼마나 한 방향으로 모이는지**예요. 근거 칸이 3/5 미만이면 참고만 하세요.")
@@ -2807,13 +2944,7 @@ def tab_rank(rules):
             continue
         price = float(df_["Close"].iloc[-1])
         fam = {f["name"]: f["score"] for f in sc["families"]}
-        flags = []
-        if any(i["항목"] == "개인 주도 경고" for f in sc["families"] for i in f["items"]):
-            flags.append("개인 주도")
-        if any(i["항목"] == "안전 기준" and i["점수"] < 0 for f in sc["families"] for i in f["items"]):
-            flags.append("안전 미달")
-        if sc["conflicts"]:
-            flags.append(f"근거 엇갈림 {len(sc['conflicts'])}쌍")
+        flags = score_flags(sc)
         name = (ag or {}).get("name") or (watch[watch["종목코드"] == code]["종목명"].iloc[0] if (watch["종목코드"] == code).any() else code)
         rows.append({"종목": name, "코드": code, "구분": kinds[code], "종합점수": sc["total"], "판정": sc["band"], "가격 흐름": fam["가격 흐름"], "수급": fam["수급"],
                      "재무·안전": fam["재무·안전"], "컨센서스": fam["컨센서스"], "진입 구조": fam["진입 구조"], "근거": f"{sc['n_avail']}/{sc['n_total']}",
@@ -2965,7 +3096,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 2, "brief": 1}
 
 
 def check_versions():
@@ -3024,7 +3155,7 @@ def main():
 
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
-    pages = {"내 자산": lambda: tab_assets(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
+    pages = {"내 자산": lambda: tab_assets(rules), "주간 브리핑": lambda: tab_brief(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
              "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
     pages[page]()  # 고른 화면만 계산해서 빠르다
