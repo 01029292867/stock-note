@@ -2668,12 +2668,21 @@ def tab_lab():
         for k, o in res.items():
             tbl.append({"가설": k, "설명": lab.CATALOG[k][0], "표본": o.get("n"), "승률(%)": o.get("win"), "기준선 승률(%)": o.get("win_base"), "승률 차이(%p)": o.get("win_diff"),
                         "평균 초과수익(%)": o.get("mean_excess"), "신뢰구간(하한)": o.get("ci_lo"), "신뢰구간(상한)": o.get("ci_hi"), "앞 절반": o.get("half1"),
-                        "뒤 절반": o.get("half2"), "평균 최대 하락(%)": o.get("mean_mae"), "등급": o["grade"]})
+                        "뒤 절반": o.get("half2"), "평균 순수익(%)": o.get("mean_net"), "평균 이익(%)": o.get("avg_win"), "평균 손실(%)": o.get("avg_loss"), "손익비": o.get("payoff"),
+                        "평균 최대 하락(%)": o.get("mean_mae"), "등급": o["grade"]})
         df = pd.DataFrame(tbl).sort_values("평균 초과수익(%)", ascending=False, na_position="last")
         st.dataframe(df, width="stretch", hide_index=True, column_config={
             "승률(%)": st.column_config.NumberColumn(format="%.1f"), "기준선 승률(%)": st.column_config.NumberColumn(format="%.1f"), "승률 차이(%p)": st.column_config.NumberColumn(format="%+.1f"),
             "평균 초과수익(%)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(하한)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(상한)": st.column_config.NumberColumn(format="%+.2f"),
-            "앞 절반": st.column_config.NumberColumn(format="%+.2f"), "뒤 절반": st.column_config.NumberColumn(format="%+.2f"), "평균 최대 하락(%)": st.column_config.NumberColumn(format="%.1f")})
+            "앞 절반": st.column_config.NumberColumn(format="%+.2f"), "뒤 절반": st.column_config.NumberColumn(format="%+.2f"), "평균 최대 하락(%)": st.column_config.NumberColumn(format="%.1f"),
+            "평균 순수익(%)": st.column_config.NumberColumn(format="%+.2f", help="비용을 뺀 건당 평균 수익(기대값)이에요."), "평균 이익(%)": st.column_config.NumberColumn(format="%+.1f"),
+            "평균 손실(%)": st.column_config.NumberColumn(format="%+.1f"), "손익비": st.column_config.NumberColumn(format="%.2f", help="평균 이익 ÷ 평균 손실(절댓값)이에요.")})
+        bo = next((o for o in res.values() if "base_mean_net" in o), None)
+        if bo:
+            bw_ = next((o.get("win_base") for o in res.values() if o.get("win_base") is not None), None)
+            bpay = (bo["base_avg_win"] / abs(bo["base_avg_loss"])) if (bo["base_avg_win"] == bo["base_avg_win"] and bo["base_avg_loss"] == bo["base_avg_loss"] and bo["base_avg_loss"]) else float("nan")
+            st.success(f"**기준선(아무 종목이나 {hh}거래일 보유)**: 승률 {bw_:.1f}% · 건당 평균 순수익 {bo['base_mean_net']:+.2f}% · 평균 이익 {bo['base_avg_win']:+.1f}% · 평균 손실 {bo['base_avg_loss']:+.1f}% · 손익비 {bpay:.2f}. "
+                       "신호의 성적은 이 기준선과 비교하세요. 승률이 50%보다 낮아도 평균 이익이 평균 손실보다 충분히 크면 기대값은 플러스일 수 있어요.")
         mdes = [o["mde"] for o in res.values() if "mde" in o]
         if mdes:
             st.info(f"이 표본으로는 승률이 **약 {np.median(mdes):.1f}%p 이상 달라야** 우연과 구분돼요. 그보다 작은 차이는 '효과가 없다'가 아니라 '**구분이 안 된다**'는 뜻이에요. "
@@ -3202,7 +3211,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 3, "brief": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1}
 
 
 def check_versions():

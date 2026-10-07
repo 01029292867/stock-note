@@ -2,7 +2,7 @@
 - 종목 × 기간의 이벤트를 모아서(겹치지 않게 간격을 두고) 시장 평균을 뺀 초과수익으로 비교한다.
 - 시험한 가설 수만큼 기준을 엄격하게 하고(다중검정 보정), 앞·뒤 기간의 일관성을 본다.
 - 과거에 효과가 있었다는 것이 앞으로도 있다는 보장은 아니다. 상장폐지 종목이 빠진 자료는 결과를 좋게 보이게 한다."""
-VERSION = 3  # 3: 수급 요인 검증(수급 기록 사용) / 2: 요인(분위) 검증
+VERSION = 4  # 4: 평균 이익·손실·손익비·기준선 기대값 / 3: 수급 요인 검증 / 2: 요인(분위) 검증
 
 import numpy as np
 import pandas as pd
@@ -129,6 +129,10 @@ def event_study(mask, P, cost=0.003, n_tests=1, B=2000, seed=0):
                 "mean_net": float(net.mean() * 100), "mean_excess": mean_ex * 100, "ci_lo": float(lo * 100), "ci_hi": float(hi * 100),
                 "mean_mae": float(np.nanmean(mae) * 100), "half1": e1 * 100, "half2": e2 * 100, "consistent": consistent, "alpha": alpha,
                 "avg_win": float(net[net > 0].mean() * 100) if (net > 0).any() else np.nan, "avg_loss": float(net[net < 0].mean() * 100) if (net < 0).any() else np.nan})
+    out["payoff"] = (out["avg_win"] / abs(out["avg_loss"])) if (out["avg_win"] == out["avg_win"] and out["avg_loss"] == out["avg_loss"] and out["avg_loss"]) else np.nan
+    out["base_mean_net"] = float(bnet.mean() * 100)
+    out["base_avg_win"] = float(bnet[bnet > 0].mean() * 100) if (bnet > 0).any() else np.nan
+    out["base_avg_loss"] = float(bnet[bnet < 0].mean() * 100) if (bnet < 0).any() else np.nan
     out["grade"] = grade(out)
     return out
 
