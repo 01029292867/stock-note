@@ -733,6 +733,31 @@ def bulk_cached(codes):
 
 
 
+def load_disc_fin_sheet(codes):
+    """내 PC 수집기가 구글 시트 '발굴재무'에 저장해 둔 DART 재무. 반환: ({종목코드: 재무}, 수집일 또는 None)"""
+    store = get_store()
+    if store is None or st.session_state.get("load_error"):
+        return {}, None
+    try:
+        df = store.read("발굴재무", ["종목코드", "재무연도", "수집일", "데이터"])
+    except Exception:
+        return {}, None
+    want = set(codes)
+    out, dates = {}, []
+    for r in df.to_dict("records"):
+        c = str(r["종목코드"]).zfill(6)
+        if c not in want:
+            continue
+        try:
+            rec = json.loads(r["데이터"])
+        except Exception:
+            continue
+        rec.setdefault("year", int(r["재무연도"]) if str(r["재무연도"]).isdigit() else None)
+        out[c] = rec
+        dates.append(str(r["수집일"]))
+    return out, (max(dates) if dates else None)
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def bulk_naver_cached(codes):
     fin, errs = discover.bulk_financials_naver(list(codes))
@@ -1828,29 +1853,44 @@ def run_discovery(f, manual_codes=None):
     held = set(st.session_state.hold["종목코드"]) if st.session_state.get("disc_excl_held", True) else set()
     s1, notes = discover.stage1(uni, f, exclude=held)
     src = st.session_state.get("disc_src", "자동(DART 우선)")
-    fin, errs, used, dart_fail = None, [], None, None
-    if src != "네이버 금융":
+    codes_ = list(s1["Code"])
+    fin, errs, used, dart_fail, sheet_date, n_sheet, n_naver = None, [], None, None, None, 0, 0
+    if src in ("자동(DART 우선)", "DART"):
         bar.progress(0.3, text=f"DART 재무 일괄 조회 중… ({len(s1)}개)")
         try:
-            fin, errs = bulk_cached(tuple(s1["Code"]))
+            fin, errs = bulk_cached(tuple(codes_))
             used = "DART"
         except Exception as e:
             dart_fail = dart_data.redact(e)
-    if used is None:
-        if src == "DART":
-            bar.empty()
-            st.session_state.disc_res = {"fail": f"DART 재무 조회에 실패했어요: {dart_fail}", "uni_n": len(uni), "s1_n": len(s1)}
-            return
-        bar.progress(0.35, text=("DART가 안 돼서 " if dart_fail else "") + f"네이버 금융의 재무로 조회하는 중… ({len(s1)}개, 1~2분 걸려요)")
-        try:
-            fin, errs = bulk_naver_cached(tuple(s1["Code"]))
-            used = "네이버"
-        except Exception as e:
-            bar.empty()
-            st.session_state.disc_res = {"fail": f"재무 조회에 실패했어요. DART: {dart_fail or '시도하지 않음'} / 네이버: {dart_data.redact(e)}", "uni_n": len(uni), "s1_n": len(s1)}
-            return
+    if used is None and src == "DART":
+        bar.empty()
+        st.session_state.disc_res = {"fail": f"DART 재무 조회에 실패했어요: {dart_fail}", "uni_n": len(uni), "s1_n": len(s1)}
+        return
+    if used is None and src in ("자동(DART 우선)", "내 PC 수집본(시트)"):
+        sheet_fin, sheet_date = load_disc_fin_sheet(codes_)
+        if sheet_fin:
+            fin, n_sheet, used = dict(sheet_fin), len(sheet_fin), "수집본"
+    if used is None and src == "내 PC 수집본(시트)":
+        bar.empty()
+        st.session_state.disc_res = {"fail": "구글 시트 '발굴재무'에 수집본이 없어요. 내 PC에서 local_collector.py를 실행해 주세요.", "uni_n": len(uni), "s1_n": len(s1)}
+        return
+    if src != "내 PC 수집본(시트)":
+        missing = [c for c in codes_ if not fin or c not in fin]
+        if used is None or (used == "수집본" and missing):
+            bar.progress(0.35, text=("DART가 안 돼서 " if dart_fail else "") + f"네이버 금융의 재무로 조회하는 중… ({len(missing)}개, 1~2분 걸려요)")
+            try:
+                nfin, nerrs = bulk_naver_cached(tuple(missing))
+                fin = {**(fin or {}), **nfin}
+                errs = (errs or []) + nerrs
+                n_naver = len(nfin)
+                used = "수집본+네이버" if used == "수집본" else "네이버"
+            except Exception as e:
+                if used is None:
+                    bar.empty()
+                    st.session_state.disc_res = {"fail": f"재무 조회에 실패했어요. DART: {dart_fail or '시도하지 않음'} / 네이버: {dart_data.redact(e)}", "uni_n": len(uni), "s1_n": len(s1)}
+                    return
     tbl = discover.metrics_table(s1, fin)
-    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes, "source": used, "dart_fail": dart_fail,
+    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes, "source": used, "dart_fail": dart_fail, "sheet_date": sheet_date, "n_sheet": n_sheet, "n_naver": n_naver,
                                  "errors": errs, "manual": bool(manual_codes), "ts": dt.datetime.now().strftime("%m-%d %H:%M"),
                                  "dept": uni["Dept"].replace("", "(비어 있음)").value_counts().head(15).to_dict() if "Dept" in uni else {}}
     bar.progress(1.0, text="완료")
@@ -1918,8 +1958,8 @@ def tab_discover():
         st.info("종목 목록 출처에 접속하지 못했어요. 대신 살펴볼 종목코드를 직접 붙여넣어 재무 조건만 적용할 수 있어요(시가총액이 없어서 PER·PBR·시가총액 조건은 빠져요).")
         txt = st.text_area("종목코드 목록 (쉼표나 줄바꿈으로 구분)", key="disc_manual", placeholder="005930, 000660, 035420")
         manual_codes = [x for x in txt.replace("\n", ",").replace(" ", ",").split(",") if x.strip()] or None
-    st.radio("재무 자료 출처", ["자동(DART 우선)", "네이버 금융", "DART"], horizontal=True, key="disc_src",
-             help="자동: DART를 먼저 쓰고 안 되면 네이버 금융으로 대신해요. 네이버 금융은 영업이익·부채비율·ROE·PER/PBR만 있어서 이자보상배율·영업현금흐름·감사의견·증자 이력 같은 안전 기준은 상세 점검에서 '확인 불가'로 나와요.")
+    st.radio("재무 자료 출처", ["자동(DART 우선)", "내 PC 수집본(시트)", "네이버 금융", "DART"], horizontal=True, key="disc_src",
+             help="자동: DART를 먼저 쓰고, 안 되면 내 PC에서 수집해 둔 DART 자료(구글 시트 '발굴재무'), 그것도 없으면 네이버 금융으로 대신해요. 네이버 금융은 영업이익·부채비율·ROE·PER/PBR만 있어서 이자보상배율·영업현금흐름·감사의견·증자 이력 같은 안전 기준은 상세 점검에서 '확인 불가'로 나와요.")
     if st.button("시장 데이터 불러오기", type="primary"):
         with st.spinner("시장 데이터를 불러오는 중이에요(1~3분 걸릴 수 있어요)…"):
             run_discovery(f, manual_codes)
@@ -1942,9 +1982,13 @@ def tab_discover():
     k[2].metric("② 재무 조회됨", f"{res['fin_n']:,}")
     k[3].metric("② 재무 조건 통과", f"{len(cand):,}")
     st.caption(f"{res['ts']}에 불러온 데이터예요.")
-    if res.get("source") == "네이버":
-        st.warning("재무 자료 출처: **네이버 금융**" + (f" (DART 연결 실패: {res['dart_fail'][:80]})" if res.get("dart_fail") else "") +
-                   ". 영업이익, 영업적자 횟수, 부채비율, ROE, PER/PBR만 있어요. 이자보상배율, 영업현금흐름, 자본잠식, 감사의견, 최대주주, 증자·CB 이력, 부도 공시는 확인하지 못해서 상세 점검에서 '확인 불가'로 나와요.")
+    src_ = res.get("source")
+    if src_ == "수집본":
+        st.info(f"재무 자료 출처: **내 PC에서 수집한 DART 자료**(수집일 {res.get('sheet_date') or '-'}, {res.get('n_sheet', 0)}종목). DART와 같은 항목이에요. 수집한 뒤에 나온 새 공시는 반영되지 않아요.")
+    elif src_ in ("네이버", "수집본+네이버"):
+        extra = f"{res.get('n_sheet', 0)}종목은 내 PC 수집본(수집일 {res.get('sheet_date') or '-'})에서, " if src_ == "수집본+네이버" else ""
+        st.warning(f"재무 자료 출처: {extra}**{res.get('n_naver', res.get('fin_n', 0))}종목은 네이버 금융**" + (f" (DART 연결 실패: {res['dart_fail'][:60]})" if res.get("dart_fail") else "") +
+                   ". 네이버 금융 자료는 영업이익, 영업적자 횟수, 부채비율, ROE, PER/PBR만 있어요. 이자보상배율, 영업현금흐름, 자본잠식, 감사의견, 최대주주, 증자·CB 이력, 부도 공시는 확인하지 못해서 상세 점검에서 '확인 불가'로 나와요.")
     for n in res.get("notes", []):
         st.warning(n)
     if res.get("errors"):
