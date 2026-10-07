@@ -19,6 +19,7 @@ import flows
 import fund
 import journal
 import judge
+import lab
 import market
 import perf
 import plan
@@ -37,6 +38,8 @@ CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
 WATCH_COLS = ["종목코드", "종목명"]
+HYP_COLS = ["실행일", "가설", "종목수", "기간(년)", "보유(일)", "표본", "승률차(%p)", "평균초과수익(%)", "CI하한", "CI상한", "일관", "등급"]
+FLOWLOG_COLS = ["날짜", "종목코드", "기관(주)", "외국인(주)", "개인(주)", "종가", "외국인보유율"]
 FUND_COLS = ["이름", "목표(만원)", "기간(년)", "현재(만원)", "매달 저축(만원)"]
 DEFAULT_FUNDS = [{"이름": "자녀 분가 자금", "목표(만원)": 0.0, "기간(년)": 5.0, "현재(만원)": 0.0, "매달 저축(만원)": 0.0},
                  {"이름": "노후 자금", "목표(만원)": 0.0, "기간(년)": 15.0, "현재(만원)": 0.0, "매달 저축(만원)": 0.0}]
@@ -1627,7 +1630,7 @@ def tab_report(rules):
                 for s in sigs:
                     hlp = explain.SIGNAL_HELP.get(s["title"])
                     if hlp:
-                        st.markdown(f"- **{s['title']}**: {hlp}")
+                        st.markdown(f"- **{s['title']}**: {hlp}{evidence_for(s['title'])}")
                 if sigs:
                     v = sg.verdict(sigs)
                     st.markdown(f"- **정리: {v}**: {explain.VERDICT_HELP.get(v, '')} (신호가 걸렸다는 뜻이지 사고팔라는 뜻은 아니에요.)")
@@ -2355,6 +2358,248 @@ def tab_plan(rules):
             st.warning("시세를 가져오지 못했어요. 종목코드를 확인하세요.")
 
 
+
+# ---------- 가설 실험실 ----------
+@st.cache_resource
+def _lab_store():
+    return {}
+
+
+def load_hyp():
+    if "hyp" in st.session_state:
+        return
+    df, err = pd.DataFrame(columns=HYP_COLS), None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("가설결과", HYP_COLS)
+        except Exception as e:
+            err = str(e)
+    st.session_state.hyp, st.session_state.hyp_err = df, err
+
+
+def save_hyp(rows):
+    store = get_store()
+    if store is not None and (st.session_state.get("load_error") or st.session_state.get("hyp_err")):
+        return False, "구글 시트에서 가설 결과를 읽지 못한 상태라 저장을 막았어요."
+    df = pd.concat([st.session_state.hyp, pd.DataFrame(rows, columns=HYP_COLS)], ignore_index=True).tail(600)
+    try:
+        if store is not None:
+            store.write("가설결과", df)
+        st.session_state.hyp = df
+        return True, "결과를 구글 시트에 저장했어요."
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def evidence_for(signal_title):
+    """종목 리포트의 신호가 우리 검증에서 어떻게 나왔는지(가장 최근 결과). 없으면 빈 문자열."""
+    name = lab.SIGNAL_TO_HYP.get(signal_title)
+    h = st.session_state.get("hyp")
+    if not name or h is None or h.empty:
+        return ""
+    g = h[h["가설"] == name]
+    if g.empty:
+        return ""
+    r = g.iloc[-1]
+    return f" → **우리 검증({r['실행일']}, {r['종목수']}종목·{r['기간(년)']}년·{r['보유(일)']}일):** {r['등급']} (시장 대비 평균 {float(r['평균초과수익(%)']):+.2f}%)"
+
+
+def lab_universe(n):
+    """검증에 쓸 종목코드. 시가총액 상위 n개(우선주·스팩 제외). 종목 목록을 못 받으면 보유·관심 종목."""
+    try:
+        uni = listing_cached()
+        uni = uni[[discover.is_common_stock(c, nm) for c, nm in zip(uni["Code"], uni["Name"])]]
+        return list(uni.sort_values("Marcap", ascending=False)["Code"].head(n)), None
+    except Exception as e:
+        codes = list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"])
+        return list(dict.fromkeys(codes)), f"종목 목록을 못 받아서 보유·관심 종목({len(set(codes))}개)으로만 검증해요: {dart_data.redact(e)[:80]}"
+
+
+def lab_prices(codes, years, bar):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    store, days = _lab_store(), int(years * 366) + 60
+    need = [c for c in codes if (c, years) not in store or time.time() - store[(c, years)][0] > 86400]
+    done = 0
+    if need:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(market.history_kr, c, days): c for c in need}
+            for f in as_completed(futs):
+                try:
+                    store[(futs[f], years)] = (time.time(), f.result())
+                except Exception:
+                    store[(futs[f], years)] = (time.time(), pd.DataFrame(columns=["Close"]))
+                done += 1
+                bar.progress(done / len(need), text=f"과거 가격을 가져오는 중… ({done}/{len(need)})")
+    return {c: store[(c, years)][1] for c in codes if (c, years) in store}
+
+
+def lab_panel(codes, years, h, bar):
+    key = (tuple(codes), years, h)
+    cached = _lab_store().get("panel")
+    if cached and cached[0] == key:
+        return cached[1]
+    prices = lab_prices(codes, years, bar)
+    bar.progress(1.0, text="지표와 신호를 계산하는 중…")
+    P = lab.build(prices, h)
+    _lab_store()["panel"] = (key, P)
+    return P
+
+
+def load_flowlog():
+    if "flowlog" in st.session_state:
+        return
+    df, err = pd.DataFrame(columns=FLOWLOG_COLS), None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("수급기록", FLOWLOG_COLS)
+        except Exception as e:
+            err = str(e)
+    for c in FLOWLOG_COLS[2:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
+    st.session_state.flowlog, st.session_state.flowlog_err = df, err
+
+
+def save_flowlog(codes):
+    """보유·관심 종목의 최근 수급(약 40거래일)을 '수급기록' 탭에 이어 붙인다. 이미 있는 날짜는 건너뛴다."""
+    store = get_store()
+    if store is not None and (st.session_state.get("load_error") or st.session_state.get("flowlog_err")):
+        return False, "구글 시트에서 수급 기록을 읽지 못한 상태라 저장을 막았어요.", []
+    cur = st.session_state.flowlog
+    have = set(zip(cur["날짜"].astype(str), cur["종목코드"]))
+    new, errs = [], []
+    errors = fetch_flows_bulk(codes)
+    errs += errors
+    for c in codes:
+        entry_ = st.session_state.get("flow_df", {}).get(c)
+        if not entry_:
+            continue
+        d = entry_[0]
+        for r in d.itertuples():
+            day = r.날짜.strftime("%Y-%m-%d")
+            if (day, c) in have:
+                continue
+            new.append([day, c, r.기관, r.외국인, getattr(r, "개인", np.nan), r.종가, getattr(r, "외국인보유율", np.nan)])
+    if not new:
+        return True, "새로 추가할 날짜가 없어요(이미 모두 기록돼 있어요).", errs
+    df = pd.concat([cur, pd.DataFrame(new, columns=FLOWLOG_COLS)], ignore_index=True).sort_values(["종목코드", "날짜"])
+    try:
+        if store is not None:
+            store.write("수급기록", df)
+        st.session_state.flowlog = df
+        return True, f"{len(new)}줄을 추가했어요.", errs
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}", errs
+
+
+def tab_lab():
+    st.markdown("**모든 지표는 가설이에요.** 20일선, 볼린저 밴드, 이격도, RSI 같은 흔한 지표가 한국 종목에서 실제로 효과가 있었는지 과거 가격으로 재봐요. "
+                "여기서 통과한 것만 판단 점수에 쓰고, 통과하지 못한 것은 '참고(가설)'로만 봐요. **51%를 찾아 1%p씩 올리려면 먼저 무엇이 효과가 있는지 가려내야 해요.**")
+    with st.expander("검증 원칙 (꼭 읽어 보세요)", expanded=False):
+        st.markdown(
+            "- **표본이 중요해요.** 승률 50%와 51%를 구분하려면 약 1만 건이 필요해요. 그래서 한 종목이 아니라 수백 종목 × 수년의 이벤트를 모아요.\n"
+            "- **시장 평균을 뺀 초과수익**으로 비교해요. 시장 전체가 오른 날의 착시를 없애기 위해서예요.\n"
+            "- **같은 종목의 겹치는 날은 한 번만** 세요(보유 기간 간격을 둬요).\n"
+            "- **여러 가설을 동시에 시험하면 우연히 맞는 게 나와요.** 시험한 개수만큼 기준을 엄격하게 올려요(다중검정 보정).\n"
+            "- **앞 절반과 뒤 절반 기간의 방향이 같아야** 믿어요.\n"
+            "- **결과에 한계가 있어요.** 지금 상장된 종목만 쓰기 때문에 상장폐지된 종목이 빠져 있어서(생존 편향) 결과가 실제보다 좋게 나올 수 있어요. 과거에 효과가 있었다는 것이 앞으로도 있다는 보장은 아니에요.")
+    c1, c2, c3, c4 = st.columns(4)
+    n_uni = c1.slider("종목 수(시가총액 상위)", 30, 300, 120, 10, key="lab_n")
+    years = c2.radio("기간", [3, 5], horizontal=True, key="lab_y", format_func=lambda x: f"최근 {x}년")
+    h = c3.radio("보유 기간", [20, 60], horizontal=True, key="lab_h", format_func=lambda x: f"{x}거래일")
+    cost = c4.number_input("왕복 비용(%)", min_value=0.0, value=0.3, step=0.05, key="lab_cost", help="세금과 수수료를 합친 값이에요. 이 비용을 뺀 수익으로 판단해요.")
+    names = st.multiselect("검증할 가설", list(lab.CATALOG), default=list(lab.CATALOG), key="lab_names")
+    if st.button("가설 검증 실행", type="primary", key="lab_run"):
+        if not names:
+            st.error("가설을 하나 이상 고르세요.")
+        else:
+            bar = st.progress(0.0, text="준비 중…")
+            codes, note = lab_universe(n_uni)
+            if note:
+                st.warning(note)
+            P = lab_panel(codes, years, h, bar)
+            if P is None:
+                bar.empty()
+                st.error("검증할 가격 자료를 가져오지 못했어요. 잠시 뒤 다시 시도해 주세요.")
+            else:
+                res = {}
+                for i, k in enumerate(names):
+                    bar.progress(i / len(names), text=f"{k} 검증 중…")
+                    res[k] = lab.event_study(P["S"][k], P, cost / 100, n_tests=len(names))
+                bar.empty()
+                st.session_state["lab_res"] = {"res": res, "meta": (len(P["C"].columns), years, h, cost, len(names)), "date": dt.date.today().isoformat()}
+                rows = [[dt.date.today().isoformat(), k, len(P["C"].columns), years, h, o.get("n", 0), o.get("win_diff"), o.get("mean_excess"), o.get("ci_lo"), o.get("ci_hi"),
+                         "Y" if o.get("consistent") else "N", o["grade"]] for k, o in res.items()]
+                ok, msg = save_hyp(rows)
+                if not ok:
+                    st.warning(msg)
+    lr = st.session_state.get("lab_res")
+    if lr:
+        nu, yy, hh, cc, kk = lr["meta"]
+        res = lr["res"]
+        st.subheader(f"결과 — {nu}종목 · 최근 {yy}년 · {hh}거래일 보유 · 비용 {cc}%")
+        tbl = []
+        for k, o in res.items():
+            tbl.append({"가설": k, "설명": lab.CATALOG[k][0], "표본": o.get("n"), "승률(%)": o.get("win"), "기준선 승률(%)": o.get("win_base"), "승률 차이(%p)": o.get("win_diff"),
+                        "평균 초과수익(%)": o.get("mean_excess"), "신뢰구간(하한)": o.get("ci_lo"), "신뢰구간(상한)": o.get("ci_hi"), "앞 절반": o.get("half1"),
+                        "뒤 절반": o.get("half2"), "평균 최대 하락(%)": o.get("mean_mae"), "등급": o["grade"]})
+        df = pd.DataFrame(tbl).sort_values("평균 초과수익(%)", ascending=False, na_position="last")
+        st.dataframe(df, width="stretch", hide_index=True, column_config={
+            "승률(%)": st.column_config.NumberColumn(format="%.1f"), "기준선 승률(%)": st.column_config.NumberColumn(format="%.1f"), "승률 차이(%p)": st.column_config.NumberColumn(format="%+.1f"),
+            "평균 초과수익(%)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(하한)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(상한)": st.column_config.NumberColumn(format="%+.2f"),
+            "앞 절반": st.column_config.NumberColumn(format="%+.2f"), "뒤 절반": st.column_config.NumberColumn(format="%+.2f"), "평균 최대 하락(%)": st.column_config.NumberColumn(format="%.1f")})
+        mdes = [o["mde"] for o in res.values() if "mde" in o]
+        if mdes:
+            st.info(f"이 표본으로는 승률이 **약 {np.median(mdes):.1f}%p 이상 달라야** 우연과 구분돼요. 그보다 작은 차이는 '효과가 없다'가 아니라 '**구분이 안 된다**'는 뜻이에요. "
+                    f"{kk}개를 동시에 시험해서 신뢰구간은 **{(1 - 0.05 / max(1, kk)) * 100:.1f}% 수준**으로 엄격하게 잡았어요.")
+        st.caption("승률은 비용을 뺀 수익이 플러스인 비율이에요. '평균 초과수익'은 같은 날 같은 기간의 시장(검증 종목 평균) 대비 얼마나 더 올랐는지예요. 등급: 검증됨(약함)은 신뢰구간이 0보다 크고 앞뒤 기간이 일관된 경우, 가설(방향만)은 방향은 맞지만 우연과 구분되지 않는 경우, 효과 구분 안 됨은 차이를 가려내지 못한 경우예요.")
+
+        st.markdown("**교차 검증 — 가설을 조합해 보기** (두세 개를 동시에 만족할 때)")
+        pick = st.multiselect("조합할 가설(2~3개)", list(lab.CATALOG), max_selections=3, key="lab_combo")
+        if len(pick) >= 2 and st.button("조합 검증", key="lab_combo_run"):
+            codes, _ = lab_universe(nu)
+            cached = _lab_store().get("panel")
+            P = cached[1] if cached and cached[0][1:] == (yy, hh) else None
+            if P is None:
+                st.error("위 검증을 다시 실행한 뒤 조합해 주세요.")
+            else:
+                st.session_state["lab_combo_n"] = st.session_state.get("lab_combo_n", 0) + 1
+                o = lab.event_study(lab.combine(P, pick), P, cc / 100, n_tests=kk + st.session_state["lab_combo_n"])
+                st.session_state["lab_combo_res"] = (" + ".join(pick), o)
+        cr = st.session_state.get("lab_combo_res")
+        if cr:
+            o = cr[1]
+            if "mean_excess" in o:
+                st.write(f"**{cr[0]}**: 표본 {o['n']:,}건 · 승률 {o['win']:.1f}% (기준선 {o['win_base']:.1f}%) · 평균 초과수익 {o['mean_excess']:+.2f}% "
+                         f"(신뢰구간 {o['ci_lo']:+.2f}~{o['ci_hi']:+.2f}) · 앞 {o['half1']:+.2f} / 뒤 {o['half2']:+.2f} → **{o['grade']}**")
+            else:
+                st.write(f"**{cr[0]}**: 표본이 부족해요({o['n']}건).")
+            st.caption("조합을 여러 번 시험할수록 우연히 좋은 결과가 나오기 쉬워서, 시험한 횟수만큼 기준을 더 엄격하게 올려요.")
+
+    st.divider()
+    st.subheader("수급 기록 쌓기 (수급 가설 검증을 위한 자료)")
+    st.markdown("한국 시장은 외국인·기관 수급의 영향이 크다는 가설을 검증하려면 **수급의 과거 기록이 길게** 필요한데, 지금은 최근 약 40거래일만 가져올 수 있어요. "
+                "그래서 보유·관심 종목의 수급을 **구글 시트의 `수급기록` 탭에 쌓아둬요.** 한 번 가져올 때 약 40거래일이 들어오므로 **한 달에 한 번 이상** 누르면 빈틈없이 이어져요.")
+    if st.session_state.get("flowlog_err"):
+        st.error(f"구글 시트에서 수급 기록을 읽지 못해서 저장을 막았어요. ({st.session_state['flowlog_err']})")
+    codes = list(dict.fromkeys(list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"])))
+    if st.button(f"보유·관심 {len(codes)}종목의 수급 기록하기", key="flowlog_save"):
+        with st.spinner("수급을 가져오는 중이에요…"):
+            ok, msg, errs = save_flowlog(codes)
+        (st.success if ok else st.error)(msg)
+        for e in errs[:3]:
+            st.warning(f"못 가져온 종목: {e}")
+    fl = st.session_state.flowlog
+    if len(fl):
+        per = fl.groupby("종목코드")["날짜"].nunique()
+        st.write(f"기록된 종목 **{per.size}개**, 종목당 최대 **{int(per.max())}거래일**, 전체 {len(fl):,}줄이에요. "
+                 + ("수급 가설을 검증하기에는 아직 짧아요(최소 6개월, 약 120거래일 이상을 권해요)." if per.max() < 120 else "수급 가설을 시험해 볼 만한 길이가 쌓였어요."))
+    else:
+        st.info("아직 기록이 없어요. 위 버튼을 눌러 오늘부터 쌓기 시작하세요.")
+
+
 def tab_rules():
     st.markdown("규칙 숫자를 바꾸면 신호가 바로 달라져요. 바꾼 뒤 맨 아래 '규칙 저장'을 눌러야 구글 시트에 저장돼요.")
     r = st.session_state.rules
@@ -2439,7 +2684,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 1}
 
 
 def check_versions():
@@ -2481,6 +2726,8 @@ def main():
     load_cons_hist()
     load_journal()
     load_plans()
+    load_hyp()
+    load_flowlog()
     load_fincache()
     rules = st.session_state.rules
 
@@ -2494,7 +2741,7 @@ def main():
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
     pages = {"내 자산": lambda: tab_assets(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
-             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "규칙": tab_rules}
+             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
     pages[page]()  # 고른 화면만 계산해서 빠르다
     with st.sidebar:
