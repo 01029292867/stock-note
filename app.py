@@ -539,7 +539,14 @@ def get_dart():
     if ts and time.time() - ts < 300:
         return None, st.session_state.get("dart_fail_msg")
     try:
-        return _make_dart(key, DART_CLIENT_VER), None
+        client = _make_dart(key, DART_CLIENT_VER)
+        ok_ts = st.session_state.get("dart_ok_ts")
+        if not ok_ts or time.time() - ok_ts > 300:   # 5분에 한 번, 실제로 응답하는지 짧게 확인한다
+            bad = dart_data.probe(key)
+            if bad:
+                raise RuntimeError(bad)
+            st.session_state["dart_ok_ts"] = time.time()
+        return client, None
     except Exception as e:
         msg = f"DART에 연결하지 못했어요: {dart_data.redact(e)[:160]} 5분 뒤에 자동으로 다시 시도해요."
         st.session_state["dart_fail_ts"], st.session_state["dart_fail_msg"] = time.time(), msg
@@ -718,7 +725,14 @@ def prefetch_prices():
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def listing_cached():
-    return discover.load_listing()
+    df = discover.load_listing()
+    # KRX가 막혀서 시가총액·거래대금이 비어 오면 네이버 금융의 시가총액 순위로 채운다
+    if ("Marcap" not in df.columns) or df["Marcap"].isna().mean() > 0.9:
+        try:
+            df = discover.fill_from_naver(df)
+        except Exception:
+            pass
+    return df
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1852,6 +1866,8 @@ def run_discovery(f, manual_codes=None):
     st.session_state.disc_cap = {c: m / 1e12 for c, m in zip(uni["Code"], uni["Marcap"]) if m == m}
     held = set(st.session_state.hold["종목코드"]) if st.session_state.get("disc_excl_held", True) else set()
     s1, notes = discover.stage1(uni, f, exclude=held)
+    if "시총출처" in uni.columns and (uni["시총출처"] == "네이버").any():
+        notes = list(notes) + [f"종목 목록에 시가총액·거래대금이 없어서 네이버 금융의 시가총액 순위(상위 {int((uni['시총출처'] == '네이버').sum())}종목)로 채웠어요. 그보다 작은 종목은 후보에서 빠져요."]
     src = st.session_state.get("disc_src", "자동(DART 우선)")
     codes_ = list(s1["Code"])
     fin, errs, used, dart_fail, sheet_date, n_sheet, n_naver = None, [], None, None, None, 0, 0
@@ -3329,7 +3345,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1, "naverfin": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1, "naverfin": 2}
 
 
 def check_versions():

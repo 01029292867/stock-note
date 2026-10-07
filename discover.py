@@ -42,6 +42,22 @@ def load_listing():
     raise RuntimeError(f"종목 목록을 가져오지 못했어요: {last}")
 
 
+def fill_from_naver(df, n=600):
+    """종목 목록에 시가총액·거래대금이 없을 때(KRX가 막힌 경우) 네이버 금융 시가총액 순위로 채운다. 상위 n종목만 채워지고 나머지는 비어 있다."""
+    import naverfin
+    top = naverfin.market_top(n)
+    d = df.copy()
+    for c in ("Marcap", "Amount", "Close"):
+        if c not in d.columns:
+            d[c] = np.nan
+    mp = top.set_index("Code")
+    hit = d["Code"].isin(mp.index)
+    for c in ("Marcap", "Amount", "Close"):
+        d.loc[hit, c] = d.loc[hit, "Code"].map(mp[c]).values
+    d["시총출처"] = np.where(hit, "네이버", "")
+    return d
+
+
 def normalize_listing(df):
     d = df.copy()
     if "Code" not in d.columns and "Symbol" in d.columns:
@@ -160,6 +176,8 @@ def bulk_financials(client, codes, today=None, progress=None):
                 errors.append(f"{year}년 묶음 {bi + 1}: {str(e)[:120]}")
                 if any(k in str(e) for k in ("010", "011", "020")):
                     return result, errors
+                if any(k in str(e) for k in ("시간 초과", "접속에 실패", "연결하지 못했")):
+                    return result, errors  # 연결 자체가 안 되면 나머지 묶음도 안 되므로 바로 멈춘다
                 continue
             for code, rec in parse_multi(jo.get("list", [])).items():
                 if code in batch:
@@ -216,6 +234,8 @@ def metrics_table(stage1_df, fin):
         rec["PBR"] = (r.Marcap / eq) if (pd.notna(r.Marcap) and eq and eq > 0) else np.nan
         rec["영업이익률"] = (op[2] / rv * 100) if (op and op[2] is not None and rv and rv > 0) else np.nan
         if f:  # 자기자본·부채 금액이 없는 자료(네이버 대체)는 비율을 직접 쓴다
+            if rec["PER"] != rec["PER"] and f.get("per") and f["per"] > 0:
+                rec["PER"] = f["per"]
             if rec["ROE"] != rec["ROE"] and f.get("roe") is not None:
                 rec["ROE"] = f["roe"]
             if rec["부채비율"] != rec["부채비율"] and f.get("debt") is not None:

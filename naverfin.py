@@ -1,7 +1,7 @@
 """네이버 금융에서 읽어오는 재무(DART가 막힐 때의 대체 자료).
 가져올 수 있는 것: 매출액·영업이익·당기순이익(최근 연간), ROE, 부채비율, PER, PBR, 주당배당금.
 가져올 수 없는 것(DART 공시에만 있는 것): 이자보상배율, 영업현금흐름, 자본잠식, 감사의견, 최대주주 지분, 증자·CB·BW 이력, 부도·회생 공시."""
-VERSION = 1
+VERSION = 2  # 2: 시가총액 순위(종목 목록의 시가총액·거래대금 보충)
 
 import re
 
@@ -147,3 +147,62 @@ def to_fin(nf):
             "roe": last("ROE"), "debt": last("부채비율"), "per": last("PER"), "pbr": last("PBR"),
             "div_list": ([div[i] for i in use if i < len(div)] if div else None),
             "year": _year(nf["labels"][use[-1]]), "fs": "NAVER"}
+
+
+SUM = "https://finance.naver.com/sise/sise_market_sum.naver"
+
+
+def parse_market_sum(html):
+    """시가총액 순위 페이지 -> [{'Code','Name','Close','Marcap'(원),'Volume','Amount'(원, 현재가×거래량),'PER','ROE'}]"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    tb = soup.select_one("table.type_2")
+    if tb is None:
+        raise NaverFinError(f"시가총액 표를 찾지 못했어요({len(html or ''):,}자, 표 {len(soup.find_all('table'))}개)")
+    heads = [th.get_text(" ", strip=True) for th in tb.select("thead th")]
+    idx = {h: i for i, h in enumerate(heads)}
+
+    def col(tds, name):
+        i = idx.get(name)
+        return _num(tds[i].get_text(" ", strip=True)) if i is not None and i < len(tds) else None
+
+    out = []
+    for tr in tb.select("tbody tr"):
+        tds = tr.find_all("td")
+        a = tr.find("a", href=re.compile(r"code=\d{6}"))
+        if not a or len(tds) < 8:
+            continue
+        code = re.search(r"code=(\d{6})", a["href"]).group(1)
+        price, cap, vol = col(tds, "현재가"), col(tds, "시가총액"), col(tds, "거래량")
+        out.append({"Code": code, "Name": a.get_text(strip=True), "Close": price, "Marcap": cap * 1e8 if cap is not None else None,
+                    "Volume": vol, "Amount": price * vol if (price is not None and vol is not None) else None,
+                    "PER": col(tds, "PER"), "ROE": col(tds, "ROE")})
+    if not out:
+        raise NaverFinError("시가총액 표에서 읽을 행이 없었어요")
+    return out
+
+
+def market_top(n=600, get=None, pause=0.2):
+    """네이버 금융 시가총액 순위에서 코스피·코스닥 상위 종목을 읽는다(시가총액 큰 순). 반환: DataFrame"""
+    import time
+
+    import pandas as pd
+    get = get or requests.get
+    rows, errs = [], []
+    pages = int(n // 50) + 2
+    for sosok in (0, 1):
+        for page in range(1, pages + 1):
+            try:
+                r = get(SUM, params={"sosok": sosok, "page": page}, headers=HEADERS, timeout=12)
+                if getattr(r, "status_code", 200) != 200:
+                    raise NaverFinError(f"HTTP {r.status_code}")
+                r.encoding = "euc-kr"
+                rows += parse_market_sum(r.text)
+            except Exception as e:
+                errs.append(f"sosok{sosok} p{page}: {str(e)[:60]}")
+                break
+            time.sleep(pause)
+    if not rows:
+        raise NaverFinError("시가총액 순위를 읽지 못했어요: " + "; ".join(errs[:2]))
+    df = pd.DataFrame(rows).drop_duplicates("Code")
+    return df.sort_values("Marcap", ascending=False).head(n).reset_index(drop=True)

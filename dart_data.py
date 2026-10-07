@@ -320,3 +320,13 @@ def fetch_all(client, stock_code, today=None):
                 result["errors"][k] = str(e)[:200]
     result["issue_detail"] = issue_detail
     return result
+
+
+def probe(api_key, timeout=6):
+    """DART API가 지금 실제로 응답하는지 짧게 확인한다. 반환: None(정상) 또는 오류 문구.
+    회사 목록은 시트 보관본으로 열릴 수 있어서, 연결 객체가 만들어졌다고 해서 DART가 되는 것은 아니다."""
+    try:
+        _call(api_key, "company", {"corp_code": "00126380"}, timeout=timeout)
+        return None
+    except Exception as e:
+        return redact(str(e))
