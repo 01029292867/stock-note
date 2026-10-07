@@ -2,7 +2,7 @@
 - 종목 × 기간의 이벤트를 모아서(겹치지 않게 간격을 두고) 시장 평균을 뺀 초과수익으로 비교한다.
 - 시험한 가설 수만큼 기준을 엄격하게 하고(다중검정 보정), 앞·뒤 기간의 일관성을 본다.
 - 과거에 효과가 있었다는 것이 앞으로도 있다는 보장은 아니다. 상장폐지 종목이 빠진 자료는 결과를 좋게 보이게 한다."""
-VERSION = 2  # 2: 요인(분위) 검증 추가
+VERSION = 3  # 3: 수급 요인 검증(수급 기록 사용) / 2: 요인(분위) 검증
 
 import numpy as np
 import pandas as pd
@@ -206,3 +206,44 @@ def factor_study(F, P, step=5, n_q=5, n_tests=1, B=2000, seed=0):
     else:
         out["grade"] = "효과 구분 안 됨"
     return out
+
+
+# ---------------- 수급 요인 검증 (구글 시트 '수급기록'이 쌓인 만큼만 검증된다) ----------------
+FLOW_FACTORS = {
+    "큰손(외국인+기관) 20일 순매수 비중": "외국인·기관이 20일간 순매수한 정도(3주체 거래금액 대비). 높을수록 큰손이 사는 종목",
+    "외국인 20일 순매수 비중": "외국인이 20일간 순매수한 정도",
+    "기관 20일 순매수 비중": "기관이 20일간 순매수한 정도",
+    "개인 20일 순매수 비중(개인 주도 가설)": "개인이 20일간 순매수한 정도. 높을수록 개인 주도 종목(가설: 중장기에는 불리)",
+}
+
+
+def flow_matrices(fl, C, window=20):
+    """수급 기록(날짜, 종목코드, 기관(주), 외국인(주), 개인(주), 종가) -> 요인 이름별 (날짜 × 종목) 표. C의 날짜·종목에 맞춘다."""
+    d = fl.copy()
+    d["날짜"] = pd.to_datetime(d["날짜"], errors="coerce")
+    d = d.dropna(subset=["날짜"])
+    for col, key in (("기관(주)", "i"), ("외국인(주)", "f"), ("개인(주)", "p")):
+        d[key] = pd.to_numeric(d[col], errors="coerce") * pd.to_numeric(d["종가"], errors="coerce")
+    piv = {k: d.pivot_table(index="날짜", columns="종목코드", values=k, aggfunc="last") for k in ("i", "f", "p")}
+    roll = {}
+    for k, v in piv.items():
+        roll[k] = v.reindex(index=C.index, columns=C.columns).rolling(window, min_periods=int(window * 0.75)).sum()
+    f, i = roll["f"], roll["i"]
+    p_ = roll["p"].where(roll["p"].notna(), -(f + i))          # 개인 값이 없으면 -(외국인+기관)으로 추정
+    den = f.abs() + i.abs() + p_.abs()
+    den = den.where(den > 0)
+    return {"큰손(외국인+기관) 20일 순매수 비중": (f + i) / den, "외국인 20일 순매수 비중": f / den,
+            "기관 20일 순매수 비중": i / den, "개인 20일 순매수 비중(개인 주도 가설)": p_ / den}
+
+
+def flow_readiness(fl, C):
+    """수급 기록이 검증에 쓸 만한지: (겹치는 종목 수, 기록된 거래일 수, 가장 오래된 날짜, 종목 30개 이상인 날짜 수)"""
+    if fl is None or fl.empty:
+        return 0, 0, None, 0
+    d = fl.copy()
+    d["날짜"] = pd.to_datetime(d["날짜"], errors="coerce")
+    d = d[d["종목코드"].isin(C.columns)].dropna(subset=["날짜"])
+    if d.empty:
+        return 0, 0, None, 0
+    per_day = d.groupby("날짜")["종목코드"].nunique()
+    return int(d["종목코드"].nunique()), int(d["날짜"].nunique()), d["날짜"].min().date().isoformat(), int((per_day >= 30).sum())

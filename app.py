@@ -2577,36 +2577,45 @@ def load_flowlog():
     st.session_state.flowlog, st.session_state.flowlog_err = df, err
 
 
-def save_flowlog(codes):
-    """보유·관심 종목의 최근 수급(약 40거래일)을 '수급기록' 탭에 이어 붙인다. 이미 있는 날짜는 건너뛴다."""
+def save_flowlog(codes, depth=40, bar=None):
+    """종목들의 최근 수급(depth 거래일)을 '수급기록' 탭에 이어 붙인다. 이미 있는 날짜는 건너뛴다.
+    반환: (성공, 문구, 오류 목록, 가장 긴 기간 행 수)"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     store = get_store()
     if store is not None and (st.session_state.get("load_error") or st.session_state.get("flowlog_err")):
-        return False, "구글 시트에서 수급 기록을 읽지 못한 상태라 저장을 막았어요.", []
+        return False, "구글 시트에서 수급 기록을 읽지 못한 상태라 저장을 막았어요.", [], 0
     cur = st.session_state.flowlog
     have = set(zip(cur["날짜"].astype(str), cur["종목코드"]))
-    new, errs = [], []
-    errors = fetch_flows_bulk(codes)
-    errs += errors
-    for c in codes:
-        entry_ = st.session_state.get("flow_df", {}).get(c)
-        if not entry_:
-            continue
-        d = entry_[0]
+    pages = max(2, int(np.ceil(depth / 20)))
+    results, errs = {}, []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(flows.fetch_flow, c, pages): c for c in codes}
+        for i, f in enumerate(as_completed(futs)):
+            c = futs[f]
+            try:
+                results[c] = f.result()
+            except Exception as e:
+                errs.append(f"{c}: {str(e)[:100]}")
+            if bar:
+                bar.progress((i + 1) / max(len(codes), 1), text=f"수급을 가져오는 중… ({i + 1}/{len(codes)})")
+    new, longest = [], 0
+    for c, d in results.items():
+        longest = max(longest, len(d))
         for r in d.itertuples():
             day = r.날짜.strftime("%Y-%m-%d")
             if (day, c) in have:
                 continue
             new.append([day, c, r.기관, r.외국인, getattr(r, "개인", np.nan), r.종가, getattr(r, "외국인보유율", np.nan)])
     if not new:
-        return True, "새로 추가할 날짜가 없어요(이미 모두 기록돼 있어요).", errs
-    df = pd.concat([cur, pd.DataFrame(new, columns=FLOWLOG_COLS)], ignore_index=True).sort_values(["종목코드", "날짜"])
+        return True, "새로 추가할 날짜가 없어요(이미 모두 기록돼 있어요).", errs, longest
+    df = pd.concat([cur, pd.DataFrame(new, columns=FLOWLOG_COLS)], ignore_index=True).sort_values(["종목코드", "날짜"]).tail(150000)
     try:
         if store is not None:
             store.write("수급기록", df)
         st.session_state.flowlog = df
-        return True, f"{len(new)}줄을 추가했어요.", errs
+        return True, f"{len(new):,}줄을 추가했어요.", errs, longest
     except Exception as e:
-        return False, f"저장에 실패했어요: {e}", errs
+        return False, f"저장에 실패했어요: {e}", errs, longest
 
 
 def tab_lab():
@@ -2745,29 +2754,89 @@ def tab_lab():
                                                            tooltip=["분위", alt.Tooltip("평균 이후 수익(%):Q", format=".2f")]).properties(height=220), width="stretch")
 
     st.divider()
-    st.subheader("수급 기록 쌓기 (수급 가설 검증을 위한 자료)")
-    st.markdown("한국 시장은 외국인·기관 수급의 영향이 크다는 가설을 검증하려면 **수급의 과거 기록이 길게** 필요한데, 지금은 최근 약 40거래일만 가져올 수 있어요. "
-                "그래서 보유·관심 종목의 수급을 **구글 시트의 `수급기록` 탭에 쌓아둬요.** 한 번 가져올 때 약 40거래일이 들어오므로 **한 달에 한 번 이상** 누르면 빈틈없이 이어져요.")
+    st.subheader("수급 가설 검증 — 외국인·기관 수급이 이후 수익과 관련 있었나")
+    st.markdown("한국 시장은 외국인·기관 수급의 영향이 크다는 가설을 **같은 방식(5등분 비교)**으로 재요. 다만 **수급의 과거 기록이 있어야** 하는데, 네이버가 주는 건 종목마다 최근 일부뿐이에요. "
+                "그래서 아래에서 **수급을 구글 시트의 `수급기록` 탭에 쌓고**, 쌓인 만큼만 검증해요. 가격 지표가 3년치로 검증되는 것과 달리 수급은 **기록한 날부터**만 가능해요.")
     if st.session_state.get("flowlog_err"):
         st.error(f"구글 시트에서 수급 기록을 읽지 못해서 저장을 막았어요. ({st.session_state['flowlog_err']})")
-    codes = list(dict.fromkeys(list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"])))
-    if st.button(f"보유·관심 {len(codes)}종목의 수급 기록하기", key="flowlog_save"):
-        with st.spinner("수급을 가져오는 중이에요…"):
-            ok, msg, errs = save_flowlog(codes)
-        (st.success if ok else st.error)(msg)
+    hcodes = list(dict.fromkeys(list(st.session_state.hold["종목코드"]) + list(st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))["종목코드"])))
+    d1, d2 = st.columns(2)
+    depth = d1.selectbox("한 번에 가져올 과거 기간", [40, 120, 250, 500], index=0, key="fl_depth", format_func=lambda x: f"최근 {x}거래일",
+                         help="길게 고를수록 한 번에 많이 쌓여요. 네이버가 그만큼 주는지는 아래 '기간 시험'으로 확인하세요.")
+    extra_n = d2.slider("검증용으로 시가총액 상위 종목도 함께 기록", 0, 200, 0, 10, key="fl_extra",
+                        help="5등분 비교를 하려면 종목이 수십 개 이상 필요해요. 위의 '검증할 종목 수'와 같은 기준(시가총액 상위)으로 고르세요. 많을수록 오래 걸려요.")
+    t1, t2, _ = st.columns([1, 1, 2])
+    if t1.button("기간 시험 (1종목)", key="flowlog_test", help="네이버가 한 종목에 대해 얼마나 긴 기간을 주는지 확인해요."):
+        probe = (hcodes[0] if hcodes else "005930")
+        try:
+            dd = flows.fetch_flow(probe, pages=25)
+            st.success(f"{probe}: 요청한 500거래일 중 **{len(dd)}거래일**({dd['날짜'].min().date()} ~ {dd['날짜'].max().date()})을 받았어요.")
+        except Exception as e:
+            st.error(f"시험에 실패했어요: {dart_data.redact(e)[:160]}")
+    if t2.button("수급 기록하기", key="flowlog_save"):
+        extra, note = (lab_universe(extra_n) if extra_n else ([], None))
+        if note:
+            st.warning(note)
+        codes = list(dict.fromkeys(hcodes + extra))
+        bar = st.progress(0.0, text="준비 중…")
+        ok, msg, errs, longest = save_flowlog(codes, depth, bar)
+        bar.empty()
+        (st.success if ok else st.error)(msg + (f" (종목당 가장 길게 받은 기간: {longest}거래일, 대상 {len(codes)}종목)" if longest else ""))
+        if longest and longest < depth * 0.8:
+            st.info(f"요청한 {depth}거래일보다 짧게 받았어요. 네이버가 이 이상은 주지 않는 것으로 보여요. 앞으로 한 달에 한 번 이상 기록해서 이어 붙이세요.")
         for e in errs[:3]:
             st.warning(f"못 가져온 종목: {e}")
     fl = st.session_state.flowlog
     if len(fl):
         per = fl.groupby("종목코드")["날짜"].nunique()
-        st.write(f"기록된 종목 **{per.size}개**, 종목당 최대 **{int(per.max())}거래일**, 전체 {len(fl):,}줄이에요. "
-                 + ("수급 가설을 검증하기에는 아직 짧아요(최소 6개월, 약 120거래일 이상을 권해요)." if per.max() < 120 else "수급 가설을 시험해 볼 만한 길이가 쌓였어요."))
+        st.write(f"기록된 종목 **{per.size}개**, 종목당 최대 **{int(per.max())}거래일**, 전체 {len(fl):,}줄이에요.")
     else:
-        st.info("아직 기록이 없어요. 위 버튼을 눌러 오늘부터 쌓기 시작하세요.")
+        st.info("아직 기록이 없어요. 위 버튼을 눌러 쌓기 시작하세요.")
+    if st.button("수급 가설 검증 실행", key="flow_factor_run"):
+        if fl.empty:
+            st.error("수급 기록이 없어요. 먼저 기록하세요.")
+        else:
+            bar = st.progress(0.0, text="준비 중…")
+            codes, note = lab_universe(n_uni)
+            if note:
+                st.warning(note)
+            P = lab_panel(codes, years, h, bar)
+            if P is None:
+                bar.empty()
+                st.error("검증할 가격 자료를 가져오지 못했어요.")
+            else:
+                n_ov, n_days, first, ok_days = lab.flow_readiness(fl, P["C"])
+                F = lab.flow_matrices(fl, P["C"])
+                res_f = {}
+                for i, (k, M) in enumerate(F.items()):
+                    bar.progress(i / len(F), text=f"{k} 검증 중…")
+                    res_f[k] = lab.factor_study(M, P, n_tests=len(F))
+                bar.empty()
+                st.session_state["lab_flow_res"] = {"res": res_f, "ready": (n_ov, n_days, first, ok_days), "meta": (len(P["C"].columns), years, h)}
+                save_hyp([[dt.date.today().isoformat(), "수급: " + k, len(P["C"].columns), years, h, o.get("n_dates", 0), None, o.get("spread"), o.get("ci_lo"), o.get("ci_hi"),
+                           "Y" if o.get("consistent") else "N", o["grade"]] for k, o in res_f.items()])
+    fr2 = st.session_state.get("lab_flow_res")
+    if fr2:
+        n_ov, n_days, first, ok_days = fr2["ready"]
+        st.markdown(f"**검증 대상과 수급 기록이 겹치는 종목 {n_ov}개 · 기록 {n_days}거래일 (시작 {first or '-'}) · 종목 30개 이상이 있는 날 {ok_days}일**")
+        if ok_days < 150:
+            st.info(f"수급 가설을 믿을 만하게 재려면 종목 30개 이상이 **150거래일(약 7개월) 이상** 있어야 해요. 지금은 {ok_days}일이라 결과는 참고만 하세요. 기간을 길게 한 번에 가져오거나 시간이 지나면 검증력이 생겨요.")
+        rows = []
+        for k, o in fr2["res"].items():
+            r = {"수급 요인": k, "설명": lab.FLOW_FACTORS[k], "날짜 수": o.get("n_dates"), "윗-아랫(%)": o.get("spread"), "신뢰구간(하한)": o.get("ci_lo"), "신뢰구간(상한)": o.get("ci_hi"),
+                 "앞 절반": o.get("half1"), "뒤 절반": o.get("half2"), "등급": o["grade"]}
+            if "q" in o:
+                for g_ in range(5):
+                    r[f"{g_ + 1}분위(%)"] = o["q"][g_]
+            rows.append(r)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, column_config={
+            "윗-아랫(%)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(하한)": st.column_config.NumberColumn(format="%+.2f"), "신뢰구간(상한)": st.column_config.NumberColumn(format="%+.2f"),
+            "앞 절반": st.column_config.NumberColumn(format="%+.2f"), "뒤 절반": st.column_config.NumberColumn(format="%+.2f"),
+            **{f"{g_}분위(%)": st.column_config.NumberColumn(format="%+.2f") for g_ in range(1, 6)}})
+        st.caption("5분위는 해당 수급이 가장 많이 순매수된 종목 그룹이에요. 윗-아랫이 +이고 신뢰구간이 0보다 크면 '수급이 많이 들어온 종목이 이후 더 올랐다'는 뜻이에요. "
+                   "'큰손'·'외국인'·'기관' 결과는 같은 데이터를 다르게 자른 것이라 서로 비슷하게 나올 수 있어요(독립된 확인이 아니에요). 개인 순매수는 거래 3주체의 합이 0에 가까워서 큰손 순매수와 반대로 움직이는 경향이 있어요. 생존 편향 등 한계는 위와 같아요.")
 
 
-
-# ---------- 종합 순위 ----------
 def load_scorelog():
     if "scorelog" in st.session_state:
         return
@@ -3133,7 +3202,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 2, "brief": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 1, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 3, "brief": 1}
 
 
 def check_versions():
