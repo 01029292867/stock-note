@@ -3345,7 +3345,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1, "naverfin": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1, "naverfin": 2, "helptext": 1}
 
 
 def check_versions():
@@ -3363,6 +3363,30 @@ def check_versions():
         st.title("📈 내 투자 노트")
         st.error("GitHub에 올라간 파일 중 예전 버전이 남아 있어요: **" + ", ".join(old) + "**. 최신 파일을 올린 뒤 앱을 다시 시작(Reboot)해 주세요.")
         st.stop()
+
+
+
+def page_help(page):
+    """각 화면 맨 위의 '이 화면 설명': 무엇을 하는 화면인지, 보는 순서, 항목별 뜻(검색 가능)."""
+    try:
+        import helptext
+    except ImportError:
+        return
+    h = helptext.PAGES.get(page)
+    if not h:
+        return
+    with st.expander("📖 이 화면 설명 — 무엇을 하는 화면이고, 항목은 무슨 뜻인가요?", expanded=False):
+        st.markdown("**무엇을 하는 화면인가요?**  \n" + h["purpose"])
+        st.markdown("**이렇게 보세요**\n\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(h["steps"], 1)))
+        st.markdown(f"**항목 설명** ({len(h['terms'])}개)")
+        q = st.text_input("항목 검색", key=f"help_q_{page}", placeholder="궁금한 용어를 입력하세요(예: 보호선)", label_visibility="collapsed").strip()
+        rows = [t for t in h["terms"] if not q or q in t[0] or q in t[1] or q in t[2]]
+        if not rows:
+            st.caption("일치하는 항목이 없어요. 다른 단어로 검색해 보세요.")
+        for name, mean, how in rows:
+            st.markdown(f"- **{name}** — {mean}" + (f"  \n  ↳ {how}" if how else ""))
+        if h.get("note"):
+            st.info(h["note"])
 
 
 def main():
@@ -3407,6 +3431,7 @@ def main():
     pages = {"내 자산": lambda: tab_assets(rules), "주간 브리핑": lambda: tab_brief(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
              "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
+    page_help(page)
     pages[page]()  # 고른 화면만 계산해서 빠르다
     with st.sidebar:
         if st.button("시세 새로고침"):

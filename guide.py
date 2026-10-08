@@ -16,6 +16,7 @@ def rows(url=""):
     add(s, "로그인", "앱 비밀번호를 입력해요. 비밀번호는 Streamlit Secrets의 APP_PASSWORD에 있고, 이 시트에는 적지 않았어요.")
     add(s, "잠든 앱 깨우기", "한동안 안 쓰면 앱이 잠들 수 있어요. '다시 깨우기' 같은 버튼이 보이면 한 번 누르고 30초~1분 기다리세요. 데이터는 이 시트에 있어서 사라지지 않아요.")
     add(s, "알림", "아직 자동 알림은 없어요. 알림이 오지 않으니 정해둔 시간에 직접 열어서 확인해요.")
+    add(s, "이 화면 설명", "각 화면 맨 위의 '📖 이 화면 설명'을 펼치면 그 화면이 무엇을 하는지, 보는 순서, 항목별 뜻이 나와요. 궁금한 용어는 검색창에 단어를 넣어 찾을 수 있어요. 처음 쓰는 화면은 꼭 한 번 펼쳐 보세요.")
     add(s, "화면 이동", "맨 위의 화면 이름(내 자산, 목표·성과, 종목 발굴 …)을 눌러 이동해요. 고른 화면만 계산해서 빨라요. 앱을 처음 열 때 시세를 한꺼번에 가져오느라 몇 초 걸릴 수 있고, 시세는 15분 동안 저장해요.")
 
     s = "2. 이 시트의 탭 (앱의 저장소)"
@@ -77,7 +78,7 @@ def rows(url=""):
 
     s = "6. 앱 코드를 고칠 때 반영 순서"
     add(s, "순서", "① 새 파일을 GitHub 저장소 맨 위(폴더 없이)에 Add file > Upload files로 올리고 Commit changes ② 앱 오른쪽 아래 Manage app > ⋮ > Reboot app ③ 1~3분 뒤 새로고침")
-    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, guide.py, requirements.txt (내 PC에서만 쓰는 local_collector.py는 올려도 되지만 collector_config.json은 절대 올리지 마세요)")
+    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, helptext.py, guide.py, requirements.txt (내 PC에서만 쓰는 local_collector.py는 올려도 되지만 collector_config.json은 절대 올리지 마세요)")
     add(s, "파일 버전이 안 맞으면", "앱이 어느 파일이 예전 버전인지 알려줘요. 그 파일을 최신으로 올리고 Reboot 하세요.")
 
     s = "7. 문제가 생기면"
