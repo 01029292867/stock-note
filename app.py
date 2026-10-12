@@ -43,7 +43,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정5(파동 분석 기간 선택)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-12 수정6(KRX 막힘 대체)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -771,9 +771,18 @@ def caps_cached():
 
 
 def listing_cached():
-    """종목 목록. KRX가 막혀서 시가총액·거래대금이 비어 오면 네이버 금융 시가총액 순위로 채운다(못 채우면 이유를 cap_note에 남긴다)."""
-    df = listing_raw_cached()
+    """종목 목록. KRX에 접속하지 못하면 네이버 금융의 시가총액 상위 600종목으로 대신하고,
+    KRX 목록에 시가총액·거래대금이 비어 오면 네이버 순위로 채운다(못 채우면 이유를 cap_note에 남긴다)."""
     st.session_state["cap_note"] = ""
+    try:
+        df = listing_raw_cached()
+    except Exception as e_krx:
+        try:
+            top = caps_cached()
+        except Exception as e_nv:
+            raise RuntimeError(f"{e_krx} / 네이버 금융 시가총액 순위도 실패: {e_nv}")
+        st.session_state["cap_note"] = "KRX 종목 목록에 접속하지 못해서 **네이버 금융의 시가총액 상위 600종목**을 대신 썼어요(그보다 작은 종목은 빠져요)."
+        return discover.normalize_listing(top[["Code", "Name", "Marcap", "Amount", "Close"]].copy())
     if ("Marcap" not in df.columns) or df["Marcap"].isna().mean() > 0.9:
         try:
             df = discover.fill_from_naver(df, top=caps_cached())
