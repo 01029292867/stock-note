@@ -43,7 +43,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정9(안정 종목군 검증)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-12 수정10(파동 규칙 선택)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -1200,10 +1200,19 @@ WAVE_WINS = {250: "1년(250일)", 180: "9개월(180일)", 120: "6개월(120일)"
 def wave_profile(close):
     """분석 기간 설정(기본 6개월)에 맞춰 파동을 분석한다."""
     import wave
-    return wave.profile(close, window=int(st.session_state.get("wave_win", 120)))
+    return wave.profile(close, window=int(st.session_state.get("wave_win", 120)), rule=st.session_state.get("wave_rule", "자동"))
+
+
+def wave_rule_params(pf):
+    """프로필에 적용된 규칙의 백테스트 매개변수."""
+    import wave
+    return dict(wave.RULE_PARAMS[pf["rule"]])
 
 
 def wave_win_picker(key_suffix=""):
+    st.radio("파동 규칙", ["자동", "기본", "좁은 폭"], index=["자동", "기본", "좁은 폭"].index(st.session_state.get("wave_rule", "자동")), horizontal=True, key="wave_rule",
+             help="자동: 연 변동성 35% 이하인 안정 종목은 '좁은 폭'(60일 구간, 손절 3%, 최소 폭 3%, 30일 정리), 그보다 흔들리는 종목은 '기본'(120일 구간, 손절 5%, 최소 폭 6%, 60일 정리)을 써요. "
+                  "가설 실험실의 안정 종목군 검증에서 변동이 작은 종목에는 좁은 폭 규칙이 더 확실하게 플러스였어요(5년 기준 연 환산 +8.5%p).")
     st.radio("파동 분석 기간", list(WAVE_WINS), index=list(WAVE_WINS).index(int(st.session_state.get("wave_win", 120))), format_func=lambda x: WAVE_WINS[x], horizontal=True, key="wave_win",
              help="추세와 파동을 몇 개월치 가격으로 볼지예요. 1년으로 보면 그 사이 한 방향으로 올랐던 종목은 추세형으로 나오고, 최근 몇 달만 박스권이던 종목은 파동형으로 안 나와요. 최근 박스권을 찾으려면 6개월이 맞아요.")
 
@@ -1747,10 +1756,10 @@ def report_wave(code, name, price, df, card, held):
     k[2].metric("파동 횟수(연)", f"{pf['per_year']:.1f}회", help=f"최근 1년 동안 {pf['thr']:.0f}% 이상 움직인 오르내림의 횟수예요.")
     k[3].metric("평균 상승 파동", "-" if pf["amp_up"] != pf["amp_up"] else f"+{pf['amp_up']:.1f}%", help="저점에서 고점까지 오른 폭의 중간값이에요. 왕복 비용(약 0.3%)을 뺀 뒤에도 충분히 남을 만한 폭인지 보세요.")
     k[4].metric("평균 주기", "-" if pf["period"] != pf["period"] else f"{pf['period']:.0f}일", help="저점과 고점 사이에 걸리는 거래일의 중간값이에요.")
-    k[5].metric("지금 위치", f"{pf['pos']:.0f}%", pf["state"], delta_color="off", help="최근 120일 가격 범위에서 지금 가격의 위치예요(0이 최저, 100이 최고). 25% 이하면 진입 구간, 75% 이상이면 매도 구간이에요.")
+    k[5].metric("지금 위치", f"{pf['pos']:.0f}%", pf["state"], delta_color="off", help="규칙이 보는 구간(좁은 폭은 최근 60일, 기본은 120일)의 가격 범위에서 지금 가격의 위치예요(0이 최저, 100이 최고). 25% 이하면 진입 구간, 75% 이상이면 매도 구간이에요.")
     wave_like = wave.is_wave(pf)
     if wave_like:
-        st.success(f"이 종목은 **파동형**으로 보여요(점수 {pf['score']:.0f}, 추세 {pf['trend']:+.0f}%/년). 최근 120일 박스권은 **{pf['L']:,.0f}원 ~ {pf['U']:,.0f}원**이고 지금 위치는 {pf['pos']:.0f}%({pf['state']})예요.")
+        st.success(f"이 종목은 **파동형**으로 보여요(점수 {pf['score']:.0f}, 추세 {pf['trend']:+.0f}%/년). 이 규칙({pf['rule']})이 보는 박스권은 **{pf['L']:,.0f}원 ~ {pf['U']:,.0f}원**이고 지금 위치는 {pf['pos']:.0f}%({pf['state']})예요.")
     elif abs(pf["trend"]) > 20:
         st.info(f"이 종목은 **한 방향으로 움직이는 추세형**이에요(연 {pf['trend']:+.0f}%). 박스권 매매보다 추세를 따르는 판단이 맞을 수 있어요.")
     else:
@@ -1762,9 +1771,9 @@ def report_wave(code, name, price, df, card, held):
         worst = min(pf["parts"], key=lambda t: t[2])
         st.write(f"점수가 가장 낮은 항목은 **{worst[0]}**({worst[1]})예요. 파동형 기준은 파동 점수 60 이상이면서 추세가 연 ±20% 이내예요(지금 점수 {pf['score']:.0f}, 추세 {pf['trend']:+.0f}%).")
     z = pd.DataFrame([
-        {"구간": "진입 구간(이하)", "가격(원)": pf["buy_hi"], "현재가 대비(%)": (pf["buy_hi"] / price - 1) * 100, "뜻": "최근 120일 가격의 하위 20%선이에요. 이 아래에서 사요."},
-        {"구간": "매도 구간(이상)", "가격(원)": pf["sell_lo"], "현재가 대비(%)": (pf["sell_lo"] / price - 1) * 100, "뜻": "최근 120일 가격의 상위 80%선이에요. 이 위에서 정리해요."},
-        {"구간": "무효가격(박스권 이탈)", "가격(원)": pf["invalid"], "현재가 대비(%)": (pf["invalid"] / price - 1) * 100, "뜻": "120일 최저가보다 3% 아래예요. 여기 아래로 내려가면 박스권이 깨진 것으로 보고 정리를 점검해요."}])
+        {"구간": "진입 구간(이하)", "가격(원)": pf["buy_hi"], "현재가 대비(%)": (pf["buy_hi"] / price - 1) * 100, "뜻": f"'{pf['rule']}' 규칙 구간 가격의 하위 20%선이에요. 이 아래에서 사요."},
+        {"구간": "매도 구간(이상)", "가격(원)": pf["sell_lo"], "현재가 대비(%)": (pf["sell_lo"] / price - 1) * 100, "뜻": f"'{pf['rule']}' 규칙 구간 가격의 상위 80%선이에요. 이 위에서 정리해요."},
+        {"구간": "무효가격(박스권 이탈)", "가격(원)": pf["invalid"], "현재가 대비(%)": (pf["invalid"] / price - 1) * 100, "뜻": f"진입 구간 가격보다 {pf['stop_gap'] * 100:g}% 아래예요(규칙의 손절 기준). 여기 아래로 내려가면 박스권이 깨진 것으로 보고 정리를 점검해요."}])
     st.dataframe(z, width="stretch", hide_index=True, column_config={"가격(원)": st.column_config.NumberColumn(format="%,d"), "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
     st.write(f"진입 구간에서 사서 매도 구간에서 팔면 **한 번에 약 {pf['gain']:+.1f}%**(왕복 비용 0.3% 반영)예요. 구간 폭({pf['gain_band']:+.1f}%)과 실제 상승 파동 중간값 중 **작은 값**으로 보수적으로 잡았어요. "
              f"이 종목의 연 변동성은 {pf['vol']:.0f}%예요.")
@@ -1773,9 +1782,9 @@ def report_wave(code, name, price, df, card, held):
     ldf = pd.DataFrame([{"가격": pf["buy_hi"], "구분": "진입 구간"}, {"가격": pf["sell_lo"], "구분": "매도 구간"}, {"가격": pf["invalid"], "구분": "무효가격"}])
     rules_ = alt.Chart(ldf).mark_rule(strokeDash=[5, 4]).encode(y="가격:Q", color=alt.Color("구분:N", scale=alt.Scale(domain=["진입 구간", "매도 구간", "무효가격"], range=["#0F6B63", "#D93A33", "#7A7F87"])))
     st.altair_chart(alt.layer(base, rules_).properties(height=240), width="stretch")
-    tr = wave.backtest(close)
+    tr = wave.backtest(close, **wave_rule_params(pf))
     sx = wave.stats(tr, close)
-    st.markdown("**과거에 이 규칙을 썼다면?** (최근 120일 하단 20%선 이하에서 다음 날 종가에 사서, 상단 80%선에서 팔고, 진입가보다 5% 더 내려가면 손절, 60일이 지나면 정리 — 비용 0.3% 반영)")
+    st.markdown(f"**과거에 이 규칙을 썼다면?** — **{pf['rule']} 규칙**: {wave.rule_text(pf['rule'])}. 신호 다음 날 종가에 사요.")
     if sx["n"] == 0:
         st.info("이 종목에서는 규칙에 맞는 거래가 없었어요.")
     else:
@@ -1793,7 +1802,7 @@ def report_wave(code, name, price, df, card, held):
     sh = wave_size(price, pf["invalid"])
     if sh is not None:
         st.write(f"박스권을 이탈(무효가격)했을 때 총자산의 {st.session_state.risk.get('per_trade', 1.0):g}%만 잃도록 계산하면 지금 **최대 {sh:,}주**(약 {sh * price / 1e4:,.0f}만원)까지 살 수 있어요.")
-    if st.button("파동 구간으로 매매 계획 만들기", key=f"wv_plan_{code}", help="무효가격은 박스권 이탈 가격, 1차 목표는 매도 구간 하단(70% 정리), 2차 목표는 120일 고점(30% 정리)으로 만들어요."):
+    if st.button("파동 구간으로 매매 계획 만들기", key=f"wv_plan_{code}", help="무효가격은 규칙의 손절 가격, 1차 목표는 매도 구간 하단(70% 정리), 2차 목표는 규칙 구간의 고점(30% 정리)으로 만들어요."):
         pl = st.session_state.plans
         if len(pl[(pl["종목코드"] == code) & (pl["상태"] == "진행")]):
             st.warning("이 종목은 이미 진행 중인 계획이 있어요. 매매 계획 화면에서 확인하세요.")
@@ -2428,16 +2437,16 @@ def run_wave_scan(cand, include_own, pool=None):
         pf = wave_profile(df["Close"]) if len(df) else None
         if pf is None:
             continue
-        sx = wave.stats(wave.backtest(df["Close"]), df["Close"])
+        sx = wave.stats(wave.backtest(df["Close"], **wave_rule_params(pf)), df["Close"])
         meta = st.session_state.get("disc_meta", {}).get(c, {})
-        rows.append({"종목코드": c, "종목명": items[c][0], "구분": items[c][1], "재무 통과": "✓" if c in passed else "-", "업종": meta.get("업종", "-"), "파동 점수": pf["score"], "추세(연%)": pf["trend"], "파동 횟수(연)": pf["per_year"],
+        rows.append({"종목코드": c, "종목명": items[c][0], "구분": items[c][1], "재무 통과": "✓" if c in passed else "-", "업종": meta.get("업종", "-"), "규칙": pf["rule"], "파동 점수": pf["score"], "추세(연%)": pf["trend"], "파동 횟수(연)": pf["per_year"],
                      "상승 파동(%)": pf["amp_up"], "변동성(연%)": pf["vol"], "주기(일)": pf["period"], "지금 위치(%)": pf["pos"], "상태": pf["state"], "진입 구간(원 이하)": pf["buy_hi"], "매도 목표(원 이상)": pf["sell_lo"],
                      "무효가격(원)": pf["invalid"], "기대 수익폭(%)": pf["gain"], "최대 매수(주)": wave_size(pf["price"], pf["invalid"]) or np.nan,
                      "과거 거래": sx.get("n", 0), "승률(%)": sx.get("win", np.nan), "건당 기대값(%)": sx.get("exp", np.nan),
                      "손절 비율(%)": (sx["stops"] / sx["n"] * 100) if sx.get("n") else np.nan, "점검가": pf["price"]})
     bar.progress(1.0, text="완료")
     df_ = pd.DataFrame(rows)
-    st.session_state.disc_wave = {"rows": df_, "ts": dt.datetime.now().strftime("%m-%d %H:%M"), "win": int(st.session_state.get("wave_win", 120))}
+    st.session_state.disc_wave = {"rows": df_, "ts": dt.datetime.now().strftime("%m-%d %H:%M"), "win": int(st.session_state.get("wave_win", 120)), "rule": st.session_state.get("wave_rule", "자동")}
     if len(df_):
         today = dt.date.today().isoformat()
         out = []
@@ -2451,7 +2460,7 @@ def run_wave_scan(cand, include_own, pool=None):
 
 def render_wave_scan(res_w):
     df = res_w["rows"]
-    st.caption(f"{res_w['ts']}에 찾은 결과예요(최근 {WAVE_WINS.get(int(res_w.get('win', 250)), '1년')} 가격 기준). 분석 기간을 바꿨다면 '파동형 후보 찾기'를 다시 눌러야 반영돼요.")
+    st.caption(f"{res_w['ts']}에 찾은 결과예요(최근 {WAVE_WINS.get(int(res_w.get('win', 250)), '1년')} 가격 기준, 규칙: {res_w.get('rule', '자동')}). 분석 기간이나 규칙을 바꿨다면 '파동형 후보 찾기'를 다시 눌러야 반영돼요. 지금 **진입 구간**에 있는 종목이 맨 위에 와요.")
     if df.empty:
         st.info("파동을 분석할 수 있는 종목이 없어요.")
         return
@@ -2478,7 +2487,7 @@ def render_wave_scan(res_w):
         v = v[v["상태"] == "진입 구간"]
     if only_pos:
         v = v[(v["과거 거래"] >= 10) & (v["건당 기대값(%)"] > 0)]
-    v = v.sort_values(["파동 점수"], ascending=False)
+    v = v.assign(_k=(v["상태"] != "진입 구간")).sort_values(["_k", "파동 점수"], ascending=[True, False]).drop(columns="_k")     # 지금 진입 구간에 있는 종목을 맨 위로
     k = st.columns(4)
     k[0].metric("파동형 종목", f"{len(v)}개", help="선택한 조건을 만족하는 종목 수예요.")
     k[1].metric("진입 구간", f"{int((v['상태'] == '진입 구간').sum())}개", help="지금 위치가 박스권 하단(25% 이하)이라 사는 쪽을 볼 만한 종목이에요.")
@@ -2487,7 +2496,7 @@ def render_wave_scan(res_w):
     if v.empty:
         st.info("조건에 맞는 종목이 없어요. 최소 파동 점수나 추세 한도를 완화해 보세요.")
     else:
-        cols = ["종목명", "구분", "재무 통과", "업종", "파동 점수", "추세(연%)", "변동성(연%)", "파동 횟수(연)", "상승 파동(%)", "주기(일)", "지금 위치(%)", "상태", "진입 구간(원 이하)", "매도 목표(원 이상)", "무효가격(원)",
+        cols = ["종목명", "구분", "재무 통과", "업종", "규칙", "파동 점수", "추세(연%)", "변동성(연%)", "파동 횟수(연)", "상승 파동(%)", "주기(일)", "지금 위치(%)", "상태", "진입 구간(원 이하)", "매도 목표(원 이상)", "무효가격(원)",
                 "기대 수익폭(%)", "최대 매수(주)", "과거 거래", "승률(%)", "건당 기대값(%)", "손절 비율(%)"]
         st.dataframe(v[cols], width="stretch", hide_index=True, column_config={
             "파동 점수": st.column_config.NumberColumn(format="%.0f"), "추세(연%)": st.column_config.NumberColumn(format="%+.0f"), "변동성(연%)": st.column_config.NumberColumn(format="%.0f"), "파동 횟수(연)": st.column_config.NumberColumn(format="%.1f"),
@@ -4063,7 +4072,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 5, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "discover": 2}
 
 
 def check_versions():

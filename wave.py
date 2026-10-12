@@ -1,7 +1,7 @@
 """파동(박스권) 분석: 오르내림을 반복하는 종목을 숫자로 찾고, 진입·매도 구간과 무효가격(박스권 이탈)을 계산한다.
 과거에 이 규칙을 썼다면 어땠는지(백테스트)와, 파동형으로 보이는 종목에서 정말 더 잘 통했는지(전 종목 검증)도 같이 본다.
 박스권은 언제든 깨질 수 있고(추세 전환), 비용(약 0.3%)보다 파동 폭이 충분히 커야 남는다. 과거 결과가 미래를 보장하지 않는다."""
-VERSION = 5  # 5: 변동성 그룹별 검증(vol_study) / 4: 손절을 '진입가 기준'으로 바로잡음(전에는 구간 하단 기준이라 이미 그 아래서 산 거래가 바로 손절됨) / 3: 변동성·파동 폭 상한 / 2: 점수 구성(parts)
+VERSION = 6  # 6: 규칙 선택(기본/좁은 폭/자동) / 5: 변동성 그룹별 검증(vol_study) / 4: 손절을 '진입가 기준'으로 바로잡음(전에는 구간 하단 기준이라 이미 그 아래서 산 거래가 바로 손절됨) / 3: 변동성·파동 폭 상한 / 2: 점수 구성(parts)
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,18 @@ import levels
 
 COST = 0.003
 STOP_GAP = 0.05          # 진입가보다 이만큼 내려가면 박스권이 깨진 것으로 보고 정리한다
+
+# 파동 규칙. 변동이 작은 종목에는 폭이 좁은 규칙이 맞았다(가설 실험실의 안정 종목군 검증: 5년 기준 연 환산 +8.5%p, 신뢰구간 +6.3~+10.7).
+RULE_PARAMS = {"기본": {"band_win": 120, "lo_q": 0.2, "hi_q": 0.8, "stop_gap": STOP_GAP, "max_hold": 60, "min_gain": 0.06},
+               "좁은 폭": {"band_win": 60, "lo_q": 0.2, "hi_q": 0.8, "stop_gap": 0.03, "max_hold": 30, "min_gain": 0.03}}
+RULE_CHOICES = ["자동", "기본", "좁은 폭"]
+AUTO_VOL = 35.0          # 자동: 연 변동성이 이 값 이하면 좁은 폭 규칙
+
+
+def rule_text(rule):
+    r = RULE_PARAMS[rule]
+    return (f"최근 {r['band_win']}일 가격의 하위 {int(r['lo_q'] * 100)}%선 이하에서 사서, 상위 {int(r['hi_q'] * 100)}%선에서 팔고, "
+            f"진입가보다 {r['stop_gap'] * 100:g}% 내려가면 손절, {r['max_hold']}일이 지나면 정리(최소 폭 {r['min_gain'] * 100:g}%, 비용 0.3% 반영)")
 
 
 def is_wave(pf):
@@ -23,8 +35,8 @@ def _cv(x):
     return float(np.std(x) / abs(np.mean(x))) if len(x) >= 2 and np.mean(x) != 0 else np.nan
 
 
-def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
-    """종목의 파동 성격. 반환 dict 또는 None(자료가 짧을 때)."""
+def profile(close, window=250, rule="자동", cost=COST):
+    """종목의 파동 성격. rule: '자동'(연 변동성 35% 이하는 좁은 폭, 아니면 기본) / '기본' / '좁은 폭'. 반환 dict 또는 None(자료가 짧을 때)."""
     c = pd.Series(close).dropna().astype(float)
     if len(c) < 130:
         return None
@@ -48,8 +60,10 @@ def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
         (ups if a["type"] == "L" else downs).append(chg)
     per_year = (len(ups) + len(downs)) / (len(w) / 252)
     amp = float(np.median(ups)) if ups else np.nan
-    b = c.iloc[-band_win:]
-    L, U, lo, hi = float(b.quantile(lo_q)), float(b.quantile(hi_q)), float(b.min()), float(b.max())
+    used = ("좁은 폭" if vol_ann <= AUTO_VOL else "기본") if rule == "자동" else rule
+    rp = RULE_PARAMS[used]
+    b = c.iloc[-rp["band_win"]:]
+    L, U, lo, hi = float(b.quantile(rp["lo_q"])), float(b.quantile(rp["hi_q"])), float(b.min()), float(b.max())
     price = float(c.iloc[-1])
     pos = float((price - lo) / (hi - lo) * 100) if hi > lo else np.nan
     gain_band = (U / L - 1 - cost) * 100
@@ -75,7 +89,7 @@ def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
     return {"score": score, "trend": trend, "r2": r2, "thr": thr * 100, "n_up": len(ups), "n_down": len(downs), "per_year": float(per_year),
             "amp_up": amp, "amp_down": float(np.median(downs)) if downs else np.nan, "period": float(np.median(gaps)) if gaps else np.nan,
             "L": L, "U": U, "lo": lo, "hi": hi, "pos": pos, "gain": float(gain), "gain_band": float(gain_band), "vol": float(vol_ann), "price": price, "state": state,
-            "invalid": float(lo * 0.97), "buy_hi": L, "sell_lo": U, "parts": parts}
+            "invalid": float(min(L, price) * (1 - rp["stop_gap"])), "rule": used, "stop_gap": rp["stop_gap"], "buy_hi": L, "sell_lo": U, "parts": parts}
 
 
 def backtest(close, band_win=120, lo_q=0.2, hi_q=0.8, stop_gap=STOP_GAP, max_hold=60, min_gain=0.06, cost=COST, start=None):
