@@ -24,6 +24,8 @@ DEFAULT_FILTERS = {
     "pbr": {"on": False, "v": 1.5},       # PBR 이하
     "growth": {"on": False},              # 영업이익이 전년보다 증가
     "maxn": 400,                          # 2단계에서 조회할 최대 종목 수(시가총액 순)
+    # 소형주(소액 후보): 시가총액이 cap 기준보다 작아도 더 엄격한 재무 기준을 통과하면 '소액 후보'로 포함한다
+    "small": {"on": False, "cap_min": 0.3, "loss": 0, "debt": 100.0, "roe": 10.0, "growth": True, "pos": 2.0},
 }
 
 

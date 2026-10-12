@@ -1,7 +1,7 @@
 """종합 판단 카드: 보수적인 상승 여력과 하락 위험, 손익비, 손익분기 승률, 내 평단 기준 시나리오.
 예측이 아니라 '내가 가진 근거로 잡은 최악과 최선 사이의 지도'다. 확률은 검증되기 전까지 모른다고 보고,
 대신 '이 손익비라면 몇 % 이상 맞혀야 본전인가(필요 승률)'를 보여준다."""
-VERSION = 1
+VERSION = 2  # 2: 기간별(단기·중기) 손익비
 
 import numpy as np
 
@@ -56,6 +56,17 @@ def build_card(price, avg, qty, tag, ind, lv, cons, flow, safety_counts, rules, 
     ratio = (up / down_pct) if (up is not None and down_pct) else None
     ratio_short = (up / abs(short["pct"])) if (up is not None and short and short["pct"]) else None
     need = (down_pct / (up + down_pct) * 100) if (up is not None and down_pct and (up + down_pct) > 0) else None
+    # ---- 기간을 맞춘 손익비: 단기(가까운 저항선 vs 가까운 지지선), 중기(컨센서스 절반 vs 중기 하락)
+    def _pair(u, d):
+        if u is None or d is None or d <= 0:
+            return None
+        r = u / d
+        return {"up": u, "down": d, "ratio": r, "need": d / (u + d) * 100 if (u + d) > 0 else None, "grade": grade(r)}
+    res_u = next((x for x in ups if x["label"] == "가까운 저항선"), None)
+    con_u = next((x for x in ups if x["label"].startswith("컨센서스")), None)
+    pair_short = _pair(res_u["pct"] if res_u and res_u["pct"] >= 0 else None, abs(short["pct"]) if short else None)
+    mid_down = abs(mid["pct"]) if mid else (abs(short["pct"]) if short else None)
+    pair_mid = _pair(con_u["pct"] if con_u else None, mid_down)
     # ---- 시나리오 표 (내 평단 기준)
     scen = []
     for name, p in (("상승(보수적)", up_price), ("단기 하락", short["price"] if short else None), ("중기 하락", mid["price"] if mid else None),
@@ -87,4 +98,4 @@ def build_card(price, avg, qty, tag, ind, lv, cons, flow, safety_counts, rules, 
     return {"price": price, "avg": avg, "qty": qty, "tag": tag, "up": up, "up_price": up_price, "ups": ups, "downs": downs,
             "short": short, "mid": mid, "extreme": extreme, "base": base, "ratio": ratio, "ratio_short": ratio_short,
             "grade": grade(ratio), "need_win": need, "scen": scen, "warns": warns, "have": have, "n_have": sum(have.values()),
-            "invalid": invalid, "ret": ret}
+            "invalid": invalid, "ret": ret, "pair_short": pair_short, "pair_mid": pair_mid}

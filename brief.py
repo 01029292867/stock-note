@@ -1,6 +1,6 @@
 """주간 브리핑: 흩어진 점수·신호·계획·기록을 모아서 '이번 주에 먼저 볼 것'을 우선순위로 정리한다.
 판단은 사람이 한다. 여기서는 어디부터 볼지, 무엇이 밀려 있는지만 알려준다."""
-VERSION = 1
+VERSION = 2  # 2: 파동(박스권) 안내를 extra로 받는다
 
 import numpy as np
 
@@ -13,7 +13,7 @@ def _num(x):
     return None if x is None or (isinstance(x, float) and np.isnan(x)) else x
 
 
-def build(holds, cands, hygiene, port, score_drop=8.0, low_score=35.0):
+def build(holds, cands, hygiene, port, score_drop=8.0, low_score=35.0, extra=None):
     """holds: 보유 종목 목록(dict), cands: 매수 후보 목록(dict), hygiene: 기록 상태(dict), port: 포트폴리오 요약(dict)."""
     actions = []
     for h in holds:
@@ -59,6 +59,8 @@ def build(holds, cands, hygiene, port, score_drop=8.0, low_score=35.0):
     # 포트폴리오 점검
     if port.get("top_weight") is not None and port.get("max_pos") and port["top_weight"] > port["max_pos"]:
         actions.append({"우선순위": 2, "구분": P_LABEL[2], "종목": port["top_name"], "내용": f"한 종목 비중이 {port['top_weight']:.0f}%로 정해둔 최대 비중({port['max_pos']:.0f}%)을 넘었어요", "볼 곳": "내 자산", "비중(%)": port["top_weight"]})
+    for x in (extra or []):                       # 파동 매도·진입 구간 안내 등 화면에서 만든 항목
+        actions.append({"우선순위": x["우선순위"], "구분": P_LABEL[x["우선순위"]], "종목": x["종목"], "내용": x["내용"], "볼 곳": x.get("볼 곳", "종목 리포트"), "비중(%)": x.get("비중(%)", 0.0)})
     actions.sort(key=lambda x: (x["우선순위"], -x["비중(%)"]))
     good = [c for c in cands if c.get("score") is not None and c.get("n_avail", 0) >= 3 and c.get("score") >= 55
             and c.get("entry_verdict") in ("유리", "보통") and c.get("ratio") is not None]

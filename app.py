@@ -9,7 +9,41 @@ import time
 import altair as alt
 import numpy as np
 import pandas as pd
+import re as _re
+
 import streamlit as st
+
+# 마크다운에서 "**배분(%)**은"처럼 닫는 ** 앞이 괄호·% 같은 기호이고 바로 뒤에 한글이 오면 굵은 글씨가 깨져서 별표가 그대로 보인다.
+# 그 자리에 아주 얇은 공백(U+200A)을 넣어 굵은 글씨가 제대로 닫히게 한다.
+_BOLD_FIX = _re.compile(r"(\*\*[^*\n]{1,80}?[)\]}%\"'”’」』]\*\*)(?=[가-힣A-Za-z0-9])")
+
+
+def _mdfix(x):
+    return _BOLD_FIX.sub(lambda m: m.group(1) + "\u200a", x) if isinstance(x, str) else x
+
+
+def _wrap_md(name):
+    orig = getattr(st, name)
+    if getattr(orig, "_mdfix", False):
+        return
+
+    def inner(body=None, *args, **kw):
+        return orig(_mdfix(body), *args, **kw)
+    inner._mdfix = True
+    setattr(st, name, inner)
+
+
+for _n in ("markdown", "caption", "info", "warning", "success", "error"):
+    _wrap_md(_n)
+
+_orig_write = st.write
+if not getattr(_orig_write, "_mdfix", False):
+    def _write(*args, **kw):
+        return _orig_write(*[_mdfix(x) for x in args], **kw)
+    _write._mdfix = True
+    st.write = _write
+
+APP_BUILD = "2026-10-08 파동·진입스캔"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -40,6 +74,8 @@ CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
 WATCH_COLS = ["종목코드", "종목명"]
+DISCRES_COLS = ["점검일", "종목코드", "종목명", "점검가", "안전", "미달 항목", "확인 불가", "목표가 여력(%)", "진입 판정", "진입 손익비", "무효가격(원)", "최대 매수(주)",
+                "기다릴 가격(원)", "외국인 5일(억)", "기관 5일(억)", "흐름", "52주 위치(%)", "RSI", "3개월(%)", "재무출처", "구분", "업종", "규모", "진입 매력도", "권장 최대 비중(%)"]
 SCORELOG_COLS = ["날짜", "종목코드", "종합점수", "가격", "수급", "재무·안전", "컨센서스", "진입 구조", "근거수", "종가"]
 HYP_COLS = ["실행일", "가설", "종목수", "기간(년)", "보유(일)", "표본", "승률차(%p)", "평균초과수익(%)", "CI하한", "CI상한", "일관", "등급"]
 FLOWLOG_COLS = ["날짜", "종목코드", "기관(주)", "외국인(주)", "개인(주)", "종가", "외국인보유율"]
@@ -979,14 +1015,14 @@ def evidence_row(h):
     return str(r["등급"]), mean
 
 
-def score_for(code, tag, avg, qty, since=None, card=None):
-    """종합 점수. 시세가 없으면 None."""
+def score_for(code, tag, avg, qty, since=None, card=None, fin=None):
+    """종합 점수. 시세가 없으면 None. fin=(m, items)을 주면 안전 점검 대신 그 재무 자료를 쓴다(종목 발굴 스캔용)."""
     ind = sg.indicators(hist_kr(code), since or None)
     if ind is None:
         return None
     if card is None:
         card = card_for(code, tag, avg, qty, since)
-    sres = safety_for(code)
+    sres = fin if fin is not None else safety_for(code)
     m, items = sres if sres else (None, None)
     return score.compute(ind, st.session_state.get("flow_sum", {}).get(code), m, items, cons_for(code), cons_change(code), card,
                          st.session_state.weights, evidence_row=evidence_row)
@@ -1033,7 +1069,123 @@ def render_score(sc, name):
                     "- 점수가 높다고 사라는 뜻도, 낮다고 팔라는 뜻도 아니에요.")
 
 
+
+# ---------- 종목 발굴 상세 점검 결과 (구글 시트 '발굴결과' 탭) ----------
+def load_disc_results():
+    if "disc_hist" in st.session_state:
+        return
+    df, err = pd.DataFrame(columns=DISCRES_COLS), None
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = store.read("발굴결과", DISCRES_COLS)
+        except Exception as e:
+            err = str(e)  # 읽지 못한 채로 저장하면 이전 결과를 덮어쓰므로 저장을 막는다
+    for c in ("점검가", "목표가 여력(%)", "진입 손익비", "무효가격(원)", "최대 매수(주)", "기다릴 가격(원)", "외국인 5일(억)", "기관 5일(억)", "52주 위치(%)", "RSI", "3개월(%)", "진입 매력도", "권장 최대 비중(%)"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["구분"] = df["구분"].replace("", "상세 점검").fillna("상세 점검")
+    df["종목코드"] = df["종목코드"].astype(str).str.zfill(6)
+    df["점검일"] = df["점검일"].astype(str).str.slice(0, 10)
+    st.session_state.disc_hist, st.session_state.disc_hist_err = df, err
+
+
+def save_disc_results(rows):
+    """상세 점검 결과를 시트에 저장한다(같은 날짜·종목은 새 값으로 바꿔요). 반환: (성공, 문구)"""
+    store = get_store()
+    if store is not None and (st.session_state.get("load_error") or st.session_state.get("disc_hist_err")):
+        return False, "구글 시트에서 이전 결과를 읽지 못한 상태라 저장을 막았어요."
+    if not rows:
+        return True, "저장할 결과가 없어요."
+    cur = st.session_state.disc_hist
+    new = pd.DataFrame(rows, columns=DISCRES_COLS)
+    keys = set(zip(new["점검일"], new["종목코드"], new["구분"]))
+    keep = cur[[(d, c, g) not in keys for d, c, g in zip(cur["점검일"].astype(str), cur["종목코드"], cur["구분"])]]
+    df = pd.concat([keep, new], ignore_index=True).tail(3000)
+    try:
+        if store is not None:
+            store.write("발굴결과", df)
+        st.session_state.disc_hist = df
+        return True, f"{len(new)}종목의 상세 점검 결과를 구글 시트('발굴결과' 탭)에 저장했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def detail_rows(codes, only_safe=False):
+    """상세 점검 표의 행(저장용 열 포함)을 만든다."""
+    rows = []
+    today = dt.date.today().isoformat()
+    for c in codes:
+        sres = safety_for(c)
+        df = hist_kr(c)
+        ind = sg.indicators(df)
+        if sres is None:
+            continue
+        items = sres[1]
+        cnt = safety.summarize(items)
+        if only_safe and cnt["fail"]:
+            continue
+        fd = st.session_state.fincache.get(c) or {}
+        rows.append({
+            "점검일": today, "종목코드": c, "종목명": st.session_state.disc_names.get(c, c), "점검가": float(df["Close"].iloc[-1]) if len(df) else np.nan,
+            "안전": safety.headline(items),
+            "미달 항목": ", ".join(i["label"] for i in items if i["status"] == "fail") or "-",
+            "확인 불가": ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-",
+            "목표가 여력(%)": (consensus.upside(cons_for(c)["target"], float(df["Close"].iloc[-1])) if (cons_for(c) or {}).get("has") and len(df) else np.nan),
+            **dict(zip(("진입 판정", "진입 손익비", "무효가격(원)", "최대 매수(주)", "기다릴 가격(원)"), _entry_cells(c, ind))),
+            "외국인 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("f5", np.nan),
+            "기관 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("i5", np.nan),
+            "흐름": sg.flow_of(ind)[0] if ind else "-", "52주 위치(%)": ind["pos"] if ind else np.nan,
+            "RSI": ind["rsi"] if ind else np.nan, "3개월(%)": ind["m3"] if ind else np.nan,
+            "재무출처": "네이버 금융" if fd.get("source") == "naver" else "DART",
+            "구분": "상세 점검", "업종": (st.session_state.get("disc_meta", {}).get(c) or {}).get("업종", "-"), "규모": (st.session_state.get("disc_meta", {}).get(c) or {}).get("규모", "-"),
+            "진입 매력도": (st.session_state.get("disc_meta", {}).get(c) or {}).get("점수", np.nan), "권장 최대 비중(%)": (st.session_state.get("disc_meta", {}).get(c) or {}).get("비중", np.nan)})
+    return rows
+
+
+def render_saved_detail(expanded):
+    """저장된 이전 상세 점검 결과를 보여준다. 점검한 날의 가격과 지금 가격을 비교해서 후보가 이후 어땠는지도 보여준다."""
+    h = st.session_state.get("disc_hist")
+    if h is None or h.empty:
+        return
+    dates = sorted(h["점검일"].unique(), reverse=True)
+    with st.expander(f"📌 저장된 상세 점검 결과 — 최근 {dates[0]} ({int((h['점검일'] == dates[0]).sum())}종목), 전체 {len(dates)}회", expanded=expanded):
+        st.caption("상세 점검을 하면 결과가 구글 시트의 '발굴결과' 탭에 자동으로 저장돼요. 새로고침하거나 앱이 다시 시작돼도 여기서 다시 볼 수 있어요.")
+        day = st.selectbox("점검한 날", dates, key="saved_day")
+        g = h[h["점검일"] == day].copy()
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(hist_kr, list(g["종목코드"])))
+        cur = []
+        for r in g.itertuples():
+            d = hist_kr(r.종목코드)
+            cur.append((float(d["Close"].iloc[-1]) / r.점검가 - 1) * 100 if (len(d) and r.점검가 == r.점검가 and r.점검가) else np.nan)
+        g["점검 후 변화(%)"] = cur
+        g = g.drop(columns=["점검일"])
+        st.dataframe(g, width="stretch", hide_index=True, column_config={
+            "점검가": st.column_config.NumberColumn(format="%,d"), "점검 후 변화(%)": st.column_config.NumberColumn(format="%+.1f", help="점검한 날의 가격 대비 지금 가격의 변화예요. 발굴한 후보가 이후 어땠는지 보는 자료예요."),
+            "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"), "RSI": st.column_config.NumberColumn(format="%.0f"), "3개월(%)": st.column_config.NumberColumn(format="%.1f"),
+            "외국인 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "기관 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
+            "진입 손익비": st.column_config.NumberColumn(format="%.2f"), "무효가격(원)": st.column_config.NumberColumn(format="%,d"),
+            "최대 매수(주)": st.column_config.NumberColumn(format="%,d"), "기다릴 가격(원)": st.column_config.NumberColumn(format="%,d")})
+        ok_ = g["점검 후 변화(%)"].dropna()
+        if len(ok_) >= 3 and day != dt.date.today().isoformat():
+            st.write(f"이 날 점검한 {len(g)}종목의 점검 후 평균 변화는 **{ok_.mean():+.1f}%**, 오른 종목은 {int((ok_ > 0).sum())}/{len(ok_)}개예요.")
+        st.caption("후보가 몇 종목 안 되면 평균은 우연일 수 있어요. 이 자료가 여러 번 쌓이면 '내 발굴 기준이 실제로 쓸 만했는지' 확인할 수 있어요.")
+
+
 # ---------- 계산 ----------
+def wave_cell(df):
+    """보유 종목 표의 '파동' 칸: 파동형(점수 60 이상, 추세 ±20% 이내)이면 지금 위치를 보여준다."""
+    import wave
+    try:
+        pf = wave.profile(df["Close"]) if len(df) else None
+    except Exception:
+        pf = None
+    if not pf or pf["score"] < 60 or abs(pf["trend"]) > 20:
+        return "-"
+    return f"{pf['state']} ({pf['pos']:.0f}%)"
+
+
 def build_positions(hold, rules):
     rows = []
     for r in hold.to_dict("records"):
@@ -1075,6 +1227,7 @@ def build_positions(hold, rules):
                 "지지선까지(%)": sup0["dist"] if sup0 else float("nan"),
                 "평소 되돌림(%)": lvl["depth_med"] if lvl else float("nan"),
                 "흐름": sg.flow_of(ind)[0] if ind else "시세 부족",
+                "파동": wave_cell(df),
                 "수급(5일)": flow_txt(fs),
                 "목표가 여력(%)": cups,
                 "안전": s_label,
@@ -1239,7 +1392,7 @@ def tab_assets(rules):
         c3.caption("수급(30분 저장)과 증권사 컨센서스(6시간 저장)는 네이버 증권 데이터를 읽어와요. 서버에서 접속이 막히면 표시되지 않아요. 목표가 여력은 평균 목표가가 현재가보다 몇 % 높은지예요.")
         for e in st.session_state.pop("flow_msg", []) or []:
             st.warning(f"수급을 못 가져왔어요 — {e}")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "지지선(원)", "지지선까지(%)", "평소 되돌림(%)", "흐름", "수급(5일)", "목표가 여력(%)", "종합점수", "근거", "안전", "판단", "신호"]]
+        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "지지선(원)", "지지선까지(%)", "평소 되돌림(%)", "흐름", "파동", "수급(5일)", "목표가 여력(%)", "종합점수", "근거", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -1256,6 +1409,7 @@ def tab_assets(rules):
                 "고점 대비(%)": st.column_config.NumberColumn(format="%.1f", help="최근 1년(또는 매수일 이후) 최고 종가 대비예요."),
                 "지지선(원)": st.column_config.NumberColumn(format="%,d", help="과거에 밀렸다가 반등한 가격대 중 현재가 바로 아래에 있는 곳이에요. 참고용이에요."),
                 "지지선까지(%)": st.column_config.NumberColumn(format="%.1f"),
+                "파동": st.column_config.TextColumn(help="오르내림을 반복하는 파동형 종목이면 최근 120일 가격 범위에서의 위치예요(진입 구간 25% 이하, 매도 구간 75% 이상). 파동형이 아니면 '-'예요."),
                 "종합점수": st.column_config.NumberColumn(format="%.0f", help="가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조를 모은 점수예요(50 중립). 이길 확률이 아니라 근거가 한 방향으로 모이는 정도예요. 근거 칸은 반영한 근거 수예요."),
                 "평소 되돌림(%)": st.column_config.NumberColumn(format="%.1f", help="이 종목이 과거에 고점에서 보통 이만큼 밀렸다가 반등했어요(중간값)."),
                 "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
@@ -1530,6 +1684,86 @@ def render_card(card, name):
             "내 평단 대비(%)": st.column_config.NumberColumn(format="%+.1f"), "내 손익 변화(원)": st.column_config.NumberColumn(format="%+,d"),
             "총자산 영향(%)": st.column_config.NumberColumn(format="%+.2f")})
     st.caption("예측이 아니라 지금 가진 근거로 잡은 보수적인 범위예요. 확률은 검증 전이라 모른다고 보고, 대신 '필요 승률'을 보여줘요. 내 판단 기록이 쌓이면 실제 승률과 비교해서 이 카드가 쓸 만한지 확인할 수 있어요. 투자 권유가 아니에요.")
+
+
+
+def wave_size(price, invalid):
+    """파동 진입 시 살 수 있는 최대 수량: 박스권을 이탈(무효가격)했을 때 총자산의 손실 한도만 잃고, 한 종목 최대 비중을 넘지 않게."""
+    total, risk = sizing_assets(), st.session_state.risk
+    if not total or not invalid or price <= invalid:
+        return None
+    by_loss = int(total * risk.get("per_trade", 1.0) / 100 // (price - invalid))
+    by_pos = int(total * risk.get("max_pos", 15.0) / 100 // price)
+    return max(min(by_loss, by_pos), 0)
+
+
+def report_wave(code, name, price, df, card, held):
+    import wave
+    st.subheader("🌊 파동(박스권) 분석 — 오르내림을 반복하는 종목인가")
+    st.caption("KT&G처럼 한 방향으로 크게 가지 않고 일정한 폭으로 오르내리는 종목은, 아래쪽에서 사서 위쪽에서 파는 식으로 소소한 수익을 반복할 수 있어요. 다만 **박스권이 깨지면(추세 전환) 손실이 날 수 있어서** 무효가격을 꼭 같이 봐요.")
+    close = df["Close"]
+    pf = wave.profile(close)
+    if pf is None:
+        st.info("가격 기록이 짧아서(약 6개월 미만) 파동을 분석하지 못했어요.")
+        return
+    k = st.columns(6)
+    k[0].metric("파동 점수", f"{pf['score']:.0f}", help="추세가 약하고, 오르내림이 자주·규칙적이고, 한 번 움직이는 폭이 큰 정도를 0~100으로 모은 점수예요. 60 이상이면 파동형, 낮으면 한 방향으로 가는 추세형이거나 폭이 작은 종목이에요.")
+    k[1].metric("추세(연 환산)", f"{pf['trend']:+.0f}%", help="최근 1년 가격을 직선으로 맞췄을 때의 연 환산 기울기예요. 0에 가까울수록 박스권이고, ±20%를 넘으면 한 방향으로 가는 중이에요.")
+    k[2].metric("파동 횟수(연)", f"{pf['per_year']:.1f}회", help=f"최근 1년 동안 {pf['thr']:.0f}% 이상 움직인 오르내림의 횟수예요.")
+    k[3].metric("평균 상승 파동", "-" if pf["amp_up"] != pf["amp_up"] else f"+{pf['amp_up']:.1f}%", help="저점에서 고점까지 오른 폭의 중간값이에요. 왕복 비용(약 0.3%)을 뺀 뒤에도 충분히 남을 만한 폭인지 보세요.")
+    k[4].metric("평균 주기", "-" if pf["period"] != pf["period"] else f"{pf['period']:.0f}일", help="저점과 고점 사이에 걸리는 거래일의 중간값이에요.")
+    k[5].metric("지금 위치", f"{pf['pos']:.0f}%", pf["state"], delta_color="off", help="최근 120일 가격 범위에서 지금 가격의 위치예요(0이 최저, 100이 최고). 25% 이하면 진입 구간, 75% 이상이면 매도 구간이에요.")
+    wave_like = pf["score"] >= 60 and abs(pf["trend"]) <= 20
+    if wave_like:
+        st.success(f"이 종목은 **파동형**으로 보여요(점수 {pf['score']:.0f}, 추세 {pf['trend']:+.0f}%/년). 최근 120일 박스권은 **{pf['L']:,.0f}원 ~ {pf['U']:,.0f}원**이고 지금 위치는 {pf['pos']:.0f}%({pf['state']})예요.")
+    elif abs(pf["trend"]) > 20:
+        st.info(f"이 종목은 **한 방향으로 움직이는 추세형**이에요(연 {pf['trend']:+.0f}%). 박스권 매매보다 추세를 따르는 판단이 맞을 수 있어요.")
+    else:
+        st.info(f"파동 점수가 {pf['score']:.0f}로 높지 않아요. 오르내림이 불규칙하거나 폭이 작아서 박스권 매매의 근거가 약해요.")
+    z = pd.DataFrame([
+        {"구간": "진입 구간(이하)", "가격(원)": pf["buy_hi"], "현재가 대비(%)": (pf["buy_hi"] / price - 1) * 100, "뜻": "최근 120일 가격의 하위 20%선이에요. 이 아래에서 사요."},
+        {"구간": "매도 구간(이상)", "가격(원)": pf["sell_lo"], "현재가 대비(%)": (pf["sell_lo"] / price - 1) * 100, "뜻": "최근 120일 가격의 상위 80%선이에요. 이 위에서 정리해요."},
+        {"구간": "무효가격(박스권 이탈)", "가격(원)": pf["invalid"], "현재가 대비(%)": (pf["invalid"] / price - 1) * 100, "뜻": "120일 최저가보다 3% 아래예요. 여기 아래로 내려가면 박스권이 깨진 것으로 보고 정리를 점검해요."}])
+    st.dataframe(z, width="stretch", hide_index=True, column_config={"가격(원)": st.column_config.NumberColumn(format="%,d"), "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
+    st.write(f"진입 구간에서 사서 매도 구간에서 팔면 **한 번에 약 {pf['gain']:+.1f}%**(왕복 비용 0.3% 반영)예요.")
+    cdf = pd.DataFrame({"날짜": pd.to_datetime(close.index[-250:]), "종가": close.values[-250:]})
+    base = alt.Chart(cdf).mark_line(color="#16202C").encode(x=alt.X("날짜:T", title=None), y=alt.Y("종가:Q", scale=alt.Scale(zero=False), title=None))
+    ldf = pd.DataFrame([{"가격": pf["buy_hi"], "구분": "진입 구간"}, {"가격": pf["sell_lo"], "구분": "매도 구간"}, {"가격": pf["invalid"], "구분": "무효가격"}])
+    rules_ = alt.Chart(ldf).mark_rule(strokeDash=[5, 4]).encode(y="가격:Q", color=alt.Color("구분:N", scale=alt.Scale(domain=["진입 구간", "매도 구간", "무효가격"], range=["#0F6B63", "#D93A33", "#7A7F87"])))
+    st.altair_chart(alt.layer(base, rules_).properties(height=240), width="stretch")
+    tr = wave.backtest(close)
+    sx = wave.stats(tr, close)
+    st.markdown("**과거에 이 규칙을 썼다면?** (최근 120일 하단 20%선 이하에서 다음 날 종가에 사서, 상단 80%선에서 팔고, 하단보다 3% 더 내려가면 손절, 60일이 지나면 정리 — 비용 0.3% 반영)")
+    if sx["n"] == 0:
+        st.info("이 종목에서는 규칙에 맞는 거래가 없었어요.")
+    else:
+        m = st.columns(6)
+        m[0].metric("거래 수", f"{sx['n']}회")
+        m[1].metric("승률", f"{sx['win']:.0f}%")
+        m[2].metric("평균 이익 / 손실", f"{sx['avg_win']:+.1f}% / {sx['avg_loss']:+.1f}%" if sx["avg_loss"] == sx["avg_loss"] else f"{sx['avg_win']:+.1f}% / -")
+        m[3].metric("건당 기대값", f"{sx['exp']:+.2f}%", help="한 번 거래할 때 평균 몇 %를 벌었는지예요(비용 반영).")
+        m[4].metric("박스권 이탈 손절", f"{sx['stops']}회", help="손절로 끝난 거래 수예요. 많을수록 박스권이 자주 깨졌다는 뜻이에요.")
+        m[5].metric("누적 vs 계속 보유", f"{sx['cum']:+.0f}% vs {sx.get('bh', float('nan')):+.0f}%", help="이 규칙으로 거래만 이어 붙인 누적 수익과, 같은 기간 그냥 들고 있었을 때의 수익이에요.")
+        with st.expander("거래 내역 (최근 10건)"):
+            st.dataframe(tr.tail(10).assign(진입일=lambda d: d["진입일"].dt.strftime("%Y-%m-%d"), 청산일=lambda d: d["청산일"].dt.strftime("%Y-%m-%d")), width="stretch", hide_index=True,
+                         column_config={"진입가": st.column_config.NumberColumn(format="%,d"), "청산가": st.column_config.NumberColumn(format="%,d"), "수익률(%)": st.column_config.NumberColumn(format="%+.1f")})
+        st.caption("한 종목의 과거 결과는 우연일 수 있어요. 이 규칙이 **전 종목에서 평균적으로 통했는지**는 가설 실험실의 '파동 전략 검증'에서 확인하세요. 누적 수익은 거래를 이어 붙인 값이라 실제로는 이만큼 나기 어려워요.")
+    sh = wave_size(price, pf["invalid"])
+    if sh is not None:
+        st.write(f"박스권을 이탈(무효가격)했을 때 총자산의 {st.session_state.risk.get('per_trade', 1.0):g}%만 잃도록 계산하면 지금 **최대 {sh:,}주**(약 {sh * price / 1e4:,.0f}만원)까지 살 수 있어요.")
+    if st.button("파동 구간으로 매매 계획 만들기", key=f"wv_plan_{code}", help="무효가격은 박스권 이탈 가격, 1차 목표는 매도 구간 하단(70% 정리), 2차 목표는 120일 고점(30% 정리)으로 만들어요."):
+        pl = st.session_state.plans
+        if len(pl[(pl["종목코드"] == code) & (pl["상태"] == "진행")]):
+            st.warning("이 종목은 이미 진행 중인 계획이 있어요. 매매 계획 화면에서 확인하세요.")
+        else:
+            tag = card["tag"] if card else "스윙"
+            row = {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "종목코드": code, "종목명": name, "생성일": dt.date.today().isoformat(), "상태": "진행", "꼬리표": tag,
+                   "기준가": price, "수량": sh or 0, "무효가격": pf["invalid"], "목표1": pf["sell_lo"], "비율1": 70, "목표2": pf["hi"], "비율2": 30,
+                   "보호폭": st.session_state.rules.get(tag, {}).get("보호폭", 8), "완료1": "", "완료2": "", "메모": "파동 매매 계획"}
+            ok, msg = save_plans(pd.concat([pl, pd.DataFrame([row])], ignore_index=True))
+            (st.success if ok else st.error)(msg + (" 매매 계획 화면에서 목표와 정리 비율을 다듬을 수 있어요." if ok else ""))
+            if ok and pf["state"] != "진입 구간":
+                st.warning(f"지금 위치는 {pf['pos']:.0f}%({pf['state']})라서 진입 구간(25% 이하)은 아니에요. 계획만 만들어 둔 거예요.")
 
 
 def report_structure(ind, tag, price, df):
@@ -1810,6 +2044,7 @@ def tab_report(rules):
             record_form(card, code, (held or {}).get("종목명") or code, f"rf_{code}", "보유 유지" if held else "관망(사지 않음)", sc["total"] if sc else None)
         render_entry(card, ind["price"], code, (held or {}).get("종목명") or code, bool(held and float(held["수량"]) > 0), f"en_{code}")
     report_structure(ind, tag, ind["price"], df)
+    report_wave(code, (held or {}).get("종목명") or code, ind["price"], df, card, held)
     report_financials(code)
     report_flow(code)
     report_consensus(code, ind["price"])
@@ -1829,7 +2064,7 @@ def disc_filters_ui(f):
     if p1.button("가치 중심 기본", key="d_p1"):
         st.session_state.disc_f = copy.deepcopy(discover.DEFAULT_FILTERS)
         for k in list(st.session_state.keys()):
-            if k.startswith(("d_on_", "d_v_")) or k == "d_maxn":
+            if k.startswith(("d_on_", "d_v_", "d_small_")) or k == "d_maxn":
                 del st.session_state[k]
         st.rerun()
     if p2.button("성장 중심", key="d_p2"):
@@ -1837,13 +2072,26 @@ def disc_filters_ui(f):
         g["roe"]["v"], g["per"]["v"], g["debt"]["v"], g["growth"]["on"] = 12.0, 25.0, 150.0, True
         st.session_state.disc_f = g
         for k in list(st.session_state.keys()):
-            if k.startswith(("d_on_", "d_v_")) or k == "d_maxn":
+            if k.startswith(("d_on_", "d_v_", "d_small_")) or k == "d_maxn":
                 del st.session_state[k]
         st.rerun()
     st.markdown("**1단계 — 시장 목록 필터** (바꾸면 아래 '시장 데이터 불러오기'를 다시 눌러요)")
     row("cap", "시가총액", "조원 이상", 0.5)
     row("tv", "일 거래대금", "억원 이상", 10.0)
     f["maxn"] = int(st.number_input("2단계에서 조회할 최대 종목 수(시가총액 큰 순)", min_value=50, max_value=1000, value=int(f["maxn"]), step=50, key="d_maxn"))
+    st.markdown("**소형주(소액 후보)** — 시가총액이 위 기준보다 작아도 재무가 더 튼튼하면 소액으로만 후보에 넣어요(바꾸면 '시장 데이터 불러오기'를 다시 눌러요)")
+    s = f["small"]
+    s["on"] = st.checkbox("소형주도 후보에 포함(소액 후보)", value=bool(s["on"]), key="d_small_on")
+    if s["on"]:
+        q1, q2, q3, q4 = st.columns(4)
+        s["cap_min"] = q1.number_input("시가총액 하한(조원)", min_value=0.05, value=float(s["cap_min"]), step=0.05, key="d_small_cap")
+        s["loss"] = int(q2.number_input("영업적자(번 이하)", min_value=0, max_value=3, value=int(s["loss"]), step=1, key="d_small_loss"))
+        s["debt"] = q3.number_input("부채비율(% 이하)", min_value=10.0, value=float(s["debt"]), step=10.0, key="d_small_debt")
+        s["roe"] = q4.number_input("ROE(% 이상)", min_value=0.0, value=float(s["roe"]), step=1.0, key="d_small_roe")
+        q5, q6, _ = st.columns([1, 1, 2])
+        s["growth"] = q5.checkbox("영업이익 증가 필요", value=bool(s["growth"]), key="d_small_growth")
+        s["pos"] = q6.number_input("한 종목 최대 비중(총자산 %)", min_value=0.1, max_value=10.0, value=float(s["pos"]), step=0.5, key="d_small_pos",
+                                   help="소형주는 변동이 커서 틀렸을 때 손실이 더 클 수 있어요. 이 비중을 넘지 않게 살 수 있는 수량을 계산해요.")
     st.markdown("**2단계 — 재무 조건** (바로 반영돼요)")
     row("profit", "최근 영업이익 흑자", None)
     row("loss", "최근 3년 영업적자", "번 이하")
@@ -1865,7 +2113,11 @@ def run_discovery(f, manual_codes=None):
         return
     st.session_state.disc_cap = {c: m / 1e12 for c, m in zip(uni["Code"], uni["Marcap"]) if m == m}
     held = set(st.session_state.hold["종목코드"]) if st.session_state.get("disc_excl_held", True) else set()
-    s1, notes = discover.stage1(uni, f, exclude=held)
+    f1 = copy.deepcopy(f)
+    if f.get("small", {}).get("on") and f1["cap"]["on"]:
+        f1["cap"]["v"] = min(f1["cap"]["v"], f["small"]["cap_min"])
+        f1["maxn"] = max(int(f1["maxn"]), 600)
+    s1, notes = discover.stage1(uni, f1, exclude=held)
     if "시총출처" in uni.columns and (uni["시총출처"] == "네이버").any():
         notes = list(notes) + [f"종목 목록에 시가총액·거래대금이 없어서 네이버 금융의 시가총액 순위(상위 {int((uni['시총출처'] == '네이버').sum())}종목)로 채웠어요. 그보다 작은 종목은 후보에서 빠져요."]
     src = st.session_state.get("disc_src", "자동(DART 우선)")
@@ -1906,7 +2158,7 @@ def run_discovery(f, manual_codes=None):
                     st.session_state.disc_res = {"fail": f"재무 조회에 실패했어요. DART: {dart_fail or '시도하지 않음'} / 네이버: {dart_data.redact(e)}", "uni_n": len(uni), "s1_n": len(s1)}
                     return
     tbl = discover.metrics_table(s1, fin)
-    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "notes": notes, "source": used, "dart_fail": dart_fail, "sheet_date": sheet_date, "n_sheet": n_sheet, "n_naver": n_naver,
+    st.session_state.disc_res = {"uni_n": len(uni), "s1_n": len(s1), "fin_n": len(fin), "tbl": tbl, "fin": fin, "small_on": bool(f.get("small", {}).get("on")), "notes": notes, "source": used, "dart_fail": dart_fail, "sheet_date": sheet_date, "n_sheet": n_sheet, "n_naver": n_naver,
                                  "errors": errs, "manual": bool(manual_codes), "ts": dt.datetime.now().strftime("%m-%d %H:%M"),
                                  "dept": uni["Dept"].replace("", "(비어 있음)").value_counts().head(15).to_dict() if "Dept" in uni else {}}
     bar.progress(1.0, text="완료")
@@ -1953,8 +2205,244 @@ def _entry_cells(code, ind):
         return ("-", np.nan, np.nan, np.nan, np.nan)
 
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def sector_map_cached():
+    import sectors
+    mp, src, note = sectors.load()
+    if not mp:
+        raise RuntimeError(note)   # 실패는 캐시하지 않는다
+    return mp, src, note
+
+
+def prefetch_codes(codes, bar=None, label="가격"):
+    """종목들의 시세를 동시에 가져와 캐시에 채운다."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    now = time.time()
+    need = [c for c in dict.fromkeys(codes) if not (("kr", c) in _PRICE_CACHE and now - _PRICE_CACHE[("kr", c)][0] < PRICE_TTL)]
+    if not need:
+        return
+    done = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(hist_kr, c) for c in need]
+        for f_ in as_completed(futs):
+            try:
+                f_.result()
+            except Exception:
+                pass
+            done += 1
+            if bar and (done % 10 == 0 or done == len(need)):
+                bar.progress(min(done / len(need), 1.0), text=f"{label}을 가져오는 중… ({done}/{len(need)})")
+
+
+def run_scan(cand, res, use_sector):
+    """② 재무를 통과한 후보 전체를 가격 흐름·손익비·업종까지 빠르게 훑는다(DART 상세 조회 없이)."""
+    import scan as scan_mod
+    small = st.session_state.disc_f.get("small", {})
+    bar = st.progress(0.0, text="준비 중…")
+    sector, ssrc, snote = {}, "", ""
+    if use_sector:
+        bar.progress(0.02, text="업종 정보를 가져오는 중…")
+        try:
+            sector, ssrc, snote = sector_map_cached()
+        except Exception as e:
+            snote = str(e)[:200]
+    codes = list(cand["종목코드"])
+    universe = list(res["tbl"]["종목코드"]) if (use_sector and sector) else []
+    prefetch_codes(codes + universe, bar, "가격")
+    strength = None
+    if universe:
+        bar.progress(0.9, text="업종별 강도를 계산하는 중…")
+        closes = {c: hist_kr(c)["Close"] for c in universe if len(hist_kr(c))}
+        strength = scan_mod.sector_strength(closes, sector)
+    c2 = scan_mod.attach_sector(cand, sector, strength)
+    fin = res.get("fin", {})
+    total, risk = sizing_assets(), st.session_state.risk
+    rows, meta = [], {}
+    for r in c2.to_dict("records"):
+        c = r["종목코드"]
+        ind = sg.indicators(hist_kr(c))
+        if ind is None:
+            continue
+        card = card_for(c, "중장기", None, None, None)
+        if not card:
+            continue
+        rec = fin.get(c) or {}
+        sc = score_for(c, "중장기", None, None, None, card=card, fin=({"op3": rec.get("op"), "debt": r.get("부채비율"), "roe": r.get("ROE")}, None))
+        e = entry_for(card, ind["price"])
+        size = scan_mod.size_class(r.get("시가총액(조)"))
+        shares, pos = e.get("shares"), risk.get("max_pos")
+        if size == "소형" and small.get("pos") and total:
+            cap_sh = int(total * small["pos"] / 100 // ind["price"])
+            shares, pos = (cap_sh if shares is None else min(shares, cap_sh)), small["pos"]
+        row = {"종목코드": c, "종목명": r["종목명"], "업종": r["업종"], "규모": size, "진입 매력도": sc["total"] if sc else np.nan,
+               "근거": f"{sc['n_avail']}/{sc['n_total']}" if sc else "-", "진입 판정": e["verdict"].split("(")[0], "진입 손익비": e["ratio"] if e["ratio"] is not None else np.nan,
+               "무효가격(원)": e["invalid"] or np.nan, "최대 매수(주)": shares if shares is not None else np.nan, "권장 최대 비중(%)": pos,
+               "기다릴 가격(원)": e["wait_price"] or np.nan, "지지선까지(%)": card["short"]["pct"] if card.get("short") else np.nan,
+               "52주 위치(%)": ind["pos"], "이격도": ind["price"] / ind["ma20"] * 100 if ind.get("ma20") else np.nan, "RSI": ind["rsi"], "3개월(%)": ind["m3"],
+               "흐름": sg.flow_of(ind)[0], "업종 1개월(%)": r["업종 1개월(%)"], "업종 순위": r["업종 순위"], "시가총액(조)": r.get("시가총액(조)"),
+               "ROE": r.get("ROE"), "PER": r.get("PER"), "부채비율": r.get("부채비율"), "점검가": ind["price"]}
+        row["진입 이유"] = scan_mod.reasons(row, n_sectors=len(strength) if strength is not None else None, small_pos=small.get("pos") if size == "소형" else None)
+        rows.append(row)
+        meta[c] = {"업종": r["업종"], "규모": size, "점수": row["진입 매력도"], "비중": pos}
+    bar.progress(1.0, text="완료")
+    df = pd.DataFrame(rows)
+    st.session_state.disc_meta = {**st.session_state.get("disc_meta", {}), **meta}
+    st.session_state.disc_scan = {"rows": df, "strength": strength, "src": ssrc, "note": snote, "ts": dt.datetime.now().strftime("%m-%d %H:%M"),
+                                  "n_sectors": 0 if strength is None else len(strength), "source": res.get("source")}
+    if len(df):
+        top = df.sort_values("진입 매력도", ascending=False).head(40)
+        today = dt.date.today().isoformat()
+        out = []
+        for r in top.to_dict("records"):
+            out.append({"점검일": today, "종목코드": r["종목코드"], "종목명": r["종목명"], "점검가": r["점검가"], "안전": "-", "미달 항목": "-", "확인 불가": "-", "목표가 여력(%)": np.nan,
+                        "진입 판정": r["진입 판정"], "진입 손익비": r["진입 손익비"], "무효가격(원)": r["무효가격(원)"], "최대 매수(주)": r["최대 매수(주)"], "기다릴 가격(원)": r["기다릴 가격(원)"],
+                        "외국인 5일(억)": np.nan, "기관 5일(억)": np.nan, "흐름": r["흐름"], "52주 위치(%)": r["52주 위치(%)"], "RSI": r["RSI"], "3개월(%)": r["3개월(%)"],
+                        "재무출처": {"DART": "DART", "수집본": "DART(수집본)", "네이버": "네이버 금융", "수집본+네이버": "수집본+네이버"}.get(res.get("source"), "-"),
+                        "구분": "진입 스캔", "업종": r["업종"], "규모": r["규모"], "진입 매력도": r["진입 매력도"], "권장 최대 비중(%)": r["권장 최대 비중(%)"]})
+        st.session_state["disc_scan_msg"] = save_disc_results(out)
+
+
+def render_scan(sc_res, cand):
+    """진입 스캔 결과: 강한 업종, 진입 후보 표(필터·정렬), 관심종목 추가."""
+    df = sc_res["rows"]
+    st.caption(f"{sc_res['ts']}에 스캔한 결과예요. 업종 출처: {sc_res['src'] or '없음'}" + (f" — {sc_res['note']}" if sc_res.get("note") else ""))
+    stg = sc_res.get("strength")
+    if stg is not None and len(stg):
+        st.markdown("**🔥 이번 주·이번 달 강한 업종** (소속 종목들의 수익률 중간값, 시가총액 상위 종목 기준)")
+        st.dataframe(stg.head(8), width="stretch", hide_index=True, column_config={
+            "1주(%)": st.column_config.NumberColumn(format="%+.1f"), "1개월(%)": st.column_config.NumberColumn(format="%+.1f"),
+            "3개월(%)": st.column_config.NumberColumn(format="%+.1f"), "1개월 상승 비율(%)": st.column_config.NumberColumn(format="%.0f")})
+        with st.expander(f"전체 업종 {len(stg)}개 보기"):
+            st.dataframe(stg, width="stretch", hide_index=True)
+    elif sc_res.get("note"):
+        st.warning("업종 정보를 가져오지 못해서 업종별 강도 없이 스캔했어요: " + sc_res["note"])
+    if df.empty:
+        st.info("스캔할 후보가 없어요.")
+        return
+    f1, f2, f3, f4 = st.columns(4)
+    judg = f1.multiselect("진입 판정", ["유리", "보통", "불리", "근거 부족", "무효가격 필요"], default=["유리", "보통"], key="scan_f_j")
+    sizes = f2.multiselect("규모", ["대형", "중형", "소형"], default=["대형", "중형", "소형"], key="scan_f_s")
+    secs = f3.multiselect("업종(비우면 전체)", sorted(df["업종"].unique()), key="scan_f_sec")
+    sort = f4.selectbox("정렬", ["진입 매력도 높은 순", "손익비 높은 순", "업종 강도 순", "시가총액 큰 순"], key="scan_f_sort")
+    v = df[df["진입 판정"].isin(judg) & df["규모"].isin(sizes)]
+    if secs:
+        v = v[v["업종"].isin(secs)]
+    if v.empty:
+        cnt = df["진입 판정"].value_counts().to_dict()
+        st.info(f"선택한 필터에 맞는 종목이 없어요. 스캔한 {len(df)}개의 진입 판정은 " + " · ".join(f"{k} {n}개" for k, n in cnt.items()) + "예요. 위 '진입 판정'에 '불리' 등을 더하거나, 발굴 조건을 조금 완화해서 다시 불러오세요.")
+    key, asc = {"진입 매력도 높은 순": ("진입 매력도", False), "손익비 높은 순": ("진입 손익비", False), "업종 강도 순": ("업종 순위", True), "시가총액 큰 순": ("시가총액(조)", False)}[sort]
+    v = v.sort_values(key, ascending=asc, na_position="last")
+    k = st.columns(4)
+    k[0].metric("스캔한 후보", f"{len(df)}개")
+    k[1].metric("진입 구조 유리", f"{int((df['진입 판정'] == '유리').sum())}개")
+    k[2].metric("진입 구조 보통", f"{int((df['진입 판정'] == '보통').sum())}개")
+    k[3].metric("소액 후보(소형)", f"{int((df['규모'] == '소형').sum())}개")
+    cols = ["종목명", "업종", "규모", "진입 매력도", "근거", "진입 판정", "진입 손익비", "무효가격(원)", "최대 매수(주)", "권장 최대 비중(%)", "기다릴 가격(원)", "52주 위치(%)",
+            "이격도", "3개월(%)", "흐름", "업종 1개월(%)", "업종 순위", "진입 이유"]
+    st.dataframe(v[cols], width="stretch", hide_index=True, column_config={
+        "진입 매력도": st.column_config.NumberColumn(format="%.0f", help="종합 점수(가격 흐름·재무·진입 구조 등)예요. 50 중립. 이길 확률이 아니에요."),
+        "진입 손익비": st.column_config.NumberColumn(format="%.2f"), "무효가격(원)": st.column_config.NumberColumn(format="%,d"),
+        "최대 매수(주)": st.column_config.NumberColumn(format="%,d"), "권장 최대 비중(%)": st.column_config.NumberColumn(format="%.1f"),
+        "기다릴 가격(원)": st.column_config.NumberColumn(format="%,d"), "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"),
+        "이격도": st.column_config.NumberColumn(format="%.0f"), "3개월(%)": st.column_config.NumberColumn(format="%.1f"),
+        "업종 1개월(%)": st.column_config.NumberColumn(format="%+.1f"), "업종 순위": st.column_config.NumberColumn(format="%d")})
+    st.caption("진입 매력도가 높고 진입 판정이 '유리'인 종목일수록 **지금 사도 틀렸을 때 손실이 작고 오를 여지가 상대적으로 큰** 후보예요. 승률이 높다고 검증된 건 아니에요(검증은 아래 저장 기록의 '점검 후 변화'로 쌓아가요). "
+               "소형 종목은 변동이 커서 권장 최대 비중 안에서 소액으로만 보세요. 스캔 결과는 구글 시트 '발굴결과' 탭에 자동 저장돼요.")
+    names = {f"{r['종목명']} ({r['종목코드']})": (r["종목코드"], r["종목명"]) for r in v.to_dict("records")}
+    pick = st.multiselect("관심종목에 추가(스캔 결과)", list(names), key="scan_add_pick")
+    if st.button("스캔 결과를 관심종목에 추가", key="scan_add_btn") and pick:
+        ok, msg = add_watch([names[p] for p in pick])
+        (st.success if ok else st.error)(msg)
+
+
+
+def run_wave_scan(cand, include_own):
+    """② 재무를 통과한(안정적인) 후보와 내 보유·관심 종목 중 오르내림을 반복하는 파동형 종목을 찾는다."""
+    import wave
+    bar = st.progress(0.0, text="준비 중…")
+    items = {r["종목코드"]: (r["종목명"], "후보") for r in cand.to_dict("records")}
+    if include_own:
+        for r in st.session_state.hold.drop_duplicates("종목코드").to_dict("records"):
+            items.setdefault(r["종목코드"], (r["종목명"] or r["종목코드"], "보유"))
+        for r in st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS)).to_dict("records"):
+            items.setdefault(r["종목코드"], (r["종목명"] or r["종목코드"], "관심"))
+    codes = list(items)
+    prefetch_codes(codes, bar, "가격")
+    rows = []
+    for c in codes:
+        df = hist_kr(c)
+        pf = wave.profile(df["Close"]) if len(df) else None
+        if pf is None:
+            continue
+        sx = wave.stats(wave.backtest(df["Close"]), df["Close"])
+        meta = st.session_state.get("disc_meta", {}).get(c, {})
+        rows.append({"종목코드": c, "종목명": items[c][0], "구분": items[c][1], "업종": meta.get("업종", "-"), "파동 점수": pf["score"], "추세(연%)": pf["trend"], "파동 횟수(연)": pf["per_year"],
+                     "상승 파동(%)": pf["amp_up"], "주기(일)": pf["period"], "지금 위치(%)": pf["pos"], "상태": pf["state"], "진입 구간(원 이하)": pf["buy_hi"], "매도 목표(원 이상)": pf["sell_lo"],
+                     "무효가격(원)": pf["invalid"], "기대 수익폭(%)": pf["gain"], "최대 매수(주)": wave_size(pf["price"], pf["invalid"]) or np.nan,
+                     "과거 거래": sx.get("n", 0), "승률(%)": sx.get("win", np.nan), "건당 기대값(%)": sx.get("exp", np.nan),
+                     "손절 비율(%)": (sx["stops"] / sx["n"] * 100) if sx.get("n") else np.nan, "점검가": pf["price"]})
+    bar.progress(1.0, text="완료")
+    df_ = pd.DataFrame(rows)
+    st.session_state.disc_wave = {"rows": df_, "ts": dt.datetime.now().strftime("%m-%d %H:%M")}
+    if len(df_):
+        today = dt.date.today().isoformat()
+        out = []
+        for r in df_.sort_values("파동 점수", ascending=False).head(40).to_dict("records"):
+            out.append({"점검일": today, "종목코드": r["종목코드"], "종목명": r["종목명"], "점검가": r["점검가"], "안전": "-", "미달 항목": "-", "확인 불가": "-", "목표가 여력(%)": np.nan,
+                        "진입 판정": r["상태"], "진입 손익비": np.nan, "무효가격(원)": r["무효가격(원)"], "최대 매수(주)": r["최대 매수(주)"], "기다릴 가격(원)": r["진입 구간(원 이하)"],
+                        "외국인 5일(억)": np.nan, "기관 5일(억)": np.nan, "흐름": "-", "52주 위치(%)": r["지금 위치(%)"], "RSI": np.nan, "3개월(%)": np.nan, "재무출처": "-",
+                        "구분": "파동 스캔", "업종": r["업종"], "규모": "-", "진입 매력도": r["파동 점수"], "권장 최대 비중(%)": np.nan})
+        st.session_state["disc_wave_msg"] = save_disc_results(out)
+
+
+def render_wave_scan(res_w):
+    df = res_w["rows"]
+    st.caption(f"{res_w['ts']}에 찾은 결과예요(최근 1년 가격 기준).")
+    if df.empty:
+        st.info("파동을 분석할 수 있는 종목이 없어요.")
+        return
+    f1, f2, f3, f4 = st.columns(4)
+    mn = f1.slider("최소 파동 점수", 0, 100, 60, 5, key="wv_f_score")
+    tmax = f2.slider("추세 한도(연 ±%)", 5, 60, 20, 5, key="wv_f_trend")
+    only_in = f3.checkbox("진입 구간만(위치 25% 이하)", value=False, key="wv_f_in")
+    kinds = f4.multiselect("구분", ["후보", "보유", "관심"], default=["후보", "보유", "관심"], key="wv_f_kind")
+    v = df[(df["파동 점수"] >= mn) & (df["추세(연%)"].abs() <= tmax) & df["구분"].isin(kinds)]
+    if only_in:
+        v = v[v["상태"] == "진입 구간"]
+    v = v.sort_values(["파동 점수"], ascending=False)
+    k = st.columns(4)
+    k[0].metric("파동형 종목", f"{len(v)}개", help="선택한 조건을 만족하는 종목 수예요.")
+    k[1].metric("진입 구간", f"{int((v['상태'] == '진입 구간').sum())}개", help="지금 위치가 박스권 하단(25% 이하)이라 사는 쪽을 볼 만한 종목이에요.")
+    k[2].metric("매도 구간", f"{int((v['상태'] == '매도 구간').sum())}개", help="지금 위치가 박스권 상단(75% 이상)이라 보유 중이면 정리를 점검할 종목이에요.")
+    k[3].metric("전체 분석", f"{len(df)}개")
+    if v.empty:
+        st.info("조건에 맞는 종목이 없어요. 최소 파동 점수나 추세 한도를 완화해 보세요.")
+    else:
+        cols = ["종목명", "구분", "업종", "파동 점수", "추세(연%)", "파동 횟수(연)", "상승 파동(%)", "주기(일)", "지금 위치(%)", "상태", "진입 구간(원 이하)", "매도 목표(원 이상)", "무효가격(원)",
+                "기대 수익폭(%)", "최대 매수(주)", "과거 거래", "승률(%)", "건당 기대값(%)", "손절 비율(%)"]
+        st.dataframe(v[cols], width="stretch", hide_index=True, column_config={
+            "파동 점수": st.column_config.NumberColumn(format="%.0f"), "추세(연%)": st.column_config.NumberColumn(format="%+.0f"), "파동 횟수(연)": st.column_config.NumberColumn(format="%.1f"),
+            "상승 파동(%)": st.column_config.NumberColumn(format="%.1f"), "주기(일)": st.column_config.NumberColumn(format="%.0f"), "지금 위치(%)": st.column_config.NumberColumn(format="%.0f"),
+            "진입 구간(원 이하)": st.column_config.NumberColumn(format="%,d"), "매도 목표(원 이상)": st.column_config.NumberColumn(format="%,d"), "무효가격(원)": st.column_config.NumberColumn(format="%,d"),
+            "기대 수익폭(%)": st.column_config.NumberColumn(format="%.1f"), "최대 매수(주)": st.column_config.NumberColumn(format="%,d"), "승률(%)": st.column_config.NumberColumn(format="%.0f"),
+            "건당 기대값(%)": st.column_config.NumberColumn(format="%+.2f"), "손절 비율(%)": st.column_config.NumberColumn(format="%.0f")})
+    st.caption("파동형으로 보이는 종목도 **박스권이 깨지면 손실**이 나요. 무효가격(박스권 이탈)을 정하고, 최대 매수 수량 안에서 사세요. 과거 거래 성적(승률·건당 기대값)은 그 종목 하나의 기록이라 우연일 수 있어요 — "
+               "전 종목 평균으로 통했는지는 가설 실험실의 '파동 전략 검증'에서 확인해요. 결과는 구글 시트 '발굴결과' 탭에 자동 저장돼요.")
+    names = {f"{r['종목명']} ({r['종목코드']})": (r["종목코드"], r["종목명"]) for r in v.to_dict("records")}
+    pick = st.multiselect("관심종목에 추가(파동형)", list(names), key="wv_add_pick")
+    if st.button("파동형 종목을 관심종목에 추가", key="wv_add_btn") and pick:
+        ok, msg = add_watch([names[p] for p in pick])
+        (st.success if ok else st.error)(msg)
+
+
 def tab_discover():
-    st.markdown("시장 전체에서 후보를 좁히는 깔때기예요. **① 시가총액·거래대금 → ② DART 재무 → ③ 남은 상위 후보만 안전 기준·가격 흐름까지 상세 점검**해요. 통과했다고 사라는 뜻은 아니고, 더 살펴볼 후보라는 뜻이에요.")
+    st.markdown("시장 전체에서 후보를 좁히는 깔때기예요. **① 시가총액·거래대금 → ② 재무 → ③ 진입 스캔(가격·업종·손익비) → ④ 상위 후보만 안전 기준까지 상세 점검**해요. 통과했다고 사라는 뜻은 아니고, 더 살펴볼 후보라는 뜻이에요.")
+    import scan as scan_mod
+    with st.expander("📋 현재 발굴 기준 (지금 설정이 이렇게 적용돼요)", expanded=False):
+        for stage, cond, why in scan_mod.criteria_rows(st.session_state.disc_f, st.session_state.risk, st.session_state.disc_f.get("small")):
+            st.markdown(f"**{stage}** — {cond}  \n  ↳ {why}")
+        st.caption("숫자는 아래 '발굴 조건'과 규칙 탭의 위험 한도에서 바꿀 수 있어요. 바꾼 뒤 1단계 조건은 '시장 데이터 불러오기'를 다시 눌러야 반영돼요.")
     dart, err = get_dart()
     if dart is None:  # DART가 안 돼도 멈추지 않고 네이버 금융의 재무로 대신한다
         st.info((err or "DART에 연결하지 못했어요.") + " 재무는 네이버 금융으로 대신 가져와요(영업이익·영업적자 횟수·부채비율·ROE·PER/PBR만 확인돼요).")
@@ -1983,6 +2471,9 @@ def tab_discover():
         if res and res.get("fail"):
             st.rerun()
     res = st.session_state.get("disc_res")
+    if st.session_state.get("disc_hist_err"):
+        st.warning(f"저장된 상세 점검 결과를 읽지 못했어요(저장도 막혀 있어요): {st.session_state['disc_hist_err'][:80]}")
+    render_saved_detail(expanded=not res)
     if not res:
         st.caption("버튼을 누르면 종목 목록과 재무를 가져와요. 한 번 가져오면 몇 시간(목록)·하루(재무) 동안 다시 쓰고, 결과는 조건을 바꿔도 바로 달라져요.")
         return
@@ -1991,6 +2482,14 @@ def tab_discover():
             st.error(res["fail"])
         return
     tbl = discover.stage2(res["tbl"], f, has_cap=not res["manual"])
+    tbl["규모"] = tbl["시가총액(조)"].map(scan_mod.size_class)
+    cap_v = f["cap"]["v"] if f["cap"]["on"] else 0.0
+    is_small = tbl["시가총액(조)"] < cap_v
+    if res.get("small_on") and f["small"]["on"]:   # 소형주는 더 엄격한 재무 기준을 추가로 통과해야 후보
+        strict = scan_mod.small_strict(tbl, f["small"])
+        tbl.loc[is_small, "통과"] = tbl.loc[is_small, "통과"] & strict[is_small] & (tbl.loc[is_small, "시가총액(조)"] >= f["small"]["cap_min"])
+    else:
+        tbl.loc[is_small, "통과"] = False
     cand = tbl[tbl["통과"]].copy()
     k = st.columns(4)
     k[0].metric("전체 종목", f"{res['uni_n']:,}")
@@ -2015,7 +2514,7 @@ def tab_discover():
     col, asc = discover.SORTS[sort_label]
     cand = cand.sort_values(col, ascending=asc, na_position="last").reset_index(drop=True)
     st.session_state.disc_names = dict(zip(tbl["종목코드"], tbl["종목명"]))
-    show = cand[["종목코드", "종목명", "시가총액(조)", "ROE", "PER", "PBR", "부채비율", "영업이익률", "영업이익증가율", "영업적자횟수"]].head(100)
+    show = cand[["종목코드", "종목명", "규모", "시가총액(조)", "ROE", "PER", "PBR", "부채비율", "영업이익률", "영업이익증가율", "영업적자횟수"]].head(100)
     st.dataframe(show, width="stretch", hide_index=True, column_config={
         "시가총액(조)": st.column_config.NumberColumn(format="%.1f"), "ROE": st.column_config.NumberColumn(format="%.1f%%"),
         "PER": st.column_config.NumberColumn(format="%.1f"), "PBR": st.column_config.NumberColumn(format="%.2f"),
@@ -2028,43 +2527,58 @@ def tab_discover():
     if res.get("dept"):
         with st.expander("목록 진단 (소속부 분포)"):
             st.write(res["dept"])
-    st.subheader("③ 상위 후보 상세 점검")
-    st.caption("안전 기준(DART 공시)과 가격 흐름까지 확인해요. 종목마다 10~30초 걸리고, 가져온 데이터는 7일 동안 저장돼요.")
+    st.subheader("③ 진입 스캔 — 지금 사도 구조가 괜찮은 후보 찾기")
+    st.caption("② 재무를 통과한 후보 **전체**를 가격 흐름·업종·손익비로 훑어요(DART 상세 조회 없이 1~2분). 업종별로 이번 주·이번 달 강한 곳도 같이 보여줘요. 소형주는 소액 후보로 표시해요.")
+    use_sector = st.checkbox("업종별 강도도 계산(1~2분 더 걸려요)", value=True, key="scan_sector")
+    if st.button("진입 스캔 실행", key="scan_run"):
+        run_scan(cand, res, use_sector)
+    sc_res = st.session_state.get("disc_scan")
+    if sc_res:
+        render_scan(sc_res, cand)
+    sm0 = st.session_state.get("disc_scan_msg")
+    if sm0 and sc_res:
+        (st.success if sm0[0] else st.error)(sm0[1])
+
+    st.subheader("🌊 파동형 후보 — 오르내림을 반복하는 안정 종목 찾기 (KT&G 같은)")
+    st.caption("② 재무를 통과한(안정적인) 후보 중에서 **추세가 약하고 일정한 폭으로 오르내리는 종목**을 찾아요. 아래쪽(진입 구간)에서 사서 위쪽(매도 구간)에서 파는 식으로 소소한 수익을 반복하려는 거예요. "
+               "종목마다 진입·매도 구간, 박스권 이탈 가격(무효가격), 과거에 이 규칙을 썼다면의 성적을 보여줘요.")
+    own_ = st.checkbox("내 보유·관심 종목도 함께 분석", value=True, key="wv_own")
+    if st.button("파동형 후보 찾기", key="wv_run"):
+        run_wave_scan(cand, own_)
+    rw_ = st.session_state.get("disc_wave")
+    if rw_:
+        render_wave_scan(rw_)
+        sw_ = st.session_state.get("disc_wave_msg")
+        if sw_:
+            (st.success if sw_[0] else st.error)(sw_[1])
+
+    st.subheader("④ 상위 후보 상세 점검")
+    st.caption("안전 기준(DART 공시)까지 확인해요. 종목마다 10~30초 걸리고, 가져온 데이터는 7일 동안 저장돼요. 진입 스캔을 했다면 **진입 구조가 유리·보통인 종목 순서**로 점검해요.")
     n = st.slider("상위 몇 개를 점검할까요", 3, 30, min(10, max(3, min(30, len(cand)))))
+    rank_codes = None
+    if sc_res is not None and len(sc_res["rows"]):
+        r_ = sc_res["rows"]
+        r_ = r_[r_["종목코드"].isin(set(cand["종목코드"])) & r_["진입 판정"].isin(["유리", "보통"])].sort_values("진입 매력도", ascending=False)
+        rank_codes = list(r_["종목코드"]) or None
     if st.button("상위 후보 상세 점검"):
-        run_detail(cand["종목코드"].head(n).tolist())
+        codes_ = (rank_codes or cand["종목코드"].tolist())[:n]
+        run_detail(codes_)
+        st.session_state["disc_save_msg"] = save_disc_results(detail_rows(codes_))   # 점검 결과를 구글 시트에 저장
     det = [c for c in st.session_state.get("disc_detail", []) if c in set(cand["종목코드"])]
     if not det:
         return
+    sm_ = st.session_state.get("disc_save_msg")
+    if sm_:
+        (st.success if sm_[0] else st.error)(sm_[1])
     note = admin_notice()
     if note:
         st.warning(note)
     only_safe = st.checkbox("안전 기준 미달 종목 숨기기", value=False)
-    rows = []
-    for c in det:
-        sres = safety_for(c)
-        df = hist_kr(c)
-        ind = sg.indicators(df)
-        if sres is None:
-            continue
-        items = sres[1]
-        cnt = safety.summarize(items)
-        if only_safe and cnt["fail"]:
-            continue
-        rows.append({
-            "종목코드": c, "종목명": st.session_state.disc_names.get(c, c), "안전": safety.headline(items),
-            "미달 항목": ", ".join(i["label"] for i in items if i["status"] == "fail") or "-",
-            "확인 불가": ", ".join(i["label"] for i in items if i["status"] == "unknown") or "-",
-            "목표가 여력(%)": (consensus.upside(cons_for(c)["target"], float(df["Close"].iloc[-1])) if (cons_for(c) or {}).get("has") and len(df) else np.nan),
-            **dict(zip(("진입 판정", "진입 손익비", "무효가격(원)", "최대 매수(주)", "기다릴 가격(원)"), _entry_cells(c, ind))),
-            "외국인 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("f5", np.nan),
-            "기관 5일(억)": (st.session_state.get("flow_sum", {}).get(c) or {}).get("i5", np.nan),
-            "흐름": sg.flow_of(ind)[0] if ind else "-", "52주 위치(%)": ind["pos"] if ind else np.nan,
-            "RSI": ind["rsi"] if ind else np.nan, "3개월(%)": ind["m3"] if ind else np.nan})
+    rows = detail_rows(det, only_safe)
     if not rows:
         st.info("표시할 종목이 없어요.")
         return
-    rdf = pd.DataFrame(rows)
+    rdf = pd.DataFrame(rows).drop(columns=["점검일", "점검가"])
     st.dataframe(rdf, width="stretch", hide_index=True, column_config={
         "52주 위치(%)": st.column_config.NumberColumn(format="%.0f"), "RSI": st.column_config.NumberColumn(format="%.0f"),
         "3개월(%)": st.column_config.NumberColumn(format="%.1f"),
@@ -2894,6 +3408,52 @@ def tab_lab():
                                                            tooltip=["분위", alt.Tooltip("평균 이후 수익(%):Q", format=".2f")]).properties(height=220), width="stretch")
 
     st.divider()
+    st.subheader("🌊 파동(박스권) 전략 검증 — 하단에서 사서 상단에서 파는 규칙이 평균적으로 통했나")
+    st.markdown("종목마다 **처음 1년으로 파동 점수**를 매기고(미래 값 없이), **그 뒤 기간에 같은 규칙**(120일 하단 20%선 이하에서 사서, 상단 80%선에서 팔고, 하단보다 3% 더 내려가면 손절, 60일 후 정리, 비용 0.3%)을 적용해요. "
+                "**파동 점수가 높은 종목 그룹이 낮은 그룹보다 실제로 더 잘 통했는지**와, 이 규칙이 전체 평균으로 비용과 손절을 넘었는지 확인해요. 3년 이상 기간이 필요해요.")
+    if st.button("파동 전략 검증 실행", key="wave_run"):
+        import wave
+        bar = st.progress(0.0, text="준비 중…")
+        codes_w, note_w = lab_universe(n_uni)
+        if note_w:
+            st.warning(note_w)
+        Pw = lab_panel(codes_w, years, h, bar)
+        if Pw is None:
+            bar.empty()
+            st.error("검증할 가격 자료를 가져오지 못했어요.")
+        else:
+            bar.progress(0.9, text="파동 전략을 검증하는 중…")
+            pr_ = {c: pd.DataFrame({"Close": Pw["C"][c].dropna()}) for c in Pw["C"].columns}
+            tbl_w, sm_w = wave.wave_study(pr_)
+            bar.empty()
+            st.session_state["lab_wave"] = {"tbl": tbl_w, "sm": sm_w, "years": years, "n": len(pr_)}
+            if tbl_w is not None:
+                spread, ci = sm_w.get("spread"), sm_w.get("ci", (None, None))
+                good = bool(sm_w.get("distinct") and spread is not None and spread > 0)
+                save_hyp([[dt.date.today().isoformat(), "전략: 파동 하단진입(파동 점수 상위−하위)", len(pr_), years, 60, int(tbl_w["거래 수"].sum()), None, spread, ci[0], ci[1],
+                           "Y" if good else "N", "검증됨(약함): 파동 점수가 높을수록 유리" if good else "효과 구분 안 됨"]])
+    rwv = st.session_state.get("lab_wave")
+    if rwv:
+        if rwv["tbl"] is None:
+            st.warning(rwv["sm"].get("msg", "비교할 수 없어요."))
+        else:
+            sm_, tb_ = rwv["sm"], rwv["tbl"]
+            st.markdown(f"**{rwv['n']}종목 · 최근 {rwv['years']}년 검증 결과**")
+            st.dataframe(tb_, width="stretch", hide_index=True, column_config={
+                "승률(%)": st.column_config.NumberColumn(format="%.1f"), "평균 이익(%)": st.column_config.NumberColumn(format="%+.1f"), "평균 손실(%)": st.column_config.NumberColumn(format="%+.1f"),
+                "건당 기대값(%)": st.column_config.NumberColumn(format="%+.2f"), "박스권 이탈 손절 비율(%)": st.column_config.NumberColumn(format="%.0f"), "같은 기간 보유 평균(%)": st.column_config.NumberColumn(format="%+.1f")})
+            if sm_.get("all_exp") is not None:
+                st.write(f"전체 종목을 합친 건당 기대값은 **{sm_['all_exp']:+.2f}%**(승률 {sm_['all_win']:.0f}%)예요.")
+            if sm_.get("spread") is not None:
+                lo_, hi_ = sm_["ci"]
+                if sm_["distinct"] and sm_["spread"] > 0:
+                    st.success(f"**파동 점수가 높은 그룹이 낮은 그룹보다 건당 기대값이 {sm_['spread']:+.2f}%p 높았고**(신뢰구간 {lo_:+.2f} ~ {hi_:+.2f}) 우연과 구분돼요. 파동형 종목을 고르는 것이 도움이 됐다는 뜻이에요.")
+                else:
+                    st.info(f"상위와 하위 그룹의 건당 기대값 차이는 {sm_['spread']:+.2f}%p(신뢰구간 {lo_:+.2f} ~ {hi_:+.2f})로 **우연과 구분되지 않아요.** 이 기간에서는 파동 점수로 종목을 고르는 효과를 확인하지 못했어요.")
+            st.caption("지금 상장된 종목만 쓰고(상장폐지 제외), 기간이 한 시기의 장세라서 결과가 실제보다 좋게 나올 수 있어요. 진입은 신호 다음 날 종가, 청산은 종가 기준이고 호가 차이·세금은 반영하지 않았어요(비용 0.3%만 반영). "
+                       "평균 이익이 크고 승률이 낮은 그룹은 '자주 지고 가끔 크게 이기는' 구조예요. 박스권 이탈 손절 비율이 높다는 건 박스권이 자주 깨졌다는 뜻이에요.")
+
+    st.divider()
     st.subheader("수급 가설 검증 — 외국인·기관 수급이 이후 수익과 관련 있었나")
     st.markdown("한국 시장은 외국인·기관 수급의 영향이 크다는 가설을 **같은 방식(5등분 비교)**으로 재요. 다만 **수급의 과거 기록이 있어야** 하는데, 네이버가 주는 건 종목마다 최근 일부뿐이에요. "
                 "그래서 아래에서 **수급을 구글 시트의 `수급기록` 탭에 쌓고**, 쌓인 만큼만 검증해요. 가격 지표가 3년치로 검증되는 것과 달리 수급은 **기록한 날부터**만 가능해요.")
@@ -3110,17 +3670,37 @@ def tab_brief(rules):
     fc = st.session_state.get("fincache", {})
     stale = sum(1 for c in hold["종목코드"].drop_duplicates() if c not in fc or (dt.date.today() - dt.date.fromisoformat(str(fc[c].get("fetched", "2000-01-01")))).days > FRESH_DAYS)
     top = max(holds, key=lambda h: h["weight"] or 0) if holds else None
+    import wave
+    extra = []
+    for h_ in holds:                                  # 보유 종목이 파동형이고 박스권 상단이면 정리 점검
+        pf_ = wave.profile(hist_kr(h_["code"])["Close"]) if len(hist_kr(h_["code"])) else None
+        if pf_ and pf_["score"] >= 60 and abs(pf_["trend"]) <= 20 and pf_["state"] == "매도 구간":
+            extra.append({"우선순위": 2, "종목": h_["name"], "내용": f"파동 매도 구간(위치 {pf_['pos']:.0f}%) — 박스권 상단 {pf_['sell_lo']:,.0f}원 근처예요. 계획대로 일부 정리를 점검하세요", "볼 곳": "종목 리포트", "비중(%)": h_["weight"] or 0.0})
+    held_codes = {h_["code"] for h_ in holds}
+    for code_ in watch["종목코드"]:                    # 관심종목이 파동형이고 박스권 하단이면 진입 구간 안내
+        if code_ in held_codes or not len(hist_kr(code_)):
+            continue
+        pf_ = wave.profile(hist_kr(code_)["Close"])
+        if pf_ and pf_["score"] >= 60 and abs(pf_["trend"]) <= 20 and pf_["state"] == "진입 구간":
+            nm_ = watch[watch["종목코드"] == code_]["종목명"].iloc[0] or code_
+            extra.append({"우선순위": 3, "종목": nm_, "내용": f"파동 진입 구간(위치 {pf_['pos']:.0f}%) — {pf_['buy_hi']:,.0f}원 이하, 박스권 이탈(무효가격) {pf_['invalid']:,.0f}원", "볼 곳": "종목 리포트"})
     res = brief.build(holds, cands, {"due_n": len(due), "flowlog_days": fl_days, "cash_days": cash_days, "stale_fin_n": stale, "missing_price_n": missing_price},
-                      {"top_name": top["name"] if top else None, "top_weight": top["weight"] if top else None, "max_pos": st.session_state.risk.get("max_pos")})
+                      {"top_name": top["name"] if top else None, "top_weight": top["weight"] if top else None, "max_pos": st.session_state.risk.get("max_pos")}, extra=extra)
     st.subheader(f"이번 주 브리핑 — {dt.date.today().isoformat()}")
     k = st.columns(4)
     k[0].metric("먼저 확인", f"{res['counts'][1]}건")
     k[1].metric("이번 주 안에", f"{res['counts'][2]}건")
     k[2].metric("여유 있을 때", f"{res['counts'][3]}건")
     k[3].metric("매수 후보", f"{len(res['cands'])}개", help="관심종목 중 종합 점수 55점 이상, 근거 3가지 이상, 진입 구조가 유리·보통인 종목이에요(최대 3개).")
-    top_rows = [a for a in res["actions"] if a["우선순위"] <= 2]
+    p1_rows = [a for a in res["actions"] if a["우선순위"] == 1]
+    p2_rows = [a for a in res["actions"] if a["우선순위"] == 2]
+    top_rows = p1_rows[:8] + p2_rows[:8]            # 비중이 큰 종목부터 위쪽 몇 건만 먼저 보여준다
+    rest_rows = p1_rows[8:] + p2_rows[8:]
     if top_rows:
         st.dataframe(pd.DataFrame(top_rows)[["구분", "종목", "내용", "볼 곳"]], width="stretch", hide_index=True)
+        if rest_rows:
+            with st.expander(f"나머지 {len(rest_rows)}건 (비중이 작은 순)"):
+                st.dataframe(pd.DataFrame(rest_rows)[["구분", "종목", "내용", "볼 곳"]], width="stretch", hide_index=True)
     else:
         st.success("이번 주에 급하게 볼 것은 없어요.")
     low_rows = [a for a in res["actions"] if a["우선순위"] == 3]
@@ -3289,6 +3869,17 @@ def tab_rules():
         s[key]["on"] = a.checkbox(lab, value=s[key]["on"], key=f"s_on_{key}")
         if "v" in s[key] and unit:
             s[key]["v"] = b.number_input(unit, value=float(s[key]["v"]), step=1.0, key=f"s_v_{key}")
+    with st.expander("🔧 올라간 파일 버전 점검 (업로드가 제대로 됐는지 확인)"):
+        import importlib
+        rows_ = []
+        for mod_, need_ in REQUIRED_VERSIONS.items():
+            try:
+                have_ = getattr(importlib.import_module(mod_), "VERSION", None)
+            except Exception as e:
+                have_ = f"읽기 실패({type(e).__name__})"
+            rows_.append({"파일": f"{mod_}.py", "필요한 버전": need_, "올라간 버전": have_ if have_ is not None else "-", "상태": "✅" if isinstance(have_, int) and have_ >= need_ else "❌ 다시 올리세요"})
+        st.dataframe(pd.DataFrame(rows_), width="stretch", hide_index=True)
+        st.caption(f"app.py 버전: {APP_BUILD}. 사이드바 맨 아래에도 같은 표시가 있어요. 이 표시가 다르면 app.py가 예전 것이에요.")
     st.divider()
     st.markdown("**종합 점수 가중치** — 근거 종류별로 얼마나 비중을 둘지예요(합계는 자동으로 100% 기준으로 계산해요). 0으로 두면 그 근거는 점수에서 빠져요. 모두 같게 두면 '그대로 평가'예요.")
     wt = st.session_state.weights
@@ -3345,7 +3936,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 1, "naverfin": 2, "helptext": 1}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 2, "helptext": 1, "scan": 1, "sectors": 1, "wave": 1}
 
 
 def check_versions():
@@ -3414,6 +4005,7 @@ def main():
     load_journal()
     load_plans()
     load_hyp()
+    load_disc_results()
     load_scorelog()
     load_flowlog()
     load_fincache()
@@ -3442,6 +4034,7 @@ def main():
             st.rerun()
         if get_store() is None:
             st.info("데모 모드")
+        st.caption(f"앱 버전: {APP_BUILD}")   # 이 표시가 안 보이면 예전 app.py가 올라가 있는 거예요
 
 
 main()

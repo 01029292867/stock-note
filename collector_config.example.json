@@ -1,0 +1,5 @@
+{
+  "GAS_URL": "여기에 Apps Script 웹앱 주소(/exec로 끝나는 것)",
+  "GAS_TOKEN": "여기에 Apps Script TOKEN",
+  "DART_API_KEY": "여기에 DART 인증키"
+}
