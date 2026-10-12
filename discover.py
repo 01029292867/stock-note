@@ -3,6 +3,8 @@
   2단계  DART 주요계정 일괄 조회(100개씩) -> 흑자·부채비율·ROE·PER·PBR 필터
   3단계  상위 후보만 상세 점검(안전 기준·가격 흐름) -> 앱에서 처리
 가져오지 못한 값은 NaN으로 두고, 조용히 통과시키지 않는다."""
+VERSION = 2  # 2: PER·PBR이 비면 그 조건 건너뜀, 시가총액 순위 보충
+
 import datetime as dt
 
 import numpy as np

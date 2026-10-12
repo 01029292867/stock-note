@@ -1,7 +1,7 @@
 """파동(박스권) 분석: 오르내림을 반복하는 종목을 숫자로 찾고, 진입·매도 구간과 무효가격(박스권 이탈)을 계산한다.
 과거에 이 규칙을 썼다면 어땠는지(백테스트)와, 파동형으로 보이는 종목에서 정말 더 잘 통했는지(전 종목 검증)도 같이 본다.
 박스권은 언제든 깨질 수 있고(추세 전환), 비용(약 0.3%)보다 파동 폭이 충분히 커야 남는다. 과거 결과가 미래를 보장하지 않는다."""
-VERSION = 1
+VERSION = 3  # 3: 변동성·파동 폭 상한 반영, 기대 수익폭을 보수적으로 / 2: 점수 구성(parts)
 
 import numpy as np
 import pandas as pd
@@ -9,6 +9,12 @@ import pandas as pd
 import levels
 
 COST = 0.003
+
+
+def is_wave(pf):
+    """파동형으로 볼 조건: 파동 점수 60 이상이면서 추세가 연 ±20% 이내. (점수만으로는 무작위 움직임과 완전히 구분되지 않아서,
+    실제로 통했는지는 그 종목의 과거 거래 성적과 전 종목 검증으로 확인한다.)"""
+    return bool(pf and pf["score"] >= 60 and abs(pf["trend"]) <= 20)
 
 
 def _cv(x):
@@ -29,6 +35,7 @@ def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
     r2 = float(1 - ((y - fit) ** 2).sum() / ((y - y.mean()) ** 2).sum()) if ((y - y.mean()) ** 2).sum() > 0 else 0.0
     trend = float((np.exp(slope * 252) - 1) * 100)
     vol = float(np.std(np.diff(y)))
+    vol_ann = vol * np.sqrt(252) * 100
     thr = float(np.clip(vol * np.sqrt(20) * 0.9, 0.05, 0.15))
     piv = levels.zigzag(w.values, thr)
     ups, downs, gaps = [], [], []
@@ -44,23 +51,29 @@ def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
     L, U, lo, hi = float(b.quantile(lo_q)), float(b.quantile(hi_q)), float(b.min()), float(b.max())
     price = float(c.iloc[-1])
     pos = float((price - lo) / (hi - lo) * 100) if hi > lo else np.nan
-    gain = (U / L - 1 - cost) * 100
+    gain_band = (U / L - 1 - cost) * 100
+    gain = min(gain_band, amp - cost * 100) if amp == amp else gain_band      # 보수적으로: 구간 폭과 실제 상승 파동 중간값 중 작은 값
     s_trend = 1 - min(abs(trend) / 30, 1)
     s_r2 = 1 - min(r2 / 0.5, 1)
     s_freq = min(per_year / 6, 1)
-    s_amp = min(max(amp - 3, 0) / 9, 1) if amp == amp else 0.0
+    if amp == amp:                                                            # 3%면 0점, 12~15%가 만점, 15%를 넘으면 '크게 흔들리는 종목'이라 깎는다
+        s_amp = min(max(amp - 3, 0) / 9, 1) if amp <= 15 else max(1 - (amp - 15) / 15, 0.0)
+    else:
+        s_amp = 0.0
     cv = _cv(ups)
     s_reg = 1 - min(cv, 1.0) if cv == cv else 0.0
-    score = float(100 * (0.30 * s_trend + 0.15 * s_r2 + 0.20 * s_freq + 0.25 * s_amp + 0.10 * s_reg))
-    parts = [("추세가 약한가", f"연 {trend:+.0f}%", s_trend, 0.30, "연 ±30%를 넘으면 0점"),
-             ("한 방향으로 흐르지 않는가", f"추세 설명력 {r2 * 100:.0f}%", s_r2, 0.15, "설명력 50% 이상이면 0점"),
-             ("오르내림이 자주 있는가", f"연 {per_year:.1f}회", s_freq, 0.20, "연 6회 이상이면 만점"),
-             ("한 번 움직이는 폭이 큰가", "-" if amp != amp else f"+{amp:.1f}%", s_amp, 0.25, "3%면 0점, 12% 이상이면 만점"),
-             ("폭이 규칙적인가", "-" if cv != cv else f"변동계수 {cv:.2f}", s_reg, 0.10, "폭이 들쭉날쭉하면 낮아요")]
+    s_vol = 1 - min(max(vol_ann - 15, 0) / 35, 1)                             # 연 변동성 15% 이하 만점, 50% 이상 0점
+    score = float(100 * (0.25 * s_trend + 0.10 * s_r2 + 0.15 * s_freq + 0.25 * s_amp + 0.10 * s_reg + 0.15 * s_vol))
+    parts = [("추세가 약한가", f"연 {trend:+.0f}%", s_trend, 0.25, "연 ±30%를 넘으면 0점"),
+             ("한 방향으로 흐르지 않는가", f"추세 설명력 {r2 * 100:.0f}%", s_r2, 0.10, "설명력 50% 이상이면 0점"),
+             ("오르내림이 자주 있는가", f"연 {per_year:.1f}회", s_freq, 0.15, "연 6회 이상이면 만점"),
+             ("한 번 움직이는 폭이 알맞은가", "-" if amp != amp else f"+{amp:.1f}%", s_amp, 0.25, "3%면 0점, 12~15%가 만점, 15%를 넘으면 감점(30%면 0점)"),
+             ("폭이 규칙적인가", "-" if cv != cv else f"변동계수 {cv:.2f}", s_reg, 0.10, "폭이 들쭉날쭉하면 낮아요"),
+             ("변동성이 작은가", f"연 {vol_ann:.0f}%", s_vol, 0.15, "연 15% 이하 만점, 50% 이상 0점")]
     state = "진입 구간" if pos == pos and pos <= 25 else "매도 구간" if pos == pos and pos >= 75 else "중간"
     return {"score": score, "trend": trend, "r2": r2, "thr": thr * 100, "n_up": len(ups), "n_down": len(downs), "per_year": float(per_year),
             "amp_up": amp, "amp_down": float(np.median(downs)) if downs else np.nan, "period": float(np.median(gaps)) if gaps else np.nan,
-            "L": L, "U": U, "lo": lo, "hi": hi, "pos": pos, "gain": float(gain), "price": price, "state": state,
+            "L": L, "U": U, "lo": lo, "hi": hi, "pos": pos, "gain": float(gain), "gain_band": float(gain_band), "vol": float(vol_ann), "price": price, "state": state,
             "invalid": float(lo * 0.97), "buy_hi": L, "sell_lo": U, "parts": parts}
 
 
