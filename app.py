@@ -43,7 +43,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정6(KRX 막힘 대체)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-12 수정7(파동 탐색 범위 확대)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -2404,11 +2404,15 @@ def render_scan(sc_res, cand):
 WAVE_REF = {"033780": "KT&G"}   # 파동 매매의 기준으로 삼는 종목(오르내림을 반복하는 안정 종목의 예)
 
 
-def run_wave_scan(cand, include_own):
+def run_wave_scan(cand, include_own, pool=None):
     """② 재무를 통과한(안정적인) 후보와 내 보유·관심 종목 중 오르내림을 반복하는 파동형 종목을 찾는다."""
     import wave
     bar = st.progress(0.0, text="준비 중…")
     items = {r["종목코드"]: (r["종목명"], "후보") for r in cand.to_dict("records")}
+    passed = set(items)
+    if pool is not None:                              # 재무 조건과 상관없이 시가총액 상위 전체까지 넓힌다(재무 통과 여부는 열로 표시)
+        for r in pool.to_dict("records"):
+            items.setdefault(r["종목코드"], (r["종목명"], "시총상위"))
     for rc, rn in WAVE_REF.items():                  # 기준 종목은 늘 함께 분석한다
         items.setdefault(rc, (rn, "기준"))
     if include_own:
@@ -2426,7 +2430,7 @@ def run_wave_scan(cand, include_own):
             continue
         sx = wave.stats(wave.backtest(df["Close"]), df["Close"])
         meta = st.session_state.get("disc_meta", {}).get(c, {})
-        rows.append({"종목코드": c, "종목명": items[c][0], "구분": items[c][1], "업종": meta.get("업종", "-"), "파동 점수": pf["score"], "추세(연%)": pf["trend"], "파동 횟수(연)": pf["per_year"],
+        rows.append({"종목코드": c, "종목명": items[c][0], "구분": items[c][1], "재무 통과": "✓" if c in passed else "-", "업종": meta.get("업종", "-"), "파동 점수": pf["score"], "추세(연%)": pf["trend"], "파동 횟수(연)": pf["per_year"],
                      "상승 파동(%)": pf["amp_up"], "변동성(연%)": pf["vol"], "주기(일)": pf["period"], "지금 위치(%)": pf["pos"], "상태": pf["state"], "진입 구간(원 이하)": pf["buy_hi"], "매도 목표(원 이상)": pf["sell_lo"],
                      "무효가격(원)": pf["invalid"], "기대 수익폭(%)": pf["gain"], "최대 매수(주)": wave_size(pf["price"], pf["invalid"]) or np.nan,
                      "과거 거래": sx.get("n", 0), "승률(%)": sx.get("win", np.nan), "건당 기대값(%)": sx.get("exp", np.nan),
@@ -2461,12 +2465,15 @@ def render_wave_scan(res_w):
     tmax = f2.slider("추세 한도(연 ±%)", 5, 60, 20, 5, key="wv_f_trend")
     vmax = f3.slider("변동성 상한(연 %)", 10, 80, 35, 5, key="wv_f_vol", help="크게 흔들리는 종목을 빼요. 오르내림이 규칙적이어도 변동성이 크면 '소소한 수익'이 아니라 큰 손실도 같이 올 수 있어요.")
     amp_lo, amp_hi = f4.slider("상승 파동 폭(%)", 2, 40, (4, 15), 1, key="wv_f_amp", help="저점에서 고점까지 오르는 폭의 중간값이에요. 비용(0.3%)을 넘으면서 너무 크지 않은 범위만 보세요.")
-    g1, g2, g3 = st.columns(3)
+    g1, g2, g3, g4 = st.columns([1, 2, 2, 1.4])
     only_in = g1.checkbox("진입 구간만(위치 25% 이하)", value=False, key="wv_f_in")
     only_pos = g2.checkbox("과거 규칙이 플러스였던 종목만(거래 10회 이상, 건당 기대값 > 0)", value=False, key="wv_f_pos",
                            help="그 종목에서 파동 규칙을 썼다면 평균적으로 벌었던 종목만 보여요. 한 종목의 기록은 우연일 수 있어요.")
-    kinds = g3.multiselect("구분", ["후보", "보유", "관심", "기준"], default=["후보", "보유", "관심", "기준"], key="wv_f_kind")
+    kinds = g3.multiselect("구분", ["후보", "시총상위", "보유", "관심", "기준"], default=["후보", "시총상위", "보유", "관심", "기준"], key="wv_f_kind",
+                           help="후보=재무 조건을 통과한 종목, 시총상위=재무 조건과 상관없이 시가총액 상위에서 찾은 종목이에요. 시총상위는 안전 기준을 아직 안 본 상태예요.")
     v = df[(df["파동 점수"] >= mn) & (df["추세(연%)"].abs() <= tmax) & (df["변동성(연%)"] <= vmax) & df["상승 파동(%)"].between(amp_lo, amp_hi) & df["구분"].isin(kinds)]
+    if g4.checkbox("재무 조건 통과 종목만", value=False, key="wv_f_fin", help="② 재무 조건(흑자·부채비율·ROE·PER)을 통과한 종목만 봐요. 보유·관심·기준 종목은 해당 없으면 빠져요."):
+        v = v[v["재무 통과"] == "✓"]
     if only_in:
         v = v[v["상태"] == "진입 구간"]
     if only_pos:
@@ -2480,7 +2487,7 @@ def render_wave_scan(res_w):
     if v.empty:
         st.info("조건에 맞는 종목이 없어요. 최소 파동 점수나 추세 한도를 완화해 보세요.")
     else:
-        cols = ["종목명", "구분", "업종", "파동 점수", "추세(연%)", "변동성(연%)", "파동 횟수(연)", "상승 파동(%)", "주기(일)", "지금 위치(%)", "상태", "진입 구간(원 이하)", "매도 목표(원 이상)", "무효가격(원)",
+        cols = ["종목명", "구분", "재무 통과", "업종", "파동 점수", "추세(연%)", "변동성(연%)", "파동 횟수(연)", "상승 파동(%)", "주기(일)", "지금 위치(%)", "상태", "진입 구간(원 이하)", "매도 목표(원 이상)", "무효가격(원)",
                 "기대 수익폭(%)", "최대 매수(주)", "과거 거래", "승률(%)", "건당 기대값(%)", "손절 비율(%)"]
         st.dataframe(v[cols], width="stretch", hide_index=True, column_config={
             "파동 점수": st.column_config.NumberColumn(format="%.0f"), "추세(연%)": st.column_config.NumberColumn(format="%+.0f"), "변동성(연%)": st.column_config.NumberColumn(format="%.0f"), "파동 횟수(연)": st.column_config.NumberColumn(format="%.1f"),
@@ -2607,8 +2614,10 @@ def tab_discover():
                "종목마다 진입·매도 구간, 박스권 이탈 가격(무효가격), 과거에 이 규칙을 썼다면의 성적을 보여줘요.")
     wave_win_picker()
     own_ = st.checkbox("내 보유·관심 종목도 함께 분석", value=True, key="wv_own")
+    wide_ = st.checkbox("재무 조건과 상관없이 시가총액 상위 전체에서도 찾기 (종목이 많아 1~3분 걸려요, 안전 점검은 나중에)", value=True, key="wv_wide",
+                        help="KT&G처럼 안정적인 종목이 PER 같은 재무 조건에 걸려 후보에서 빠질 수 있어서, 시가총액 기준을 통과한 종목 전체를 먼저 훑어요. 재무 통과 여부는 표의 '재무 통과' 열에 나와요.")
     if st.button("파동형 후보 찾기", key="wv_run"):
-        run_wave_scan(cand, own_)
+        run_wave_scan(cand, own_, tbl if wide_ else None)
     rw_ = st.session_state.get("disc_wave")
     if rw_:
         render_wave_scan(rw_)
