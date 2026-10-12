@@ -1,7 +1,7 @@
 """파동(박스권) 분석: 오르내림을 반복하는 종목을 숫자로 찾고, 진입·매도 구간과 무효가격(박스권 이탈)을 계산한다.
 과거에 이 규칙을 썼다면 어땠는지(백테스트)와, 파동형으로 보이는 종목에서 정말 더 잘 통했는지(전 종목 검증)도 같이 본다.
 박스권은 언제든 깨질 수 있고(추세 전환), 비용(약 0.3%)보다 파동 폭이 충분히 커야 남는다. 과거 결과가 미래를 보장하지 않는다."""
-VERSION = 4  # 4: 손절을 '진입가 기준'으로 바로잡음(전에는 구간 하단 기준이라 이미 그 아래서 산 거래가 바로 손절됨) / 3: 변동성·파동 폭 상한 / 2: 점수 구성(parts)
+VERSION = 5  # 5: 변동성 그룹별 검증(vol_study) / 4: 손절을 '진입가 기준'으로 바로잡음(전에는 구간 하단 기준이라 이미 그 아래서 산 거래가 바로 손절됨) / 3: 변동성·파동 폭 상한 / 2: 점수 구성(parts)
 
 import numpy as np
 import pandas as pd
@@ -179,3 +179,58 @@ def wave_study(prices, formation=250, n_boot=1000, seed=0, **bt):
     if len(allr):
         summ["all_exp"], summ["all_win"] = float(allr.mean()), float((allr > 0).mean() * 100)
     return pd.DataFrame(out), summ
+
+
+# ---------------- 변동이 작은(안정적인) 종목군에서 통했나 ----------------
+RULES = {"기본 규칙(120일 구간, 손절 5%, 최소 폭 6%)": {},
+         "좁은 폭 규칙(60일 구간, 손절 3%, 최소 폭 3%, 30일 정리)": {"band_win": 60, "stop_gap": 0.03, "min_gain": 0.03, "max_hold": 30}}
+VOL_NAMES = ["1(변동 작음)", "2", "3", "4", "5(변동 큼)"]
+
+
+def vol_study(prices, formation=250, n_boot=1000, seed=0):
+    """종목을 처음 1년의 변동성 순으로 5등분하고, 그 뒤 기간에 규칙 두 가지를 적용해서 변동이 작은 종목군에서 통했는지 본다.
+    '연 환산 수익'은 종목마다(거래 수익률 합 ÷ 검증 기간 연수)의 평균으로, 소소하게 꾸준히 번다는 목표에 맞춘 값이다(복리 아님).
+    반환: ({규칙 이름: 그룹별 표}, 요약 dict)"""
+    rows = []
+    for code, df in prices.items():
+        c = pd.Series(df["Close"]).dropna() if df is not None and len(df) else None
+        if c is None or len(c) < formation + 250:
+            continue
+        pf = profile(c.iloc[:formation], window=formation)
+        if pf is None:
+            continue
+        years = (len(c) - formation) / 252
+        rows.append({"code": code, "vol": pf["vol"], "years": years, "bh": float((c.iloc[-1] / c.iloc[formation] - 1) * 100),
+                     "tr": {name: backtest(c, start=formation, **kw) for name, kw in RULES.items()}})
+    if len(rows) < 20:
+        return None, {"n_stocks": len(rows), "msg": "종목이 너무 적어서(20개 미만) 비교할 수 없어요."}
+    vols = np.array([r["vol"] for r in rows])
+    grp = np.digitize(vols, np.quantile(vols, [0.2, 0.4, 0.6, 0.8]))
+    rng = np.random.default_rng(seed)
+    tables, summary = {}, {"n_stocks": len(rows), "vol_cut": [float(np.min(vols[grp == g])) if (grp == g).any() else np.nan for g in range(5)] + [float(np.max(vols))]}
+    for name in RULES:
+        out, ann = [], {}
+        for g in range(5):
+            sel = [i for i in range(len(rows)) if grp[i] == g]
+            rets = [rows[i]["tr"][name]["수익률(%)"].values for i in sel]
+            allr = np.concatenate([x for x in rets if len(x)] or [np.array([])])
+            ann[g] = np.array([x.sum() / rows[i]["years"] for x, i in zip(rets, sel)])         # 종목별 연 환산 수익(%p)
+            per = np.array([len(x) / rows[i]["years"] for x, i in zip(rets, sel)])
+            row = {"그룹": VOL_NAMES[g], "연 변동성(%)": float(np.mean(vols[sel])) if sel else np.nan, "종목수": len(sel), "거래 수": int(len(allr)), "종목당 연 거래": float(per.mean()) if len(per) else np.nan}
+            if len(allr):
+                w_, l_ = allr[allr > 0], allr[allr < 0]
+                reasons = np.concatenate([rows[i]["tr"][name]["사유"].values for i in sel if len(rows[i]["tr"][name])])
+                row.update({"승률(%)": float((allr > 0).mean() * 100), "평균 이익(%)": float(w_.mean()) if len(w_) else np.nan, "평균 손실(%)": float(l_.mean()) if len(l_) else np.nan,
+                            "건당 기대값(%)": float(allr.mean()), "손절 비율(%)": float((reasons == "박스권 이탈 손절").mean() * 100)})
+            row["연 환산 수익(%p)"] = float(ann[g].mean()) if len(ann[g]) else np.nan
+            row["같은 기간 보유 평균(%)"] = float(np.mean([rows[i]["bh"] for i in sel])) if sel else np.nan
+            out.append(row)
+        tables[name] = pd.DataFrame(out)
+        low = np.concatenate([ann[0], ann[1]])
+        high = np.concatenate([ann[3], ann[4]])
+        s = {"low_mean": float(low.mean()), "low_ci": tuple(float(x) for x in np.percentile([rng.choice(low, len(low)).mean() for _ in range(n_boot)], [2.5, 97.5])),
+             "n_low": int(len(low)), "diff": float(low.mean() - high.mean())}
+        diffs = [rng.choice(low, len(low)).mean() - rng.choice(high, len(high)).mean() for _ in range(n_boot)]
+        s["diff_ci"] = tuple(float(x) for x in np.percentile(diffs, [2.5, 97.5]))
+        summary[name] = s
+    return tables, summary

@@ -43,7 +43,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정8(파동 손절 기준 수정)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-12 수정9(안정 종목군 검증)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -3529,6 +3529,58 @@ def tab_lab():
                        "평균 이익이 크고 승률이 낮은 그룹은 '자주 지고 가끔 크게 이기는' 구조예요. 박스권 이탈 손절 비율이 높다는 건 박스권이 자주 깨졌다는 뜻이에요.")
 
     st.divider()
+    st.subheader("🌊 안정 종목군 검증 — 변동이 작은 종목에서 이 규칙이 통했나 (KT&G 같은)")
+    st.markdown("종목을 **처음 1년의 변동성 순으로 5등분**해서, 그 뒤 기간에 규칙을 적용했을 때 **변동이 작은 종목군에서 실제로 통했는지** 봐요. 변동이 작은 종목에는 폭이 작은 규칙이 맞을 수 있어서 **기본 규칙**과 **좁은 폭 규칙**(60일 구간, 손절 3%, 최소 폭 3%, 30일 정리) 두 가지를 같이 시험해요. "
+                "**소소하게 꾸준히** 버는지 보려고 종목당 연 거래 수와 **연 환산 수익**(종목마다 거래 수익률을 더해 검증 기간 연수로 나눈 값, 복리 아님)도 보여줘요. 3년 이상 기간이 필요해요.")
+    if st.button("안정 종목군 검증 실행", key="wavevol_run"):
+        import wave
+        barv = st.progress(0.0, text="준비 중…")
+        codes_v, note_v = lab_universe(n_uni)
+        if note_v:
+            st.warning(note_v)
+        Pv = lab_panel(codes_v, years, h, barv)
+        if Pv is None:
+            barv.empty()
+            st.error("검증할 가격 자료를 가져오지 못했어요.")
+        else:
+            barv.progress(0.9, text="변동성 그룹별로 검증하는 중…")
+            prv = {c: pd.DataFrame({"Close": Pv["C"][c].dropna()}) for c in Pv["C"].columns}
+            tv_, sv_ = wave.vol_study(prv)
+            barv.empty()
+            st.session_state["lab_wave_vol"] = {"tabs": tv_, "sm": sv_, "years": years, "n": len(prv)}
+            if tv_ is not None:
+                rows_h = []
+                for rn_, s_ in ((k, sv_[k]) for k in tv_):
+                    good_ = s_["low_ci"][0] > 0
+                    rows_h.append([dt.date.today().isoformat(), f"전략: 파동 하단진입(변동 작은 종목군·{rn_.split('(')[0]})", len(prv), years, 60, int(tv_[rn_]["거래 수"].sum()), None,
+                                   s_["low_mean"], s_["low_ci"][0], s_["low_ci"][1], "Y" if good_ else "N", "검증됨(약함): 변동 작은 종목군에서 플러스" if good_ else "효과 구분 안 됨"])
+                save_hyp(rows_h)
+    rvv = st.session_state.get("lab_wave_vol")
+    if rvv:
+        if rvv["tabs"] is None:
+            st.warning(rvv["sm"].get("msg", "비교할 수 없어요."))
+        else:
+            st.markdown(f"**{rvv['n']}종목 · 최근 {rvv['years']}년 검증 결과** (연 변동성은 처음 1년 기준이에요)")
+            cfg_ = {"연 변동성(%)": st.column_config.NumberColumn(format="%.0f"), "종목당 연 거래": st.column_config.NumberColumn(format="%.1f"), "승률(%)": st.column_config.NumberColumn(format="%.0f"),
+                    "평균 이익(%)": st.column_config.NumberColumn(format="%+.1f"), "평균 손실(%)": st.column_config.NumberColumn(format="%+.1f"), "건당 기대값(%)": st.column_config.NumberColumn(format="%+.2f"),
+                    "손절 비율(%)": st.column_config.NumberColumn(format="%.0f"), "연 환산 수익(%p)": st.column_config.NumberColumn(format="%+.1f", help="종목마다 (거래 수익률 합 ÷ 검증 기간 연수)의 평균이에요. 거래가 없는 종목은 0으로 쳐요."),
+                    "같은 기간 보유 평균(%)": st.column_config.NumberColumn(format="%+.1f")}
+            for rn_, t_ in rvv["tabs"].items():
+                s_ = rvv["sm"][rn_]
+                st.markdown(f"**{rn_}**")
+                st.dataframe(t_, width="stretch", hide_index=True, column_config=cfg_)
+                lo_, hi_ = s_["low_ci"]
+                line = f"변동이 작은 두 그룹({s_['n_low']}종목)의 **연 환산 수익은 평균 {s_['low_mean']:+.1f}%p**(신뢰구간 {lo_:+.1f} ~ {hi_:+.1f})예요. 변동이 큰 두 그룹과의 차이는 {s_['diff']:+.1f}%p(신뢰구간 {s_['diff_ci'][0]:+.1f} ~ {s_['diff_ci'][1]:+.1f})예요."
+                if lo_ > 0:
+                    st.success(line + " 신뢰구간이 0보다 커서 **변동이 작은 종목군에서도 규칙이 플러스였어요**(이 기간 기준).")
+                elif hi_ < 0:
+                    st.error(line + " 신뢰구간이 모두 0보다 작아요. **변동이 작은 종목군에서는 이 규칙이 손실이었어요.**")
+                else:
+                    st.info(line + " 신뢰구간이 0을 포함해서 **변동이 작은 종목군에서 플러스인지 가려내지 못했어요.**")
+            st.caption("지금 상장된 종목만 쓰고(상장폐지 제외), 한 시기의 장세라서 결과가 실제보다 좋게 나올 수 있어요. 비용 0.3%만 반영했고 호가 차이·세금은 빠졌어요. '같은 기간 보유 평균'과 꼭 비교하세요(시장이 많이 오른 기간에는 그냥 들고 있는 편이 훨씬 나을 수 있어요). "
+                       "변동이 작은 그룹은 구간 폭이 좁아 최소 폭 조건 때문에 거래가 적을 수 있어요(종목당 연 거래 수 참고).")
+
+    st.divider()
     st.subheader("수급 가설 검증 — 외국인·기관 수급이 이후 수익과 관련 있었나")
     st.markdown("한국 시장은 외국인·기관 수급의 영향이 크다는 가설을 **같은 방식(5등분 비교)**으로 재요. 다만 **수급의 과거 기록이 있어야** 하는데, 네이버가 주는 건 종목마다 최근 일부뿐이에요. "
                 "그래서 아래에서 **수급을 구글 시트의 `수급기록` 탭에 쌓고**, 쌓인 만큼만 검증해요. 가격 지표가 3년치로 검증되는 것과 달리 수급은 **기록한 날부터**만 가능해요.")
@@ -4011,7 +4063,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 4, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 5, "discover": 2}
 
 
 def check_versions():
