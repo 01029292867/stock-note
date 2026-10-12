@@ -1,7 +1,7 @@
 """파동(박스권) 분석: 오르내림을 반복하는 종목을 숫자로 찾고, 진입·매도 구간과 무효가격(박스권 이탈)을 계산한다.
 과거에 이 규칙을 썼다면 어땠는지(백테스트)와, 파동형으로 보이는 종목에서 정말 더 잘 통했는지(전 종목 검증)도 같이 본다.
 박스권은 언제든 깨질 수 있고(추세 전환), 비용(약 0.3%)보다 파동 폭이 충분히 커야 남는다. 과거 결과가 미래를 보장하지 않는다."""
-VERSION = 3  # 3: 변동성·파동 폭 상한 반영, 기대 수익폭을 보수적으로 / 2: 점수 구성(parts)
+VERSION = 4  # 4: 손절을 '진입가 기준'으로 바로잡음(전에는 구간 하단 기준이라 이미 그 아래서 산 거래가 바로 손절됨) / 3: 변동성·파동 폭 상한 / 2: 점수 구성(parts)
 
 import numpy as np
 import pandas as pd
@@ -9,6 +9,7 @@ import pandas as pd
 import levels
 
 COST = 0.003
+STOP_GAP = 0.05          # 진입가보다 이만큼 내려가면 박스권이 깨진 것으로 보고 정리한다
 
 
 def is_wave(pf):
@@ -77,9 +78,10 @@ def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
             "invalid": float(lo * 0.97), "buy_hi": L, "sell_lo": U, "parts": parts}
 
 
-def backtest(close, band_win=120, lo_q=0.2, hi_q=0.8, stop_gap=0.03, max_hold=60, min_gain=0.06, cost=COST, start=None):
+def backtest(close, band_win=120, lo_q=0.2, hi_q=0.8, stop_gap=STOP_GAP, max_hold=60, min_gain=0.06, cost=COST, start=None):
     """최근 band_win일의 하단(lo_q)·상단(hi_q) 가격을 구간으로 보고, 하단 이하면 다음 날 종가에 사서 상단에서 팔고,
-    하단보다 stop_gap 더 내려가면 손절, max_hold일이 지나면 정리한다. 미래 값을 쓰지 않는다. 반환: 거래 DataFrame"""
+    **진입가(구간 하단보다 이미 낮게 샀다면 그 가격)보다 stop_gap 더 내려가면 손절**, max_hold일이 지나면 정리한다. 미래 값을 쓰지 않는다. 반환: 거래 DataFrame
+    (손절을 구간 하단 기준으로 잡으면, 신호 다음 날 이미 그 아래에서 산 거래가 곧바로 손절돼서 결과가 무작위에 가까워진다.)"""
     c = pd.Series(close).dropna().astype(float)
     v, idx = c.values, c.index
     n = len(v)
@@ -90,7 +92,8 @@ def backtest(close, band_win=120, lo_q=0.2, hi_q=0.8, stop_gap=0.03, max_hold=60
         L, U = np.quantile(b, lo_q), np.quantile(b, hi_q)
         if v[t] <= L and (U / L - 1) >= min_gain:
             e = t + 1                                    # 신호가 난 다음 날 종가에 산다
-            entry, stop, target = v[e], L * (1 - stop_gap), U
+            entry, target = v[e], U
+            stop = min(entry, L) * (1 - stop_gap)
             k, reason = e, "기간 종료"
             for k in range(e + 1, min(e + max_hold, n - 1) + 1):
                 if v[k] >= target:

@@ -43,7 +43,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정7(파동 탐색 범위 확대)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-12 수정8(파동 손절 기준 수정)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -1775,7 +1775,7 @@ def report_wave(code, name, price, df, card, held):
     st.altair_chart(alt.layer(base, rules_).properties(height=240), width="stretch")
     tr = wave.backtest(close)
     sx = wave.stats(tr, close)
-    st.markdown("**과거에 이 규칙을 썼다면?** (최근 120일 하단 20%선 이하에서 다음 날 종가에 사서, 상단 80%선에서 팔고, 하단보다 3% 더 내려가면 손절, 60일이 지나면 정리 — 비용 0.3% 반영)")
+    st.markdown("**과거에 이 규칙을 썼다면?** (최근 120일 하단 20%선 이하에서 다음 날 종가에 사서, 상단 80%선에서 팔고, 진입가보다 5% 더 내려가면 손절, 60일이 지나면 정리 — 비용 0.3% 반영)")
     if sx["n"] == 0:
         st.info("이 종목에서는 규칙에 맞는 거래가 없었어요.")
     else:
@@ -3482,7 +3482,7 @@ def tab_lab():
 
     st.divider()
     st.subheader("🌊 파동(박스권) 전략 검증 — 하단에서 사서 상단에서 파는 규칙이 평균적으로 통했나")
-    st.markdown("종목마다 **처음 1년으로 파동 점수**를 매기고(미래 값 없이), **그 뒤 기간에 같은 규칙**(120일 하단 20%선 이하에서 사서, 상단 80%선에서 팔고, 하단보다 3% 더 내려가면 손절, 60일 후 정리, 비용 0.3%)을 적용해요. "
+    st.markdown("종목마다 **처음 1년으로 파동 점수**를 매기고(미래 값 없이), **그 뒤 기간에 같은 규칙**(120일 하단 20%선 이하에서 사서, 상단 80%선에서 팔고, 진입가보다 5% 더 내려가면 손절, 60일 후 정리, 비용 0.3%)을 적용해요. "
                 "**파동 점수가 높은 종목 그룹이 낮은 그룹보다 실제로 더 잘 통했는지**와, 이 규칙이 전체 평균으로 비용과 손절을 넘었는지 확인해요. 3년 이상 기간이 필요해요.")
     if st.button("파동 전략 검증 실행", key="wave_run"):
         import wave
@@ -3521,6 +3521,8 @@ def tab_lab():
                 lo_, hi_ = sm_["ci"]
                 if sm_["distinct"] and sm_["spread"] > 0:
                     st.success(f"**파동 점수가 높은 그룹이 낮은 그룹보다 건당 기대값이 {sm_['spread']:+.2f}%p 높았고**(신뢰구간 {lo_:+.2f} ~ {hi_:+.2f}) 우연과 구분돼요. 파동형 종목을 고르는 것이 도움이 됐다는 뜻이에요.")
+                elif sm_["distinct"] and sm_["spread"] < 0:
+                    st.error(f"**파동 점수가 높은 그룹이 오히려 낮은 그룹보다 건당 기대값이 {abs(sm_['spread']):.2f}%p 낮았어요**(신뢰구간 {lo_:+.2f} ~ {hi_:+.2f}, 우연과 구분돼요). 이 기간에서는 '파동 점수가 높은 종목'을 고르는 것이 도움이 되기는커녕 **반대로 나왔어요.** 파동 점수만 믿고 고르지 마세요.")
                 else:
                     st.info(f"상위와 하위 그룹의 건당 기대값 차이는 {sm_['spread']:+.2f}%p(신뢰구간 {lo_:+.2f} ~ {hi_:+.2f})로 **우연과 구분되지 않아요.** 이 기간에서는 파동 점수로 종목을 고르는 효과를 확인하지 못했어요.")
             st.caption("지금 상장된 종목만 쓰고(상장폐지 제외), 기간이 한 시기의 장세라서 결과가 실제보다 좋게 나올 수 있어요. 진입은 신호 다음 날 종가, 청산은 종가 기준이고 호가 차이·세금은 반영하지 않았어요(비용 0.3%만 반영). "
@@ -4009,7 +4011,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 3, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 4, "discover": 2}
 
 
 def check_versions():
