@@ -152,13 +152,41 @@ def to_fin(nf):
 SUM = "https://finance.naver.com/sise/sise_market_sum.naver"
 
 
+def page_hint(html):
+    """받은 페이지가 무엇인지 짧게(제목과 본문 앞부분). 표를 못 찾을 때 안내 문구에 쓴다."""
+    import re as _re
+    t = _re.search(r"<title[^>]*>(.*?)</title>", html or "", _re.S)
+    body = _re.sub(r"<script.*?</script>|<style.*?</style>|<[^>]+>", " ", html or "", flags=_re.S)
+    body = _re.sub(r"\s+", " ", body).strip()
+    return f"제목 '{(t.group(1).strip() if t else '-')[:40]}', 본문 '{body[:80]}'"
+
+
+def parse_market_json(data):
+    """모바일 API(시가총액 순위) 응답 -> [{'Code','Name','Close','Marcap'(원),'Volume','Amount'(원)}]"""
+    stocks = data.get("stocks") if isinstance(data, dict) else None
+    if not stocks:
+        keys = ", ".join(list(data)[:6]) if isinstance(data, dict) else type(data).__name__
+        raise NaverFinError(f"모바일 시가총액 응답 형식이 달라요(항목: {keys[:60]})")
+    out = []
+    for s in stocks:
+        code = str(s.get("itemCode") or s.get("code") or "").zfill(6)
+        price, cap, vol = _num(s.get("closePrice")), _num(s.get("marketValue")), _num(s.get("accumulatedTradingVolume"))
+        if not code.strip("0") or cap is None:
+            continue
+        out.append({"Code": code, "Name": s.get("stockName") or s.get("name") or code, "Close": price, "Marcap": cap * 1e8,
+                    "Volume": vol, "Amount": price * vol if (price is not None and vol is not None) else None, "PER": None, "ROE": None})
+    if not out:
+        raise NaverFinError("모바일 시가총액 응답에서 읽을 종목이 없었어요")
+    return out
+
+
 def parse_market_sum(html):
     """시가총액 순위 페이지 -> [{'Code','Name','Close','Marcap'(원),'Volume','Amount'(원, 현재가×거래량),'PER','ROE'}]"""
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
     tb = soup.select_one("table.type_2")
     if tb is None:
-        raise NaverFinError(f"시가총액 표를 찾지 못했어요({len(html or ''):,}자, 표 {len(soup.find_all('table'))}개)")
+        raise NaverFinError(f"시가총액 표를 찾지 못했어요({len(html or ''):,}자, 표 {len(soup.find_all('table'))}개; {page_hint(html)})")
     heads = [th.get_text(" ", strip=True) for th in tb.select("thead th")]
     idx = {h: i for i, h in enumerate(heads)}
 
@@ -182,8 +210,47 @@ def parse_market_sum(html):
     return out
 
 
+MOBILE_CAP = "https://m.stock.naver.com/api/stocks/marketValue/{mkt}"
+
+
+def market_top_mobile(n=600, get=None, pause=0.15):
+    """모바일 API로 코스피·코스닥 시가총액 순위를 읽는다(웹 페이지가 막힐 때의 대체). 반환: DataFrame"""
+    import time
+
+    import pandas as pd
+    get = get or requests.get
+    rows, errs = [], []
+    per = 100
+    for mkt in ("KOSPI", "KOSDAQ"):
+        for page in range(1, int(n // per) + 2):
+            try:
+                r = get(MOBILE_CAP.format(mkt=mkt), params={"page": page, "pageSize": per}, headers=dict(HEADERS, Referer="https://m.stock.naver.com/"), timeout=12)
+                if getattr(r, "status_code", 200) != 200:
+                    raise NaverFinError(f"HTTP {r.status_code}")
+                rows += parse_market_json(r.json())
+            except Exception as e:
+                errs.append(f"{mkt} p{page}: {str(e)[:60]}")
+                break
+            time.sleep(pause)
+    if not rows:
+        raise NaverFinError("모바일 시가총액 순위를 읽지 못했어요: " + "; ".join(errs[:2]))
+    df = pd.DataFrame(rows).drop_duplicates("Code")
+    return df.sort_values("Marcap", ascending=False).head(n).reset_index(drop=True)
+
+
 def market_top(n=600, get=None, pause=0.2):
-    """네이버 금융 시가총액 순위에서 코스피·코스닥 상위 종목을 읽는다(시가총액 큰 순). 반환: DataFrame"""
+    """시가총액 순위(코스피·코스닥 상위). 모바일 API를 먼저, 안 되면 웹 페이지를 읽는다. 반환: DataFrame"""
+    try:
+        return market_top_mobile(n, get=get)
+    except Exception as e_m:
+        try:
+            return market_top_web(n, get=get, pause=pause)
+        except Exception as e_w:
+            raise NaverFinError(f"{e_m} / {e_w}")
+
+
+def market_top_web(n=600, get=None, pause=0.2):
+    """네이버 금융 시가총액 순위 웹 페이지에서 상위 종목을 읽는다(시가총액 큰 순). 반환: DataFrame"""
     import time
 
     import pandas as pd

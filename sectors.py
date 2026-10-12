@@ -30,7 +30,8 @@ def parse_index(html):
             out.append((no, name))
     if not out:
         hrefs = re.findall(r'href=["\']([^"\']*(?:upjong|sise_group)[^"\']*)["\']', html or "")
-        raise SectorError(f"업종 목록을 찾지 못했어요({len(html or ''):,}자, 관련 링크 {len(hrefs)}개" + (f", 예: {hrefs[0][:90]}" if hrefs else "") + ")")
+        import naverfin
+        raise SectorError(f"업종 목록을 찾지 못했어요({len(html or ''):,}자, 관련 링크 {len(hrefs)}개" + (f", 예: {hrefs[0][:90]}" if hrefs else "") + f"; {naverfin.page_hint(html)})")
     return out
 
 

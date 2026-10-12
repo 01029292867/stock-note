@@ -264,10 +264,14 @@ def stage2(tbl, f, has_cap=True):
         ok &= (d["부채비율"] <= f["debt"]["v"]) | (d["금융업의심"] & d["재무"])
     if f["roe"]["on"]:
         ok &= d["ROE"] >= f["roe"]["v"]
-    if has_cap and f["per"]["on"]:
+    per_known = d["PER"].notna().mean() > 0.2          # 시가총액을 몰라서 PER·PBR을 못 구했으면 그 조건은 적용하지 않는다
+    pbr_known = d["PBR"].notna().mean() > 0.2
+    if has_cap and f["per"]["on"] and per_known:
         ok &= d["PER"] <= f["per"]["v"]
-    if has_cap and f["pbr"]["on"]:
+    if has_cap and f["pbr"]["on"] and pbr_known:
         ok &= d["PBR"] <= f["pbr"]["v"]
+    d.attrs["per_skipped"] = bool(f["per"]["on"] and not per_known)
+    d.attrs["pbr_skipped"] = bool(f["pbr"]["on"] and not pbr_known)
     if f["growth"]["on"]:
         ok &= d["영업이익증가율"] > 0
     d["통과"] = ok.fillna(False)

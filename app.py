@@ -2509,6 +2509,8 @@ def tab_discover():
         tbl.loc[is_small, "통과"] = tbl.loc[is_small, "통과"] & strict[is_small] & (tbl.loc[is_small, "시가총액(조)"] >= f["small"]["cap_min"])
     else:
         tbl.loc[is_small, "통과"] = False
+    if tbl.attrs.get("per_skipped") or tbl.attrs.get("pbr_skipped"):
+        st.warning("시가총액을 몰라서 **PER·PBR을 계산하지 못해 그 조건은 적용하지 않았어요.** 시가총액 순위를 가져오면 적용돼요('시장 데이터 불러오기'를 다시 눌러 보세요).")
     cand = tbl[tbl["통과"]].copy()
     k = st.columns(4)
     k[0].metric("전체 종목", f"{res['uni_n']:,}")
