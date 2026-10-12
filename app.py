@@ -43,7 +43,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정4(파동 안정성·KT&G 기준)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-12 수정5(파동 분석 기간 선택)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -1185,11 +1185,25 @@ def render_saved_detail(expanded):
 
 
 # ---------- 계산 ----------
+WAVE_WINS = {250: "1년(250일)", 180: "9개월(180일)", 120: "6개월(120일)"}
+
+
+def wave_profile(close):
+    """분석 기간 설정(기본 6개월)에 맞춰 파동을 분석한다."""
+    import wave
+    return wave.profile(close, window=int(st.session_state.get("wave_win", 120)))
+
+
+def wave_win_picker(key_suffix=""):
+    st.radio("파동 분석 기간", list(WAVE_WINS), index=list(WAVE_WINS).index(int(st.session_state.get("wave_win", 120))), format_func=lambda x: WAVE_WINS[x], horizontal=True, key="wave_win",
+             help="추세와 파동을 몇 개월치 가격으로 볼지예요. 1년으로 보면 그 사이 한 방향으로 올랐던 종목은 추세형으로 나오고, 최근 몇 달만 박스권이던 종목은 파동형으로 안 나와요. 최근 박스권을 찾으려면 6개월이 맞아요.")
+
+
 def wave_cell(df):
     """보유 종목 표의 '파동' 칸: 파동형(점수 60 이상, 추세 ±20% 이내)이면 지금 위치를 보여준다."""
     import wave
     try:
-        pf = wave.profile(df["Close"]) if len(df) else None
+        pf = wave_profile(df["Close"]) if len(df) else None
     except Exception:
         pf = None
     if not wave.is_wave(pf):
@@ -1712,8 +1726,9 @@ def report_wave(code, name, price, df, card, held):
     import wave
     st.subheader("🌊 파동(박스권) 분석 — 오르내림을 반복하는 종목인가")
     st.caption("KT&G처럼 한 방향으로 크게 가지 않고 일정한 폭으로 오르내리는 종목은, 아래쪽에서 사서 위쪽에서 파는 식으로 소소한 수익을 반복할 수 있어요. 다만 **박스권이 깨지면(추세 전환) 손실이 날 수 있어서** 무효가격을 꼭 같이 봐요.")
+    wave_win_picker()
     close = df["Close"]
-    pf = wave.profile(close)
+    pf = wave_profile(close)
     if pf is None:
         st.info("가격 기록이 짧아서(약 6개월 미만) 파동을 분석하지 못했어요.")
         return
@@ -2397,7 +2412,7 @@ def run_wave_scan(cand, include_own):
     rows = []
     for c in codes:
         df = hist_kr(c)
-        pf = wave.profile(df["Close"]) if len(df) else None
+        pf = wave_profile(df["Close"]) if len(df) else None
         if pf is None:
             continue
         sx = wave.stats(wave.backtest(df["Close"]), df["Close"])
@@ -2409,7 +2424,7 @@ def run_wave_scan(cand, include_own):
                      "손절 비율(%)": (sx["stops"] / sx["n"] * 100) if sx.get("n") else np.nan, "점검가": pf["price"]})
     bar.progress(1.0, text="완료")
     df_ = pd.DataFrame(rows)
-    st.session_state.disc_wave = {"rows": df_, "ts": dt.datetime.now().strftime("%m-%d %H:%M")}
+    st.session_state.disc_wave = {"rows": df_, "ts": dt.datetime.now().strftime("%m-%d %H:%M"), "win": int(st.session_state.get("wave_win", 120))}
     if len(df_):
         today = dt.date.today().isoformat()
         out = []
@@ -2423,7 +2438,7 @@ def run_wave_scan(cand, include_own):
 
 def render_wave_scan(res_w):
     df = res_w["rows"]
-    st.caption(f"{res_w['ts']}에 찾은 결과예요(최근 1년 가격 기준).")
+    st.caption(f"{res_w['ts']}에 찾은 결과예요(최근 {WAVE_WINS.get(int(res_w.get('win', 250)), '1년')} 가격 기준). 분석 기간을 바꿨다면 '파동형 후보 찾기'를 다시 눌러야 반영돼요.")
     if df.empty:
         st.info("파동을 분석할 수 있는 종목이 없어요.")
         return
@@ -2581,6 +2596,7 @@ def tab_discover():
     st.subheader("🌊 파동형 후보 — 오르내림을 반복하는 안정 종목 찾기 (KT&G 같은)")
     st.caption("② 재무를 통과한(안정적인) 후보 중에서 **추세가 약하고 일정한 폭으로 오르내리는 종목**을 찾아요. 아래쪽(진입 구간)에서 사서 위쪽(매도 구간)에서 파는 식으로 소소한 수익을 반복하려는 거예요. "
                "종목마다 진입·매도 구간, 박스권 이탈 가격(무효가격), 과거에 이 규칙을 썼다면의 성적을 보여줘요.")
+    wave_win_picker()
     own_ = st.checkbox("내 보유·관심 종목도 함께 분석", value=True, key="wv_own")
     if st.button("파동형 후보 찾기", key="wv_run"):
         run_wave_scan(cand, own_)
@@ -3712,14 +3728,14 @@ def tab_brief(rules):
     import wave
     extra = []
     for h_ in holds:                                  # 보유 종목이 파동형이고 박스권 상단이면 정리 점검
-        pf_ = wave.profile(hist_kr(h_["code"])["Close"]) if len(hist_kr(h_["code"])) else None
+        pf_ = wave_profile(hist_kr(h_["code"])["Close"]) if len(hist_kr(h_["code"])) else None
         if wave.is_wave(pf_) and pf_["state"] == "매도 구간":
             extra.append({"우선순위": 2, "종목": h_["name"], "내용": f"파동 매도 구간(위치 {pf_['pos']:.0f}%) — 박스권 상단 {pf_['sell_lo']:,.0f}원 근처예요. 계획대로 일부 정리를 점검하세요", "볼 곳": "종목 리포트", "비중(%)": h_["weight"] or 0.0})
     held_codes = {h_["code"] for h_ in holds}
     for code_ in watch["종목코드"]:                    # 관심종목이 파동형이고 박스권 하단이면 진입 구간 안내
         if code_ in held_codes or not len(hist_kr(code_)):
             continue
-        pf_ = wave.profile(hist_kr(code_)["Close"])
+        pf_ = wave_profile(hist_kr(code_)["Close"])
         if wave.is_wave(pf_) and pf_["state"] == "진입 구간":
             nm_ = watch[watch["종목코드"] == code_]["종목명"].iloc[0] or code_
             extra.append({"우선순위": 3, "종목": nm_, "내용": f"파동 진입 구간(위치 {pf_['pos']:.0f}%) — {pf_['buy_hi']:,.0f}원 이하, 박스권 이탈(무효가격) {pf_['invalid']:,.0f}원", "볼 곳": "종목 리포트"})
