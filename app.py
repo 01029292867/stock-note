@@ -760,14 +760,25 @@ def prefetch_prices():
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
+def listing_raw_cached():
+    return discover.load_listing()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def caps_cached():
+    import naverfin
+    return naverfin.market_top(600)          # 실패하면 예외가 나서 캐시되지 않는다
+
+
 def listing_cached():
-    df = discover.load_listing()
-    # KRX가 막혀서 시가총액·거래대금이 비어 오면 네이버 금융의 시가총액 순위로 채운다
+    """종목 목록. KRX가 막혀서 시가총액·거래대금이 비어 오면 네이버 금융 시가총액 순위로 채운다(못 채우면 이유를 cap_note에 남긴다)."""
+    df = listing_raw_cached()
+    st.session_state["cap_note"] = ""
     if ("Marcap" not in df.columns) or df["Marcap"].isna().mean() > 0.9:
         try:
-            df = discover.fill_from_naver(df)
-        except Exception:
-            pass
+            df = discover.fill_from_naver(df, top=caps_cached())
+        except Exception as e:
+            st.session_state["cap_note"] = f"네이버 금융 시가총액 순위를 가져오지 못했어요({str(e)[:100]}). 잠시 뒤 '시장 데이터 불러오기'를 다시 눌러 보세요."
     return df
 
 
@@ -1720,6 +1731,12 @@ def report_wave(code, name, price, df, card, held):
         st.info(f"이 종목은 **한 방향으로 움직이는 추세형**이에요(연 {pf['trend']:+.0f}%). 박스권 매매보다 추세를 따르는 판단이 맞을 수 있어요.")
     else:
         st.info(f"파동 점수가 {pf['score']:.0f}로 높지 않아요. 오르내림이 불규칙하거나 폭이 작아서 박스권 매매의 근거가 약해요.")
+    with st.expander("파동 점수가 이렇게 나왔어요 (왜 파동형이거나 아닌지)"):
+        pdf = pd.DataFrame([{"항목": nm, "이 종목": val, "점수(0~1)": sc_, "가중치": wt_, "기여(점)": sc_ * wt_ * 100, "기준": note_} for nm, val, sc_, wt_, note_ in pf["parts"]])
+        st.dataframe(pdf, width="stretch", hide_index=True, column_config={"점수(0~1)": st.column_config.NumberColumn(format="%.2f"), "가중치": st.column_config.NumberColumn(format="%.2f"),
+                                                                           "기여(점)": st.column_config.NumberColumn(format="%.0f")})
+        worst = min(pf["parts"], key=lambda t: t[2])
+        st.write(f"점수가 가장 낮은 항목은 **{worst[0]}**({worst[1]})예요. 파동형 기준은 파동 점수 60 이상이면서 추세가 연 ±20% 이내예요(지금 점수 {pf['score']:.0f}, 추세 {pf['trend']:+.0f}%).")
     z = pd.DataFrame([
         {"구간": "진입 구간(이하)", "가격(원)": pf["buy_hi"], "현재가 대비(%)": (pf["buy_hi"] / price - 1) * 100, "뜻": "최근 120일 가격의 하위 20%선이에요. 이 아래에서 사요."},
         {"구간": "매도 구간(이상)", "가격(원)": pf["sell_lo"], "현재가 대비(%)": (pf["sell_lo"] / price - 1) * 100, "뜻": "최근 120일 가격의 상위 80%선이에요. 이 위에서 정리해요."},
@@ -2118,6 +2135,8 @@ def run_discovery(f, manual_codes=None):
         f1["cap"]["v"] = min(f1["cap"]["v"], f["small"]["cap_min"])
         f1["maxn"] = max(int(f1["maxn"]), 600)
     s1, notes = discover.stage1(uni, f1, exclude=held)
+    if st.session_state.get("cap_note"):
+        notes = list(notes) + [st.session_state["cap_note"]]
     if "시총출처" in uni.columns and (uni["시총출처"] == "네이버").any():
         notes = list(notes) + [f"종목 목록에 시가총액·거래대금이 없어서 네이버 금융의 시가총액 순위(상위 {int((uni['시총출처'] == '네이버').sum())}종목)로 채웠어요. 그보다 작은 종목은 후보에서 빠져요."]
     src = st.session_state.get("disc_src", "자동(DART 우선)")
@@ -2322,7 +2341,7 @@ def render_scan(sc_res, cand):
         return
     f1, f2, f3, f4 = st.columns(4)
     judg = f1.multiselect("진입 판정", ["유리", "보통", "불리", "근거 부족", "무효가격 필요"], default=["유리", "보통"], key="scan_f_j")
-    sizes = f2.multiselect("규모", ["대형", "중형", "소형"], default=["대형", "중형", "소형"], key="scan_f_s")
+    sizes = f2.multiselect("규모", ["대형", "중형", "소형", "알 수 없음"], default=["대형", "중형", "소형", "알 수 없음"], key="scan_f_s", help="시가총액을 알 수 없는 종목은 '알 수 없음'이에요.")
     secs = f3.multiselect("업종(비우면 전체)", sorted(df["업종"].unique()), key="scan_f_sec")
     sort = f4.selectbox("정렬", ["진입 매력도 높은 순", "손익비 높은 순", "업종 강도 순", "시가총액 큰 순"], key="scan_f_sort")
     v = df[df["진입 판정"].isin(judg) & df["규모"].isin(sizes)]

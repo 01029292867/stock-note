@@ -52,11 +52,16 @@ def profile(close, window=250, band_win=120, lo_q=0.2, hi_q=0.8, cost=COST):
     cv = _cv(ups)
     s_reg = 1 - min(cv, 1.0) if cv == cv else 0.0
     score = float(100 * (0.30 * s_trend + 0.15 * s_r2 + 0.20 * s_freq + 0.25 * s_amp + 0.10 * s_reg))
+    parts = [("추세가 약한가", f"연 {trend:+.0f}%", s_trend, 0.30, "연 ±30%를 넘으면 0점"),
+             ("한 방향으로 흐르지 않는가", f"추세 설명력 {r2 * 100:.0f}%", s_r2, 0.15, "설명력 50% 이상이면 0점"),
+             ("오르내림이 자주 있는가", f"연 {per_year:.1f}회", s_freq, 0.20, "연 6회 이상이면 만점"),
+             ("한 번 움직이는 폭이 큰가", "-" if amp != amp else f"+{amp:.1f}%", s_amp, 0.25, "3%면 0점, 12% 이상이면 만점"),
+             ("폭이 규칙적인가", "-" if cv != cv else f"변동계수 {cv:.2f}", s_reg, 0.10, "폭이 들쭉날쭉하면 낮아요")]
     state = "진입 구간" if pos == pos and pos <= 25 else "매도 구간" if pos == pos and pos >= 75 else "중간"
     return {"score": score, "trend": trend, "r2": r2, "thr": thr * 100, "n_up": len(ups), "n_down": len(downs), "per_year": float(per_year),
             "amp_up": amp, "amp_down": float(np.median(downs)) if downs else np.nan, "period": float(np.median(gaps)) if gaps else np.nan,
             "L": L, "U": U, "lo": lo, "hi": hi, "pos": pos, "gain": float(gain), "price": price, "state": state,
-            "invalid": float(lo * 0.97), "buy_hi": L, "sell_lo": U}
+            "invalid": float(lo * 0.97), "buy_hi": L, "sell_lo": U, "parts": parts}
 
 
 def backtest(close, band_win=120, lo_q=0.2, hi_q=0.8, stop_gap=0.03, max_hold=60, min_gain=0.06, cost=COST, start=None):

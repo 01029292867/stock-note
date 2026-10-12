@@ -16,30 +16,31 @@ class SectorError(Exception):
     pass
 
 
+IDX_RE = re.compile(r'sise_group_detail\.(?:naver|nhn)\?type=upjong(?:&amp;|&)no=(\d+)[^>]*>\s*([^<]+?)\s*<', re.S)
+CODE_RE = re.compile(r'main\.(?:naver|nhn)\?code=(\d{6})')
+
+
 def parse_index(html):
-    """업종 목록 페이지 -> [(번호, 업종 이름)]"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
+    """업종 목록 페이지 -> [(번호, 업종 이름)]. 링크 형식(.naver/.nhn, &amp;)이 달라도 읽는다."""
     out, seen = [], set()
-    for a in soup.find_all("a", href=re.compile(r"sise_group_detail\.naver\?type=upjong&(amp;)?no=\d+")):
-        no = re.search(r"no=(\d+)", a["href"]).group(1)
-        name = a.get_text(strip=True)
+    for no, name in IDX_RE.findall(html or ""):
+        name = re.sub(r"\s+", " ", name).strip()
         if name and no not in seen:
             seen.add(no)
             out.append((no, name))
     if not out:
-        raise SectorError(f"업종 목록을 찾지 못했어요({len(html or ''):,}자)")
+        hrefs = re.findall(r'href=["\']([^"\']*(?:upjong|sise_group)[^"\']*)["\']', html or "")
+        raise SectorError(f"업종 목록을 찾지 못했어요({len(html or ''):,}자, 관련 링크 {len(hrefs)}개" + (f", 예: {hrefs[0][:90]}" if hrefs else "") + ")")
     return out
 
 
 def parse_detail(html):
     """업종 상세 페이지 -> 소속 종목코드 목록"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    scope = soup.select_one("table.type_5") or soup
+    html = html or ""
+    m = re.search(r'<table[^>]*class="[^"]*type_5[^"]*"[^>]*>.*?</table>', html, re.S)
+    scope = m.group(0) if m else html
     codes = []
-    for a in scope.find_all("a", href=re.compile(r"/item/main\.naver\?code=\d{6}")):
-        c = re.search(r"code=(\d{6})", a["href"]).group(1)
+    for c in CODE_RE.findall(scope):
         if c not in codes:
             codes.append(c)
     return codes

@@ -192,14 +192,22 @@ def market_top(n=600, get=None, pause=0.2):
     pages = int(n // 50) + 2
     for sosok in (0, 1):
         for page in range(1, pages + 1):
-            try:
-                r = get(SUM, params={"sosok": sosok, "page": page}, headers=HEADERS, timeout=12)
-                if getattr(r, "status_code", 200) != 200:
-                    raise NaverFinError(f"HTTP {r.status_code}")
-                r.encoding = "euc-kr"
-                rows += parse_market_sum(r.text)
-            except Exception as e:
-                errs.append(f"sosok{sosok} p{page}: {str(e)[:60]}")
+            ok = False
+            for attempt in range(2):                      # 일시적인 실패는 한 번 더 시도한다
+                try:
+                    r = get(SUM, params={"sosok": sosok, "page": page}, headers=HEADERS, timeout=12)
+                    if getattr(r, "status_code", 200) != 200:
+                        raise NaverFinError(f"HTTP {r.status_code}")
+                    r.encoding = "euc-kr"
+                    rows += parse_market_sum(r.text)
+                    ok = True
+                    break
+                except Exception as e:
+                    if attempt == 1:
+                        errs.append(f"sosok{sosok} p{page}: {str(e)[:60]}")
+                    else:
+                        time.sleep(1.0)
+            if not ok:
                 break
             time.sleep(pause)
     if not rows:

@@ -44,10 +44,12 @@ def load_listing():
     raise RuntimeError(f"종목 목록을 가져오지 못했어요: {last}")
 
 
-def fill_from_naver(df, n=600):
-    """종목 목록에 시가총액·거래대금이 없을 때(KRX가 막힌 경우) 네이버 금융 시가총액 순위로 채운다. 상위 n종목만 채워지고 나머지는 비어 있다."""
-    import naverfin
-    top = naverfin.market_top(n)
+def fill_from_naver(df, n=600, top=None):
+    """종목 목록에 시가총액·거래대금이 없을 때(KRX가 막힌 경우) 네이버 금융 시가총액 순위로 채운다. 상위 n종목만 채워지고 나머지는 비어 있다.
+    top: 이미 받아 둔 순위 표(없으면 여기서 가져온다)"""
+    if top is None:
+        import naverfin
+        top = naverfin.market_top(n)
     d = df.copy()
     for c in ("Marcap", "Amount", "Close"):
         if c not in d.columns:

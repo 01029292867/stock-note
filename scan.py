@@ -10,7 +10,7 @@ SMALL_DEFAULT = {"on": False, "cap_min": 0.3, "loss": 0, "debt": 100.0, "roe": 1
 
 def size_class(cap_jo):
     if cap_jo is None or cap_jo != cap_jo:
-        return "-"
+        return "알 수 없음"
     return "대형" if cap_jo >= 5 else "중형" if cap_jo >= 1 else "소형"
 
 
