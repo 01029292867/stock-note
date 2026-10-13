@@ -1,4 +1,5 @@
 """내 투자 노트 - 2단계: 내 자산 + 안전 점검(DART) + 종목 리포트 (실제 시세, 구글 시트 저장)"""
+import contextlib
 import copy
 import datetime as dt
 import hashlib
@@ -43,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-12 수정10(파동 규칙 선택)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-13 수정11(속도 개선)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import consensus
 import brief
@@ -140,9 +141,71 @@ def _make_store(url, token):
     return GasStore(url, token)
 
 
+@contextlib.contextmanager
+def timed(label):
+    """걸린 시간을 재서 사이드바 '⏱ 속도 표시'에 보여준다."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        st.session_state.setdefault("_timings", []).append((label, time.perf_counter() - t0))
+
+
+class _MemoReader:
+    """시작할 때 미리(동시에) 받아 둔 시트 읽기 결과가 있으면 한 번만 돌려주고, 그 밖에는 그대로 읽는다."""
+
+    def __init__(self, store):
+        self._s = store
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+    def read(self, sheet, columns):
+        memo = st.session_state.get("_read_memo")
+        if memo:
+            hit = memo.pop((sheet, tuple(columns)), None)
+            if hit is not None:
+                return hit.copy()
+        return self._s.read(sheet, columns)
+
+
 def get_store():
     url, token = secret("GAS_URL"), secret("GAS_TOKEN")
-    return _make_store(url, token) if url and token else None
+    return _MemoReader(_make_store(url, token)) if url and token else None
+
+
+def warm_reads():
+    """로그인 직후 구글 시트의 여러 탭을 하나씩 읽으면 오래 걸려서, 시작에 필요한 탭을 동시에 읽어 둔다(이후 load_* 가 이 결과를 쓴다)."""
+    if st.session_state.get("_warmed"):
+        return
+    st.session_state["_warmed"] = True
+    store = get_store()
+    if store is None:
+        return
+    try:
+        import inspect
+        from concurrent.futures import ThreadPoolExecutor
+        funcs = (load_tables, load_settings, load_watch, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
+        src = "".join(inspect.getsource(f) for f in funcs)
+        pairs = []
+        for m in _re.finditer(r'\.read\(\s*"([^"]+)"\s*,\s*([A-Za-z_][\w\.]*)\s*\)', src):
+            try:
+                key = (m.group(1), tuple(eval(m.group(2), globals())))
+            except Exception:
+                continue
+            if key not in pairs:
+                pairs.append(key)
+        raw = store._s
+
+        def one(k):
+            try:
+                return k, raw.read(k[0], list(k[1]))
+            except Exception:
+                return k, None          # 실패하면 load_* 가 평소처럼 직접 읽어서 오류를 처리한다
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            st.session_state["_read_memo"] = {k: df for k, df in ex.map(one, pairs) if df is not None}
+    except Exception:
+        st.session_state.pop("_read_memo", None)
 
 
 
@@ -722,8 +785,25 @@ def _cached(key, fn, ttl=PRICE_TTL):
     return df
 
 
+SCAN_TTL = 6 * 3600     # 전체 종목을 훑을 때는 일봉이라 6시간 전 자료도 괜찮다(두 번째부터는 거의 바로 끝난다)
+
+
+def ttl_now():
+    return SCAN_TTL if st.session_state.get("_scan_mode") else PRICE_TTL
+
+
+@contextlib.contextmanager
+def scan_mode():
+    prev = st.session_state.get("_scan_mode")
+    st.session_state["_scan_mode"] = True
+    try:
+        yield
+    finally:
+        st.session_state["_scan_mode"] = prev
+
+
 def hist_kr(code):
-    return _cached(("kr", code), lambda: market.history_kr(code))
+    return _cached(("kr", code), lambda: market.history_kr(code), ttl=ttl_now())
 
 
 def hist_us(ticker):
@@ -1172,14 +1252,15 @@ def render_saved_detail(expanded):
         st.caption("상세 점검을 하면 결과가 구글 시트의 '발굴결과' 탭에 자동으로 저장돼요. 새로고침하거나 앱이 다시 시작돼도 여기서 다시 볼 수 있어요.")
         day = st.selectbox("점검한 날", dates, key="saved_day")
         g = h[h["점검일"] == day].copy()
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            list(ex.map(hist_kr, list(g["종목코드"])))
-        cur = []
-        for r in g.itertuples():
-            d = hist_kr(r.종목코드)
-            cur.append((float(d["Close"].iloc[-1]) / r.점검가 - 1) * 100 if (len(d) and r.점검가 == r.점검가 and r.점검가) else np.nan)
-        g["점검 후 변화(%)"] = cur
+        show_chg = st.checkbox("점검 후 변화(%)도 계산 (지금 시세를 가져와서 시간이 걸려요)", value=False, key="saved_chg")
+        if show_chg:
+            with scan_mode():
+                prefetch_codes(list(g["종목코드"]), None, "시세")
+                cur = []
+                for r in g.itertuples():
+                    d = hist_kr(r.종목코드)
+                    cur.append((float(d["Close"].iloc[-1]) / r.점검가 - 1) * 100 if (len(d) and r.점검가 == r.점검가 and r.점검가) else np.nan)
+            g["점검 후 변화(%)"] = cur
         g = g.drop(columns=["점검일"])
         st.dataframe(g, width="stretch", hide_index=True, column_config={
             "점검가": st.column_config.NumberColumn(format="%,d"), "점검 후 변화(%)": st.column_config.NumberColumn(format="%+.1f", help="점검한 날의 가격 대비 지금 가격의 변화예요. 발굴한 후보가 이후 어땠는지 보는 자료예요."),
@@ -1187,7 +1268,7 @@ def render_saved_detail(expanded):
             "외국인 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "기관 5일(억)": st.column_config.NumberColumn(format="%+,.0f"), "목표가 여력(%)": st.column_config.NumberColumn(format="%.0f"),
             "진입 손익비": st.column_config.NumberColumn(format="%.2f"), "무효가격(원)": st.column_config.NumberColumn(format="%,d"),
             "최대 매수(주)": st.column_config.NumberColumn(format="%,d"), "기다릴 가격(원)": st.column_config.NumberColumn(format="%,d")})
-        ok_ = g["점검 후 변화(%)"].dropna()
+        ok_ = g["점검 후 변화(%)"].dropna() if "점검 후 변화(%)" in g.columns else pd.Series(dtype=float)
         if len(ok_) >= 3 and day != dt.date.today().isoformat():
             st.write(f"이 날 점검한 {len(g)}종목의 점검 후 평균 변화는 **{ok_.mean():+.1f}%**, 오른 종목은 {int((ok_ > 0).sum())}/{len(ok_)}개예요.")
         st.caption("후보가 몇 종목 안 되면 평균은 우연일 수 있어요. 이 자료가 여러 번 쌓이면 '내 발굴 기준이 실제로 쓸 만했는지' 확인할 수 있어요.")
@@ -2155,6 +2236,11 @@ def disc_filters_ui(f):
 
 
 def run_discovery(f, manual_codes=None):
+    with timed("시장 데이터 불러오기"):
+        return _run_discovery_impl(f, manual_codes)
+
+
+def _run_discovery_impl(f, manual_codes=None):
     bar = st.progress(0.0, text="종목 목록을 가져오는 중…")
     try:
         uni = discover.manual_listing(manual_codes) if manual_codes else listing_cached()
@@ -2272,12 +2358,13 @@ def prefetch_codes(codes, bar=None, label="가격"):
     """종목들의 시세를 동시에 가져와 캐시에 채운다."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     now = time.time()
-    need = [c for c in dict.fromkeys(codes) if not (("kr", c) in _PRICE_CACHE and now - _PRICE_CACHE[("kr", c)][0] < PRICE_TTL)]
+    need = [c for c in dict.fromkeys(codes) if not (("kr", c) in _PRICE_CACHE and now - _PRICE_CACHE[("kr", c)][0] < ttl_now())]
     if not need:
         return
     done = 0
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [ex.submit(hist_kr, c) for c in need]
+        ttl_ = ttl_now()
+        futs = [ex.submit(lambda c=c: _cached(("kr", c), lambda: market.history_kr(c), ttl=ttl_)) for c in need]
         for f_ in as_completed(futs):
             try:
                 f_.result()
@@ -2289,6 +2376,11 @@ def prefetch_codes(codes, bar=None, label="가격"):
 
 
 def run_scan(cand, res, use_sector):
+    with timed("진입 스캔"), scan_mode():
+        return _run_scan_impl(cand, res, use_sector)
+
+
+def _run_scan_impl(cand, res, use_sector):
     """② 재무를 통과한 후보 전체를 가격 흐름·손익비·업종까지 빠르게 훑는다(DART 상세 조회 없이)."""
     import scan as scan_mod
     small = st.session_state.disc_f.get("small", {})
@@ -2356,6 +2448,7 @@ def run_scan(cand, res, use_sector):
         st.session_state["disc_scan_msg"] = save_disc_results(out)
 
 
+@st.fragment
 def render_scan(sc_res, cand):
     """진입 스캔 결과: 강한 업종, 진입 후보 표(필터·정렬), 관심종목 추가."""
     df = sc_res["rows"]
@@ -2414,6 +2507,11 @@ WAVE_REF = {"033780": "KT&G"}   # 파동 매매의 기준으로 삼는 종목(�
 
 
 def run_wave_scan(cand, include_own, pool=None):
+    with timed("파동형 후보 찾기"), scan_mode():
+        return _run_wave_scan_impl(cand, include_own, pool)
+
+
+def _run_wave_scan_impl(cand, include_own, pool=None):
     """② 재무를 통과한(안정적인) 후보와 내 보유·관심 종목 중 오르내림을 반복하는 파동형 종목을 찾는다."""
     import wave
     bar = st.progress(0.0, text="준비 중…")
@@ -2458,6 +2556,7 @@ def run_wave_scan(cand, include_own, pool=None):
         st.session_state["disc_wave_msg"] = save_disc_results(out)
 
 
+@st.fragment
 def render_wave_scan(res_w):
     df = res_w["rows"]
     st.caption(f"{res_w['ts']}에 찾은 결과예요(최근 {WAVE_WINS.get(int(res_w.get('win', 250)), '1년')} 가격 기준, 규칙: {res_w.get('rule', '자동')}). 분석 기간이나 규칙을 바꿨다면 '파동형 후보 찾기'를 다시 눌러야 반영돼요. 지금 **진입 구간**에 있는 종목이 맨 위에 와요.")
@@ -4117,8 +4216,11 @@ def page_help(page):
 
 
 def main():
+    st.session_state["_timings"] = []
     check_versions()
     gate()
+    _t_load = time.perf_counter()
+    warm_reads()
     load_tables()
     if "rules" not in st.session_state:
         st.session_state.rules = copy.deepcopy(sg.DEFAULT_RULES)
@@ -4145,14 +4247,18 @@ def main():
     load_scorelog()
     load_flowlog()
     load_fincache()
+    st.session_state.pop("_read_memo", None)
+    st.session_state["_timings"].append(("시트 읽기·불러오기", time.perf_counter() - _t_load))
     rules = st.session_state.rules
 
     for k in ("rep_select", "jr_h", "jm_all", "disc_excl_held"):  # 다른 화면에 갔다 와도 선택을 유지한다
         if k in st.session_state:
             st.session_state[k] = st.session_state[k]
-    prefetch_prices()
-    st.session_state["total_val"] = portfolio_value(rules)
-    maybe_auto_snapshot(rules)
+    with timed("시세 미리 받기"):
+        prefetch_prices()
+    with timed("평가금액 계산"):
+        st.session_state["total_val"] = portfolio_value(rules)
+        maybe_auto_snapshot(rules)
 
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
@@ -4160,7 +4266,8 @@ def main():
              "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
     page_help(page)
-    pages[page]()  # 고른 화면만 계산해서 빠르다
+    with timed(f"화면: {page}"):
+        pages[page]()  # 고른 화면만 계산해서 빠르다
     with st.sidebar:
         if st.button("시세 새로고침"):
             st.cache_data.clear()
@@ -4171,6 +4278,18 @@ def main():
         if get_store() is None:
             st.info("데모 모드")
         st.caption(f"앱 버전: {APP_BUILD}")   # 이 표시가 안 보이면 예전 app.py가 올라가 있는 거예요
+        st.session_state.setdefault("_first_timings", list(st.session_state.get("_timings", [])))   # 로그인 직후 첫 실행의 시간은 따로 남겨 둔다
+        if st.checkbox("⏱ 속도 표시", key="show_timing", help="단계별로 몇 초 걸렸는지 보여줘요. 어느 곳이 느린지 찾을 때 켜세요."):
+            ft = st.session_state.get("_first_timings", [])
+            if ft:
+                st.caption(f"로그인 직후 첫 실행: 합계 {sum(x[1] for x in ft if not x[0].startswith('화면')):.1f}초(화면 제외)")
+                st.dataframe(pd.DataFrame(ft, columns=["단계", "초"]).sort_values("초", ascending=False), hide_index=True, width="stretch", column_config={"초": st.column_config.NumberColumn(format="%.1f")})
+            st.caption("방금 실행:")
+            tm = st.session_state.get("_timings", [])
+            if tm:
+                st.dataframe(pd.DataFrame(tm, columns=["단계", "초"]).sort_values("초", ascending=False), hide_index=True, width="stretch",
+                             column_config={"초": st.column_config.NumberColumn(format="%.1f")})
+                st.caption("위젯을 바꿔도 표 영역만 다시 계산되는 곳(진입 스캔·파동형 후보의 필터)은 이 표가 갱신되지 않아요.")
 
 
 main()
