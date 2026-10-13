@@ -44,8 +44,9 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-13 수정11(속도 개선)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-13 수정13(왼쪽 메뉴)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
+import coins
 import consensus
 import brief
 import dart_data
@@ -185,7 +186,7 @@ def warm_reads():
     try:
         import inspect
         from concurrent.futures import ThreadPoolExecutor
-        funcs = (load_tables, load_settings, load_watch, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
+        funcs = (load_tables, load_settings, load_watch, load_coins, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
         src = "".join(inspect.getsource(f) for f in funcs)
         pairs = []
         for m in _re.finditer(r'\.read\(\s*"([^"]+)"\s*,\s*([A-Za-z_][\w\.]*)\s*\)', src):
@@ -271,7 +272,7 @@ def reset_settings():
     st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
     st.session_state.weights = copy.deepcopy(score.DEFAULT_WEIGHTS)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "wt_ev", "rk_pt", "rk_mp", "rk_mr", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "wt_ev", "rk_pt", "rk_mp", "rk_mr", "rk_cm", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
             del st.session_state[k]
 
 
@@ -289,6 +290,34 @@ def load_watch():
         except Exception:
             pass
     st.session_state.watch = df.reset_index(drop=True)
+
+
+def load_coins():
+    """구글 시트 '코인' 탭(거래소·코인·수량·평균단가)을 불러온다. 보기 전용이라 주식 성과 계산에는 쓰지 않는다."""
+    if "coin" in st.session_state:
+        return
+    df = pd.DataFrame(columns=coins.COLS)
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = coins.clean(store.read("코인", coins.COLS))
+        except Exception:
+            pass
+    st.session_state.coin = df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def coin_prices_cached(symbols):
+    return coins.fetch_prices(list(symbols))
+
+
+def coin_values():
+    """보유 코인의 평가 표와 시세를 못 가져온 코인 목록."""
+    c = st.session_state.get("coin")
+    if c is None or c.empty:
+        return pd.DataFrame(), []
+    prices, src, missing, notes = coin_prices_cached(tuple(sorted(set(c["코인"]))))
+    return coins.values(c, prices), missing
 
 
 def add_watch(items):
@@ -1276,6 +1305,8 @@ def render_saved_detail(expanded):
 
 # ---------- 계산 ----------
 WAVE_WINS = {250: "1년(250일)", 180: "9개월(180일)", 120: "6개월(120일)"}
+PAGE_ICON = {"내 자산": "💼", "주간 브리핑": "🗓️", "종합 순위": "🏆", "목표·성과": "🎯", "목적 자금": "🧭", "종목 발굴": "🔎", "안전 점검": "🛡️", "종목 리포트": "📄",
+             "매매 계획": "📝", "판단 기록": "📒", "가설 실험실": "🧪", "규칙": "⚙️"}
 
 
 def wave_profile(close):
@@ -1437,6 +1468,10 @@ def tab_assets(rules):
     ok_kk = kk[kk["평가금액"].notna()] if len(kk) else kk
     val = (ok_pos["평가금액"].sum() if len(ok_pos) else 0) + (ok_kk["평가금액"].sum() if len(ok_kk) else 0)
     cost = (ok_pos["투자원금"].sum() if len(ok_pos) else 0) + (ok_kk["투자원금"].sum() if len(ok_kk) else 0)
+    cdf, cmiss = coin_values()                                   # 코인은 보기 전용으로만 합친다(입금보정수익률·자동 기록은 주식 기준 그대로)
+    cval = float(cdf["평가금액"].sum(skipna=True)) if len(cdf) else 0.0
+    ccost = float(cdf["투자원금"].sum(skipna=True)) if len(cdf) else 0.0
+    st.session_state["coin_val"] = cval
 
     st.session_state["total_val"] = val if val > 0 else None
     last_d, due = journal_due()
@@ -1457,11 +1492,19 @@ def tab_assets(rules):
     c2.metric("평가손익", man(val - cost), pct((val / cost - 1) * 100) if cost else None)
     c3.metric("투자 원금", man(cost))
     c4.metric("등록 종목", f"{len(hold)}개 + 정기매수 {len(kakao)}개")
+    if len(st.session_state.get("coin", [])):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("코인 평가금액", man(cval), help="코인 편집에서 적은 수량 × 업비트(없으면 빗썸) 원화 시세예요. 시세는 1분 동안 기억해요.")
+        m2.metric("주식 + 코인 합계", man(val + cval), help="보기 전용 합계예요. 목표·성과의 입금보정수익률과 자동으로 기록되는 자산은 주식 기준 그대로예요.")
+        m3.metric("코인 비중", f"{cval / (val + cval) * 100:.1f}%" if (val + cval) > 0 else "-", help="주식과 코인을 합친 금액 중 코인의 비율이에요.")
+        m4.metric("코인 평가손익", man(cval - ccost) if ccost else "-", pct((cval / ccost - 1) * 100) if ccost else None, help="평균단가를 적은 코인만 계산해요.")
 
     missing = pos[pos["평가금액"].isna()]["종목명"].tolist() if len(pos) else []
     missing += kk[kk["평가금액"].isna()]["종목명"].tolist() if len(kk) else []
     if missing:
         st.warning("시세를 가져오지 못해 합계에서 제외했어요: " + ", ".join(missing))
+    if cmiss:
+        st.warning("시세를 가져오지 못한 코인(합계에서 제외): " + ", ".join(cmiss) + " — 약어를 확인하거나(예: BTC, ETH) 잠시 뒤 다시 열어 보세요. 업비트·빗썸에 상장되지 않은 코인은 시세를 못 가져와요.")
 
     if val > 0:
         by_broker = {}
@@ -1470,11 +1513,15 @@ def tab_assets(rules):
                 by_broker[b] = by_broker.get(b, 0) + v
         if len(ok_kk):
             by_broker["카카오"] = by_broker.get("카카오", 0) + ok_kk["평가금액"].sum()
+        if len(cdf):
+            for ex_, v_ in cdf[cdf["평가금액"].notna()].groupby("거래소")["평가금액"].sum().items():
+                if v_ > 0:
+                    by_broker[f"{ex_}(코인)"] = by_broker.get(f"{ex_}(코인)", 0) + v_
         bdf = pd.DataFrame({"증권사": list(by_broker), "평가금액": list(by_broker.values())})
         bdf["비중"] = bdf["평가금액"] / bdf["평가금액"].sum() * 100
         left, right = st.columns([1, 1])
         with left:
-            st.subheader("증권사별 비중")
+            st.subheader("증권사·거래소별 비중" if cval else "증권사별 비중")
             st.altair_chart(
                 alt.Chart(bdf).mark_arc(innerRadius=55).encode(
                     theta="평가금액:Q", color=alt.Color("증권사:N"), tooltip=["증권사", alt.Tooltip("평가금액:Q", format=",.0f"), alt.Tooltip("비중:Q", format=".1f")]
@@ -1484,13 +1531,19 @@ def tab_assets(rules):
         with right:
             st.subheader("쏠림 점검")
             if len(ok_pos):
-                w = ok_pos.groupby("종목명")["평가금액"].sum() / val * 100
+                w = ok_pos.groupby("종목명")["평가금액"].sum() / (val + cval) * 100
                 over = w[w > CONC_LIMIT]
                 if len(over):
                     for n, x in over.items():
                         st.error(f"{n} 한 종목이 전체의 {x:.0f}%예요 (기준 {CONC_LIMIT}%)")
                 else:
                     st.success(f"한 종목이 전체의 {CONC_LIMIT}%를 넘지 않아요.")
+            if cval > 0:
+                cw, cmax = cval / (val + cval) * 100, float(st.session_state.risk.get("coin_max", 10.0))
+                if cw > cmax:
+                    st.error(f"코인이 전체의 {cw:.0f}%예요 (기준 {cmax:g}%)")
+                else:
+                    st.success(f"코인이 전체의 {cw:.0f}%로 기준({cmax:g}%) 안이에요.")
             st.caption("업종 쏠림은 업종 정보를 연결하는 다음 단계에서 추가돼요.")
 
     if len(pos):
@@ -1559,7 +1612,15 @@ def tab_assets(rules):
                 st.warning(f"{r['종목명']}: 시세 기록이 짧아서 가장 오래된 회차 일부를 계산에서 뺐어요.")
         st.caption("미국 거래일마다 하루 금액만큼 샀다고 보고 그날 주가·환율로 계산한 추정치예요. 현재 횟수는 시작일부터 거래일마다 하나씩 자동으로 늘어요. 실제 횟수와 어긋나면(휴장일·중단 등) 보유 종목 편집에서 지금 횟수를 다시 적고 저장하면 시작일이 다시 맞춰져요.")
 
+    if len(cdf):
+        st.subheader("코인")
+        st.dataframe(cdf[["거래소", "코인", "수량", "평균단가", "현재가", "평가금액", "수익금액", "손익률"]], width="stretch", hide_index=True, column_config={
+            "수량": st.column_config.NumberColumn(format="%.8g"), "평균단가": st.column_config.NumberColumn(format="%,.0f원"), "현재가": st.column_config.NumberColumn(format="%,.0f원"),
+            "평가금액": st.column_config.NumberColumn(format="%,.0f원"), "수익금액": st.column_config.NumberColumn(format="%,.0f원"), "손익률": st.column_config.NumberColumn(format="%.1f%%")})
+        st.caption("보기 전용이에요. 시세는 업비트(없으면 빗썸)의 원화 시세이고, 평균단가는 직접 적은 값이에요. 코인은 주식의 보호선·지지선 같은 신호를 적용하지 않아요.")
     st.divider()
+    with st.expander("코인 편집 (추가·수정·삭제)", expanded=False):
+        edit_coins()
     with st.expander("보유 종목 편집 (추가·수정·삭제)", expanded=not len(hold)):
         edit_tables()
 
@@ -1612,6 +1673,40 @@ def edit_tables():
         except Exception as e:
             st.error(f"저장에 실패했어요: {e}")
 
+
+
+def edit_coins():
+    store = get_store()
+    if st.session_state.get("load_error"):
+        st.error(f"구글 시트에서 불러오지 못해서 저장을 막았어요. ({st.session_state.load_error})")
+        return
+    if store is None:
+        st.warning("데모 모드예요. 여기서 고친 내용은 저장되지 않고 새로고침하면 사라져요.")
+    st.markdown("**코인** — 거래소, 코인 약어(예: BTC, ETH, XRP), 수량, 평균단가(원, 선택)를 직접 적어요. 시세는 업비트(없으면 빗썸)에서 가져와요. "
+                "**거래소 API 키는 필요 없고, 넣지 마세요.** 행을 추가하려면 맨 아래 빈 줄에 입력하세요. **코인 약어가 비어 있는 줄은 저장되지 않아요.**")
+    ed = st.data_editor(
+        st.session_state.coin, num_rows="dynamic", width="stretch", hide_index=True, key="coin_editor",
+        column_config={
+            "거래소": st.column_config.SelectboxColumn(options=coins.EXCHANGES),
+            "코인": st.column_config.TextColumn(help="BTC, ETH처럼 약어로 적어요(KRW-BTC로 적어도 돼요)."),
+            "수량": st.column_config.NumberColumn(min_value=0.0, format="%.8g", help="가진 개수예요(소수점 가능)."),
+            "평균단가": st.column_config.NumberColumn(min_value=0.0, format="%,.0f", help="코인 1개당 평균 매수가(원)예요. 비워 두면 수익률은 계산하지 않아요."),
+        })
+    if st.button("코인 저장", type="primary", key="coin_save"):
+        bad = coins.blank_symbol_rows(ed)
+        if bad:
+            st.error(f"코인 약어가 비어 있는 줄이 있어요(줄 번호: {', '.join(map(str, bad))}). 약어를 채우거나 그 줄을 지운 뒤 저장하세요. 그대로 저장하면 그 줄이 사라져요.")
+        else:
+            new = coins.clean(ed)
+            try:
+                if store is not None:
+                    store.write("코인", new)
+                st.session_state.coin = new
+                st.session_state.pop("coin_editor", None)
+                st.success("저장했어요." if store is not None else "임시로 반영했어요(데모 모드).")
+                st.rerun()
+            except Exception as e:
+                st.error(f"저장에 실패했어요: {e}")
 
 
 def eok(x):
@@ -3098,15 +3193,18 @@ def tab_fund():
     c1, c2 = st.columns(2)
     inc_cash = c2.checkbox("증권 계좌 현금(목표·성과에서 마지막으로 기록한 값)도 투자금액에 포함", value=False, key="fund_cash",
                            help="기본은 주식 평가금액만 써요. 투자하려고 계좌에 둔 현금까지 목적 자금으로 보고 싶을 때 켜세요.")
+    inc_coin = c2.checkbox("코인 평가금액도 투자금액에 포함", value=False, key="fund_coin", help="기본은 포함하지 않아요. 코인도 목적 자금으로 보고 싶을 때 켜세요(코인은 변동이 커서 목표 계산이 흔들릴 수 있어요).")
     snaps = perf.clean_snaps(st.session_state.get("perf_snaps", pd.DataFrame(columns=perf.SNAP_COLS)))
     cash = float(snaps["현금"].dropna().iloc[-1]) if (inc_cash and len(snaps) and snaps["현금"].notna().any()) else 0.0
-    total = a_ + b_ + cash
+    cdf_f, _cm = coin_values()
+    coin_amt = float(cdf_f["평가금액"].sum(skipna=True)) if (inc_coin and len(cdf_f)) else 0.0
+    total = a_ + b_ + cash + coin_amt
     k0 = st.columns(4)
     k0[0].metric("현재 주식 투자금액", f"{total / 1e4:,.0f}만원", "잔고 합산(자동)", delta_color="off",
                  help="내 자산 화면의 보유 종목 평가금액과 카카오 정기매수 평가금액을 합친 값이에요. 시세에 따라 매일 바뀌고, 아래 목적별 현재 금액에 자동으로 반영돼요.")
     k0[1].metric("보유 종목", f"{a_ / 1e4:,.0f}만원")
     k0[2].metric("카카오 정기매수", f"{b_ / 1e4:,.0f}만원")
-    k0[3].metric("계좌 현금(포함 시)", f"{cash / 1e4:,.0f}만원" if inc_cash else "미포함")
+    k0[3].metric("현금·코인(포함 시)", f"{(cash + coin_amt) / 1e4:,.0f}만원" if (inc_cash or inc_coin) else "미포함")
     if total <= 0:
         st.warning("주식 평가금액을 계산하지 못했어요. 보유 종목을 입력하고 시세가 들어오면 자동으로 채워져요.")
     goal["inflation"] = c1.number_input("물가 상승률(연 %)", min_value=0.0, value=float(goal.get("inflation", 2.5)), step=0.5, key="g_infl",
@@ -4131,6 +4229,9 @@ def tab_rules():
                                       help="무효가격까지 내려갔을 때 총자산의 이 비율만 잃도록 살 수량을 계산해요. 보통 1~2%를 많이 써요.")
     rk["max_pos"] = rb.number_input("한 종목 최대 비중(총자산 대비 %)", min_value=1.0, max_value=100.0, value=float(rk["max_pos"]), step=1.0, key="rk_mp")
     rk["min_ratio"] = rc.number_input("진입 손익비 기준(이 이상이면 유리)", min_value=1.0, max_value=5.0, value=float(rk["min_ratio"]), step=0.5, key="rk_mr")
+    rd, _, _ = st.columns(3)
+    rk["coin_max"] = rd.number_input("코인 최대 비중(총자산 대비 %)", min_value=0.0, max_value=100.0, value=float(rk.get("coin_max", 10.0)), step=1.0, key="rk_cm",
+                                     help="내 자산의 쏠림 점검에서 코인이 주식+코인 합계의 이 비율을 넘으면 알려줘요. 코인은 변동이 커서 주식과 따로 한도를 두는 걸 권해요.")
     st.divider()
     c1, c2, _ = st.columns([1, 1, 3])
     if c1.button("규칙 저장", type="primary"):
@@ -4171,7 +4272,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 1, "discover": 2}
 
 
 def check_versions():
@@ -4237,7 +4338,9 @@ def main():
     if "funds" not in st.session_state:
         st.session_state.funds = copy.deepcopy(DEFAULT_FUNDS)
     load_settings()
+    st.session_state.risk.setdefault("coin_max", 10.0)
     load_watch()
+    load_coins()
     load_perf()
     load_cons_hist()
     load_journal()
@@ -4264,7 +4367,9 @@ def main():
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
     pages = {"내 자산": lambda: tab_assets(rules), "주간 브리핑": lambda: tab_brief(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
              "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
-    page = st.radio("화면", list(pages), horizontal=True, key="page", label_visibility="collapsed")
+    with st.sidebar:                    # 메뉴는 왼쪽에 두어서, 화면이 길어도 스크롤하지 않고 바로 다른 화면으로 갈 수 있다
+        page = st.radio("화면", list(pages), key="page", label_visibility="collapsed", format_func=lambda p: f"{PAGE_ICON.get(p, '')} {p}".strip())
+        st.divider()
     page_help(page)
     with timed(f"화면: {page}"):
         pages[page]()  # 고른 화면만 계산해서 빠르다

@@ -22,6 +22,7 @@ def rows(url=""):
     s = "2. 이 시트의 탭 (앱의 저장소)"
     for tab, desc in (("보유종목", "증권사별 보유 종목, 수량, 평균단가, 매수일. 앱의 내 자산 탭에서 고치고 저장해요."),
                       ("정기매수", "카카오 소수점 정기매수(종목, 티커, 하루금액, 시작일)."),
+                      ("코인", "보유 코인(거래소, 코인 약어, 수량, 평균단가). 내 자산 화면의 코인 편집에서 저장하고, 시세는 업비트(없으면 빗썸)에서 자동으로 가져와 평가금액·비중·쏠림 점검에 보기 전용으로 합쳐요."),
                       ("설정", "규칙 탭의 숫자(손절선, 보호선, 안전 기준 등)와 목표. 규칙 저장을 누르면 여기에 남아요."),
                       ("자산기록", "총자산 기록(주식+현금). 앱을 연 날 하루 한 번 자동으로 쌓여요. 목표·성과 탭의 수익률 계산에 써요."),
                       ("입출금", "증권 계좌 밖에서 들어오거나 나간 돈(수익률에서 빼는 값)."),
@@ -41,7 +42,7 @@ def rows(url=""):
     add(s, "주의", "탭의 열 이름과 순서는 바꾸지 마세요. 값은 직접 고쳐도 되지만 앱에서 저장하면 앱의 값으로 덮어써질 수 있어요.")
 
     s = "3. 앱 화면별 용도"
-    for tab, desc in (("내 자산", "총자산, 증권사별 비중, 보유 종목 표(수익금액, 보호선, 지지선, 수급, 목표가 여력, 판단). 보유 종목 편집과 수급·컨센서스 가져오기."),
+    for tab, desc in (("내 자산", "총자산(코인은 보기 전용으로 합산), 증권사·거래소별 비중, 보유 종목 표(수익금액, 보호선, 지지선, 수급, 목표가 여력, 판단). 보유 종목 편집과 수급·컨센서스 가져오기."),
                       ("주간 브리핑", "이번 주에 무엇부터 볼지를 한 장으로. 매매 계획 기준 이탈, 매도·비중 축소 검토, 점수 하락, 개인 주도 경고, 월간 점검 기한, 비중 쏠림 등을 우선순위로 정리하고 매수 후보 3개를 보여줘요. 10분 안에 읽도록 만들었어요."),
                       ("종합 순위", "가격 흐름·수급·재무·컨센서스·진입 구조(손익비)를 하나의 종합 점수로 모아 종목을 한눈에 비교. 보유 종목 점검(점수 낮은 순)과 매수 후보(점수 높은 순) 보기, 점수의 실제 성과 확인."),
                       ("목표·성과", "올해 수익률(입금 보정), 고점 대비 낙폭, 월말 자산, 올해 목표 범위와 허용 낙폭."),
@@ -81,7 +82,7 @@ def rows(url=""):
 
     s = "6. 앱 코드를 고칠 때 반영 순서"
     add(s, "순서", "① 새 파일을 GitHub 저장소 맨 위(폴더 없이)에 Add file > Upload files로 올리고 Commit changes ② 앱 오른쪽 아래 Manage app > ⋮ > Reboot app ③ 1~3분 뒤 새로고침")
-    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, helptext.py, scan.py, sectors.py, wave.py, guide.py, requirements.txt (내 PC에서만 쓰는 local_collector.py는 올려도 되지만 collector_config.json은 절대 올리지 마세요)")
+    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, helptext.py, scan.py, sectors.py, wave.py, coins.py, guide.py, requirements.txt (내 PC에서만 쓰는 local_collector.py는 올려도 되지만 collector_config.json은 절대 올리지 마세요)")
     add(s, "파일 버전이 안 맞으면", "앱이 어느 파일이 예전 버전인지 알려줘요. 그 파일을 최신으로 올리고 Reboot 하세요.")
 
     s = "7. 문제가 생기면"
