@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-13 수정14(코인 수량·단가 입력)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-13 수정15(관심종목 관리)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -339,6 +339,88 @@ def add_watch(items):
     except Exception as e:
         return False, f"저장에 실패했어요: {e}"
 
+
+
+def save_watch(df):
+    """관심종목 전체를 시트에 저장한다. 반환: (성공, 문구)"""
+    store = get_store()
+    try:
+        if store is not None:
+            if st.session_state.get("load_error"):
+                return False, "구글 시트 연결이 불안정해서 저장하지 않았어요."
+            store.write("관심종목", df)
+        st.session_state.watch = df.reset_index(drop=True)
+        return True, "저장했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def watch_table(with_score=False):
+    """관심종목 표: 이름, 코드, 보유 여부, 현재가, 1개월 수익률(, 종합 점수)."""
+    w = st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS)).copy().reset_index(drop=True)
+    held = set(st.session_state.hold["종목코드"])
+    rows = []
+    with scan_mode():
+        prefetch_codes(list(w["종목코드"]), None, "시세")
+        for r in w.to_dict("records"):
+            c = str(r["종목코드"]).zfill(6)
+            d = hist_kr(c)
+            price = float(d["Close"].iloc[-1]) if len(d) else np.nan
+            m1 = (float(d["Close"].iloc[-1]) / float(d["Close"].iloc[-21]) - 1) * 100 if len(d) > 21 else np.nan
+            sc = np.nan
+            if with_score and len(d):
+                try:
+                    s_ = score_for(c, "중장기", None, None, None)
+                    sc = s_["total"] if s_ else np.nan
+                except Exception:
+                    sc = np.nan
+            rows.append({"삭제": False, "종목명": r["종목명"] or "", "종목코드": c, "상태": "보유 중" if c in held else "관심", "현재가(원)": price, "1개월(%)": m1, "종합점수": sc})
+    return pd.DataFrame(rows, columns=["삭제", "종목명", "종목코드", "상태", "현재가(원)", "1개월(%)", "종합점수"])
+
+
+def render_watch_manager():
+    """관심종목 보기·추가·이름 고치기·삭제."""
+    w = st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))
+    with st.expander(f"⭐ 관심종목 관리 ({len(w)}개) — 보기·추가·삭제", expanded=False):
+        st.caption("종목 발굴에서 '관심종목에 추가'한 종목들이에요. 구글 시트의 '관심종목' 탭과 같은 목록이고, 주간 브리핑의 매수 후보와 종합 순위, 종목 리포트에 나와요.")
+        a1, a2, a3 = st.columns([1, 2, 1])
+        code_in = a1.text_input("종목코드로 추가(6자리)", key="wm_code", placeholder="예: 033780")
+        name_in = a2.text_input("종목명(선택)", key="wm_name", placeholder="예: KT&G")
+        if a3.button("추가", key="wm_add"):
+            c_ = code_in.strip().zfill(6) if code_in.strip().isdigit() else ""
+            if len(c_) != 6:
+                st.error("종목코드는 6자리 숫자예요(예: 033780).")
+            else:
+                ok, msg = add_watch([(c_, name_in.strip())])
+                (st.success if ok else st.error)(msg)
+        if not len(w):
+            st.info("아직 관심종목이 없어요. 종목 발굴 결과 아래의 '관심종목에 추가'나 위의 종목코드 추가로 넣어 보세요.")
+            return
+        with_score = st.checkbox("종합 점수도 계산(종목마다 시간이 걸려요)", value=False, key="wm_score")
+        df = watch_table(with_score)
+        ed = st.data_editor(df, hide_index=True, width="stretch", key="wm_editor", disabled=["종목코드", "상태", "현재가(원)", "1개월(%)", "종합점수"], column_config={
+            "삭제": st.column_config.CheckboxColumn(help="빼고 싶은 종목에 체크한 뒤 아래 '삭제 확정'을 눌러요."),
+            "종목명": st.column_config.TextColumn(help="이름을 고치고 '이름 변경 저장'을 누르면 바뀌어요."),
+            "현재가(원)": st.column_config.NumberColumn(format="%,.0f"), "1개월(%)": st.column_config.NumberColumn(format="%+.1f"), "종합점수": st.column_config.NumberColumn(format="%.0f")})
+        sel = ed[ed["삭제"] == True]
+        b1, b2 = st.columns([1, 3])
+        if b1.button("이름 변경 저장", key="wm_names"):
+            cur = st.session_state.watch.copy().reset_index(drop=True)
+            new_names = dict(zip(ed["종목코드"], ed["종목명"].fillna("")))
+            cur["종목명"] = [new_names.get(c, n) for c, n in zip(cur["종목코드"], cur["종목명"])]
+            ok, msg = save_watch(cur)
+            (st.success if ok else st.error)(msg)
+        if len(sel):
+            st.warning(f"{len(sel)}개를 관심종목에서 뺄까요? **" + ", ".join(f"{r.종목명 or r.종목코드}" for r in sel.itertuples()) + "** (보유 종목에는 영향이 없어요)")
+            if st.button("삭제 확정", type="primary", key="wm_del"):
+                cur = st.session_state.watch.copy().reset_index(drop=True)
+                new = cur[~cur["종목코드"].isin(set(sel["종목코드"]))].reset_index(drop=True)
+                ok, msg = save_watch(new)
+                if ok:
+                    st.session_state.pop("wm_editor", None)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
 
 # ---------- 성과 기록 (구글 시트 '자산기록'·'입출금' 탭) ----------
@@ -2724,6 +2806,7 @@ def tab_discover():
         for stage, cond, why in scan_mod.criteria_rows(st.session_state.disc_f, st.session_state.risk, st.session_state.disc_f.get("small")):
             st.markdown(f"**{stage}** — {cond}  \n  ↳ {why}")
         st.caption("숫자는 아래 '발굴 조건'과 규칙 탭의 위험 한도에서 바꿀 수 있어요. 바꾼 뒤 1단계 조건은 '시장 데이터 불러오기'를 다시 눌러야 반영돼요.")
+    render_watch_manager()
     dart, err = get_dart()
     if dart is None:  # DART가 안 돼도 멈추지 않고 네이버 금융의 재무로 대신한다
         st.info((err or "DART에 연결하지 못했어요.") + " 재무는 네이버 금융으로 대신 가져와요(영업이익·영업적자 횟수·부채비율·ROE·PER/PBR만 확인돼요).")
@@ -4076,6 +4159,7 @@ def tab_rank(rules):
     st.markdown("**흩어진 근거를 하나의 점수로 모아서** 한눈에 비교해요. 가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조(손익비)를 각각 -100~+100으로 매기고 가중치(규칙 탭)로 모은 종합 점수예요(50 중립). "
                 "점수는 **이길 확률이 아니라 근거가 얼마나 한 방향으로 모이는지**예요. 근거 칸이 3/5 미만이면 참고만 하세요.")
     hold, watch = st.session_state.hold, st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))
+    st.caption(f"관심종목 {len(watch)}개가 `구분: 관심`으로 함께 나와요. 보거나 삭제하려면 **종목 발굴 화면 위쪽의 '⭐ 관심종목 관리'**를 여세요.")
     kinds = {}
     for c in hold["종목코드"].drop_duplicates():
         kinds[c] = "보유"
