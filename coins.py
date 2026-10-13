@@ -1,12 +1,13 @@
 """코인 평가(보기 전용): 거래소, 코인 약어, 수량, 평균단가를 직접 적으면 원화 시세로 평가금액을 계산한다.
 시세는 업비트 공개 API(없는 코인은 빗썸)에서 가져오며 API 키는 필요 없다. 주문은 하지 않는다."""
-VERSION = 1
+VERSION = 2  # 2: 수량 소수점, 매수금액으로 수량·평균단가 계산
 
 import numpy as np
 import pandas as pd
 import requests
 
 COLS = ["거래소", "코인", "수량", "평균단가", "메모"]
+EDIT_COLS = COLS + ["매수금액"]          # 편집 표에만 있는 칸: 수량이나 평균단가를 모를 때 계산하는 데 쓰고, 저장하면 비워진다
 EXCHANGES = ["업비트", "빗썸", "코인원", "바이낸스", "기타"]
 UPBIT_ALL = "https://api.upbit.com/v1/market/all"
 UPBIT_TICKER = "https://api.upbit.com/v1/ticker"
@@ -26,20 +27,40 @@ def norm_symbol(x):
     return "" if s in _BLANK else s
 
 
+def _num(x):
+    v = pd.to_numeric(x, errors="coerce")
+    return float(v) if pd.notna(v) else float("nan")
+
+
+def derive(qty, avg, amt):
+    """수량·평균단가·매수금액 중 두 가지를 알면 나머지 하나를 계산한다. 반환: (수량, 평균단가)."""
+    qty, avg, amt = _num(qty), _num(avg), _num(amt)
+    if not (qty > 0) and avg > 0 and amt > 0:
+        qty = round(amt / avg, 8)
+    elif qty > 0 and not (avg > 0) and amt > 0:
+        avg = round(amt / qty, 6)
+    return (qty if qty > 0 else 0.0), (avg if avg > 0 else float("nan"))
+
+
 def clean(df):
-    """입력 표를 정리한다: 코인 약어를 대문자로, 수량·평균단가를 숫자로. 코인 약어가 없는 줄은 뺀다."""
-    d = df.copy() if df is not None else pd.DataFrame(columns=COLS)
-    for c in COLS:
+    """입력 표를 정리한다: 코인 약어를 대문자로, 수량·평균단가를 숫자로(소수점 가능). 코인 약어가 없는 줄은 뺀다.
+    매수금액 칸이 있으면 수량이나 평균단가를 모를 때 거기서 계산해 채운다(매수금액 칸은 결과에 남기지 않는다)."""
+    d = df.copy() if df is not None else pd.DataFrame(columns=EDIT_COLS)
+    for c in EDIT_COLS:
         if c not in d.columns:
             d[c] = None
-    d = d[COLS].copy()
+    d = d[EDIT_COLS].copy()
     d["코인"] = d["코인"].map(norm_symbol)
-    d = d[d["코인"] != ""]
-    d["수량"] = pd.to_numeric(d["수량"], errors="coerce").fillna(0.0)
-    d["평균단가"] = pd.to_numeric(d["평균단가"], errors="coerce")
+    d = d[d["코인"] != ""].reset_index(drop=True)
+    q, a = [], []
+    for r in d.itertuples(index=False):
+        qq, aa = derive(r.수량, r.평균단가, r.매수금액)
+        q.append(qq)
+        a.append(aa)
+    d["수량"], d["평균단가"] = pd.Series(q, dtype="float64"), pd.Series(a, dtype="float64")
     d["거래소"] = d["거래소"].fillna("").astype(str).replace({"None": "", "nan": ""}).where(lambda s: s != "", "기타")
     d["메모"] = d["메모"].fillna("").astype(str).replace({"None": "", "nan": ""})
-    return d.reset_index(drop=True)
+    return d[COLS].reset_index(drop=True)
 
 
 def blank_symbol_rows(df):
@@ -49,10 +70,34 @@ def blank_symbol_rows(df):
     out = []
     for i, r in df.reset_index(drop=True).iterrows():
         sym = norm_symbol(r.get("코인"))
-        other = any(str(r.get(c) if r.get(c) is not None else "").strip().upper() not in _BLANK for c in ("수량", "평균단가", "메모"))
+        other = any(str(r.get(c) if r.get(c) is not None else "").strip().upper() not in _BLANK for c in ("수량", "평균단가", "메모", "매수금액"))
         if sym == "" and other:
             out.append(i + 1)
     return out
+
+
+def unknown_qty_rows(df):
+    """코인 약어는 있는데 수량을 알 수 없는 줄의 번호(수량을 적거나, 매수금액과 평균단가를 같이 적어야 한다)."""
+    if df is None or df.empty:
+        return []
+    d = df.reset_index(drop=True)
+    out = []
+    for i, r in d.iterrows():
+        if norm_symbol(r.get("코인")) and not (derive(r.get("수량"), r.get("평균단가"), r.get("매수금액"))[0] > 0):
+            out.append(i + 1)
+    return out
+
+
+def fmt_price(x):
+    """원화 가격을 보기 좋게: 큰 값은 천 단위 쉼표, 작은 값(수십 원 이하)은 소수점 몇 자리까지."""
+    v = _num(x)
+    if v != v:
+        return ""
+    if abs(v) >= 100:
+        return f"{v:,.0f}"
+    if abs(v) >= 1:
+        return f"{v:,.2f}".rstrip("0").rstrip(".")
+    return f"{v:.6f}".rstrip("0").rstrip(".") or "0"
 
 
 def fetch_prices(symbols, get=None):

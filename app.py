@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-13 수정13(왼쪽 메뉴)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-13 수정14(코인 수량·단가 입력)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -1614,8 +1614,11 @@ def tab_assets(rules):
 
     if len(cdf):
         st.subheader("코인")
-        st.dataframe(cdf[["거래소", "코인", "수량", "평균단가", "현재가", "평가금액", "수익금액", "손익률"]], width="stretch", hide_index=True, column_config={
-            "수량": st.column_config.NumberColumn(format="%.8g"), "평균단가": st.column_config.NumberColumn(format="%,.0f원"), "현재가": st.column_config.NumberColumn(format="%,.0f원"),
+        cshow = cdf[["거래소", "코인", "수량", "평균단가", "현재가", "평가금액", "수익금액", "손익률"]].copy()
+        cshow["수량"] = cshow["수량"].map(lambda v: f"{v:.8f}".rstrip("0").rstrip(".") if v == v else "")
+        cshow["평균단가"], cshow["현재가"] = cshow["평균단가"].map(coins.fmt_price), cshow["현재가"].map(coins.fmt_price)
+        st.dataframe(cshow, width="stretch", hide_index=True, column_config={
+            "수량": st.column_config.TextColumn(help="소수점 여덟 자리까지 보여줘요."), "평균단가": st.column_config.TextColumn("평균단가(원)"), "현재가": st.column_config.TextColumn("현재가(원)"),
             "평가금액": st.column_config.NumberColumn(format="%,.0f원"), "수익금액": st.column_config.NumberColumn(format="%,.0f원"), "손익률": st.column_config.NumberColumn(format="%.1f%%")})
         st.caption("보기 전용이에요. 시세는 업비트(없으면 빗썸)의 원화 시세이고, 평균단가는 직접 적은 값이에요. 코인은 주식의 보호선·지지선 같은 신호를 적용하지 않아요.")
     st.divider()
@@ -1682,20 +1685,27 @@ def edit_coins():
         return
     if store is None:
         st.warning("데모 모드예요. 여기서 고친 내용은 저장되지 않고 새로고침하면 사라져요.")
-    st.markdown("**코인** — 거래소, 코인 약어(예: BTC, ETH, XRP), 수량, 평균단가(원, 선택)를 직접 적어요. 시세는 업비트(없으면 빗썸)에서 가져와요. "
-                "**거래소 API 키는 필요 없고, 넣지 마세요.** 행을 추가하려면 맨 아래 빈 줄에 입력하세요. **코인 약어가 비어 있는 줄은 저장되지 않아요.**")
+    st.markdown("**코인** — 거래소, 코인 약어(예: BTC, ETH, XRP)와 **수량**, **평균단가**(코인 1개당 원)를 적어요. **수량은 소수점으로**(예: `0.00123`) 적어도 돼요. 시세는 업비트(없으면 빗썸)에서 가져와요. "
+                "**두 가지만 알면 나머지는 저장할 때 계산해요**: 수량을 모르면 `평균단가`와 `매수금액`을, 평균단가를 모르면 `수량`과 `매수금액`을 적으세요(`매수금액` 칸은 저장하면 비워져요). "
+                "**거래소 API 키는 필요 없고, 넣지 마세요.** 행을 추가하려면 맨 아래 빈 줄에 입력하세요. **코인 약어가 비어 있거나 수량을 알 수 없는 줄은 저장되지 않아요.**")
+    base = st.session_state.coin.reindex(columns=coins.EDIT_COLS)
+    for c_ in ("수량", "평균단가", "매수금액"):
+        base[c_] = pd.to_numeric(base[c_], errors="coerce").astype("float64")        # 빈 표여도 소수점을 받을 수 있게 숫자(실수) 칸으로 둔다
     ed = st.data_editor(
-        st.session_state.coin, num_rows="dynamic", width="stretch", hide_index=True, key="coin_editor",
+        base, num_rows="dynamic", width="stretch", hide_index=True, key="coin_editor",
         column_config={
             "거래소": st.column_config.SelectboxColumn(options=coins.EXCHANGES),
             "코인": st.column_config.TextColumn(help="BTC, ETH처럼 약어로 적어요(KRW-BTC로 적어도 돼요)."),
-            "수량": st.column_config.NumberColumn(min_value=0.0, format="%.8g", help="가진 개수예요(소수점 가능)."),
-            "평균단가": st.column_config.NumberColumn(min_value=0.0, format="%,.0f", help="코인 1개당 평균 매수가(원)예요. 비워 두면 수익률은 계산하지 않아요."),
+            "수량": st.column_config.NumberColumn(min_value=0.0, step=1e-8, format="%.10g", help="가진 개수예요. 소수점으로 적어도 돼요(예: 0.00123). 모르면 비워 두고 평균단가와 매수금액을 적으세요."),
+            "평균단가": st.column_config.NumberColumn(min_value=0.0, step=1e-6, format="%.10g", help="코인 1개당 평균 매수가(원)예요. 업비트의 '매수평균가'를 적으면 돼요. 모르면 비워 두고 수량과 매수금액을 적으세요."),
+            "매수금액": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%,.0f", help="산 데 쓴 총 금액(원)이에요. 수량이나 평균단가를 모를 때만 적으세요. 저장하면 계산해서 채우고 이 칸은 비워져요."),
         })
     if st.button("코인 저장", type="primary", key="coin_save"):
-        bad = coins.blank_symbol_rows(ed)
+        bad, noq = coins.blank_symbol_rows(ed), coins.unknown_qty_rows(ed)
         if bad:
             st.error(f"코인 약어가 비어 있는 줄이 있어요(줄 번호: {', '.join(map(str, bad))}). 약어를 채우거나 그 줄을 지운 뒤 저장하세요. 그대로 저장하면 그 줄이 사라져요.")
+        elif noq:
+            st.error(f"수량을 알 수 없는 줄이 있어요(줄 번호: {', '.join(map(str, noq))}). **수량**을 적거나, **평균단가와 매수금액**을 같이 적어 주세요.")
         else:
             new = coins.clean(ed)
             try:
@@ -4272,7 +4282,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 1, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2}
 
 
 def check_versions():
