@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-13 수정15(관심종목 관리)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-13 수정16(관심종목 추가 기록)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -75,7 +75,7 @@ KAKAO_COLS = ["종목명", "티커", "하루금액", "횟수", "기준일", "시
 CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
 CACHE_COLS = ["종목코드", "갱신일", "데이터"]
 SETTINGS_COLS = ["이름", "값"]
-WATCH_COLS = ["종목코드", "종목명"]
+WATCH_COLS = ["종목코드", "종목명", "추가일", "추가가"]      # 추가일·추가가: 관심종목에 담은 날과 그날의 종가(담은 뒤 얼마나 올랐나를 보려는 기록)
 DISCRES_COLS = ["점검일", "종목코드", "종목명", "점검가", "안전", "미달 항목", "확인 불가", "목표가 여력(%)", "진입 판정", "진입 손익비", "무효가격(원)", "최대 매수(주)",
                 "기다릴 가격(원)", "외국인 5일(억)", "기관 5일(억)", "흐름", "52주 위치(%)", "RSI", "3개월(%)", "재무출처", "구분", "업종", "규모", "진입 매력도", "권장 최대 비중(%)"]
 SCORELOG_COLS = ["날짜", "종목코드", "종합점수", "가격", "수급", "재무·안전", "컨센서스", "진입 구조", "근거수", "종가"]
@@ -287,6 +287,8 @@ def load_watch():
         try:
             df = store.read("관심종목", WATCH_COLS)
             df["종목코드"] = df["종목코드"].astype(str).str.strip().str.zfill(6)
+            df["추가일"] = df["추가일"].fillna("").astype(str).str.slice(0, 10).replace({"None": "", "nan": ""})
+            df["추가가"] = pd.to_numeric(df["추가가"], errors="coerce")           # 예전에 담은 종목은 비어 있다(기록이 없어서 채울 수 없어요)
         except Exception:
             pass
     st.session_state.watch = df.reset_index(drop=True)
@@ -327,7 +329,14 @@ def add_watch(items):
     new = [(c, n) for c, n in items if c not in have]
     if not new:
         return True, "이미 모두 관심종목에 있어요."
-    df = pd.concat([cur, pd.DataFrame(new, columns=WATCH_COLS)], ignore_index=True)
+    today, rows = dt.date.today().isoformat(), []
+    with scan_mode():                      # 담는 날의 종가를 같이 기록한다(방금 스캔한 시세가 있으면 그걸 써서 빠르다)
+        prefetch_codes([c for c, _ in new], None, "시세")
+        for c, n in new:
+            d = hist_kr(c)
+            rows.append((c, n, today, float(d["Close"].iloc[-1]) if len(d) else np.nan))
+    cur = cur.reindex(columns=WATCH_COLS)
+    df = pd.concat([cur, pd.DataFrame(rows, columns=WATCH_COLS)], ignore_index=True)
     store = get_store()
     try:
         if store is not None:
@@ -367,6 +376,8 @@ def watch_table(with_score=False):
             d = hist_kr(c)
             price = float(d["Close"].iloc[-1]) if len(d) else np.nan
             m1 = (float(d["Close"].iloc[-1]) / float(d["Close"].iloc[-21]) - 1) * 100 if len(d) > 21 else np.nan
+            add_p = pd.to_numeric(r.get("추가가"), errors="coerce")
+            chg = (price / add_p - 1) * 100 if (pd.notna(add_p) and add_p > 0 and price == price) else np.nan
             sc = np.nan
             if with_score and len(d):
                 try:
@@ -374,8 +385,9 @@ def watch_table(with_score=False):
                     sc = s_["total"] if s_ else np.nan
                 except Exception:
                     sc = np.nan
-            rows.append({"삭제": False, "종목명": r["종목명"] or "", "종목코드": c, "상태": "보유 중" if c in held else "관심", "현재가(원)": price, "1개월(%)": m1, "종합점수": sc})
-    return pd.DataFrame(rows, columns=["삭제", "종목명", "종목코드", "상태", "현재가(원)", "1개월(%)", "종합점수"])
+            rows.append({"삭제": False, "종목명": r["종목명"] or "", "종목코드": c, "상태": "보유 중" if c in held else "관심", "추가일": r.get("추가일") or "", "추가가(원)": add_p,
+                         "현재가(원)": price, "추가 후 변화(%)": chg, "1개월(%)": m1, "종합점수": sc})
+    return pd.DataFrame(rows, columns=["삭제", "종목명", "종목코드", "상태", "추가일", "추가가(원)", "현재가(원)", "추가 후 변화(%)", "1개월(%)", "종합점수"])
 
 
 def render_watch_manager():
@@ -398,10 +410,17 @@ def render_watch_manager():
             return
         with_score = st.checkbox("종합 점수도 계산(종목마다 시간이 걸려요)", value=False, key="wm_score")
         df = watch_table(with_score)
-        ed = st.data_editor(df, hide_index=True, width="stretch", key="wm_editor", disabled=["종목코드", "상태", "현재가(원)", "1개월(%)", "종합점수"], column_config={
+        ed = st.data_editor(df, hide_index=True, width="stretch", key="wm_editor", disabled=["종목코드", "상태", "추가일", "추가가(원)", "현재가(원)", "추가 후 변화(%)", "1개월(%)", "종합점수"], column_config={
             "삭제": st.column_config.CheckboxColumn(help="빼고 싶은 종목에 체크한 뒤 아래 '삭제 확정'을 눌러요."),
             "종목명": st.column_config.TextColumn(help="이름을 고치고 '이름 변경 저장'을 누르면 바뀌어요."),
-            "현재가(원)": st.column_config.NumberColumn(format="%,.0f"), "1개월(%)": st.column_config.NumberColumn(format="%+.1f"), "종합점수": st.column_config.NumberColumn(format="%.0f")})
+            "추가일": st.column_config.TextColumn(help="관심종목에 담은 날이에요. 이 기능이 생기기 전에 담은 종목은 비어 있어요."),
+            "추가가(원)": st.column_config.NumberColumn(format="%,.0f", help="담은 날의 종가(장 마감 전이면 직전 종가)예요."),
+            "현재가(원)": st.column_config.NumberColumn(format="%,.0f"), "추가 후 변화(%)": st.column_config.NumberColumn(format="%+.1f", help="담은 날의 가격 대비 지금 가격의 변화예요. 발굴한 종목이 이후 어땠는지 보는 자료예요."),
+            "1개월(%)": st.column_config.NumberColumn(format="%+.1f"), "종합점수": st.column_config.NumberColumn(format="%.0f")})
+        ok_ = df[(df["추가일"] != "") & (df["추가일"] < dt.date.today().isoformat())]["추가 후 변화(%)"].dropna()
+        if len(ok_) >= 3:
+            st.write(f"추가 기록이 있는 {len(ok_)}종목의 **추가 후 평균 변화는 {ok_.mean():+.1f}%**, 오른 종목은 {int((ok_ > 0).sum())}/{len(ok_)}개예요.")
+            st.caption("종목이 몇 개 안 되면 평균은 우연일 수 있어요. 담은 시점이 제각각이라 기간이 달라서 비교용으로만 보세요. 같은 기간 시장(코스피)이 얼마나 올랐는지와 함께 보시면 좋아요.")
         sel = ed[ed["삭제"] == True]
         b1, b2 = st.columns([1, 3])
         if b1.button("이름 변경 저장", key="wm_names"):
