@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-13 수정16(관심종목 추가 기록)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-14 수정17(꼬리표별 기간·목표·만료)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -69,7 +69,7 @@ from store import GasStore
 st.set_page_config(page_title="내 투자 노트", page_icon="📈", layout="wide")
 
 BROKERS = ["키움", "한국투자", "카카오", "토스"]
-TAGS = ["중장기", "스윙"]
+TAGS = ["중장기", "스윙", "단타"]
 HOLD_COLS = ["증권사", "종목코드", "종목명", "꼬리표", "수량", "평균단가", "매수일"]
 KAKAO_COLS = ["종목명", "티커", "하루금액", "횟수", "기준일", "시작일"]
 CONC_LIMIT = 20  # 한 종목 쏠림 경고 기준(%)
@@ -272,7 +272,7 @@ def reset_settings():
     st.session_state.risk = copy.deepcopy(entry.DEFAULTS)
     st.session_state.weights = copy.deepcopy(score.DEFAULT_WEIGHTS)
     for k in list(st.session_state.keys()):
-        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "wt_ev", "rk_pt", "rk_mp", "rk_mr", "rk_cm", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
+        if k.startswith(("s_on_", "s_v_", "d_on_", "d_v_", "g_")) or k in ("wt_0", "wt_1", "wt_2", "wt_3", "wt_4", "wt_ev", "rk_pt", "rk_mp", "rk_mr", "rk_cm", "s_hold", "d_sl", "d_t", "d_rsi", "d_pl", "d_ph", "d_ta", "d_tw", "d_sp", "d_td", "d_hold", "l_t", "s_t", "d_maxn", "l_ta", "l_tw", "s_ta", "s_tw", "l_td", "s_td", "l_sp", "s_sp"):
             del st.session_state[k]
 
 
@@ -573,8 +573,11 @@ def card_for(code, tag, avg, qty, since=None):
     lv = sg.structure(ind, tag, rules)
     sres = safety_for(code)
     counts = safety.summarize(sres[1]) if sres else None
-    return judge.build_card(ind["price"], avg or None, qty or None, tag, ind, lv, cons_for(code), st.session_state.get("flow_sum", {}).get(code),
+    card = judge.build_card(ind["price"], avg or None, qty or None, tag, ind, lv, cons_for(code), st.session_state.get("flow_sum", {}).get(code),
                             counts, rules, st.session_state.get("total_val"))
+    cl = pd.Series(df["Close"]).dropna().astype(float).iloc[-61:]
+    card["vol_d"] = float(np.std(np.diff(np.log(cl.values)))) if len(cl) > 20 else None      # 일 변동성(최근 60일): 단타·스윙의 기간 변동폭 계산에 쓴다
+    return card
 
 
 def journal_due():
@@ -634,7 +637,12 @@ def sizing_assets():
 
 
 def entry_for(card, price, invalid=None):
-    return entry.plan_entry(price, card, sizing_assets(), st.session_state.risk, invalid)
+    """진입 평가. 단타·스윙은 보유 기간 기준(가까운 저항선·지지선, 기간 변동폭)으로 목표와 무효가격을 정하고, 중장기는 기존대로(컨센서스 절반·저항선, 지지선)."""
+    h = entry.horizon_levels(card, price, (card or {}).get("tag"), (card or {}).get("vol_d"), st.session_state.get("rules")) if card else None
+    c = entry.with_horizon(card, h) if h else card
+    e = entry.plan_entry(price, c, sizing_assets(), st.session_state.risk, invalid if invalid else (h["invalid"] if h else None))
+    e["horizon"] = h
+    return e
 
 
 def plan_rows(rules):
@@ -1430,6 +1438,18 @@ def wave_win_picker(key_suffix=""):
              help="추세와 파동을 몇 개월치 가격으로 볼지예요. 1년으로 보면 그 사이 한 방향으로 올랐던 종목은 추세형으로 나오고, 최근 몇 달만 박스권이던 종목은 파동형으로 안 나와요. 최근 박스권을 찾으려면 6개월이 맞아요.")
 
 
+def hold_period(tag, since, rules, today=None):
+    """단타·스윙의 보유 기간 경과. 매수일이 없거나 중장기면 None. 반환: {limit, elapsed, left, text, expired, imminent}"""
+    lim = int(((rules or {}).get(tag) or {}).get("보유기간") or 0)
+    if tag not in ("단타", "스윙") or lim <= 0 or not since or pd.isna(pd.to_datetime(since, errors="coerce")):
+        return None
+    t = pd.Timestamp(today if today is not None else pd.Timestamp.today()).normalize()
+    el = int(np.busday_count(pd.to_datetime(since).date(), t.date()))
+    left = lim - el
+    txt = f"{el}/{lim}일" + (" (만료)" if left <= 0 else " (임박)" if left <= 2 else "")
+    return {"limit": lim, "elapsed": el, "left": left, "text": txt, "expired": left <= 0, "imminent": 0 < left <= 2}
+
+
 def wave_cell(df):
     """보유 종목 표의 '파동' 칸: 파동형(점수 60 이상, 추세 ±20% 이내)이면 지금 위치를 보여준다."""
     import wave
@@ -1471,7 +1491,7 @@ def build_positions(hold, rules):
         rows.append(
             {
                 "증권사": r["증권사"], "종목명": r["종목명"] or r["종목코드"], "종목코드": r["종목코드"],
-                "꼬리표": r["꼬리표"], "수량": qty, "평균단가": avg, "현재가": price,
+                "꼬리표": r["꼬리표"], "기간": (hold_period(r["꼬리표"], r.get("매수일"), rules) or {}).get("text", "-"), "수량": qty, "평균단가": avg, "현재가": price,
                 "평가금액": qty * price, "투자원금": qty * avg, "수익금액": qty * (price - avg),
                 "수익률": (price / avg - 1) * 100 if avg > 0 else float("nan"),
                 "고점 대비(%)": prot["overall_dd"] if prot else float("nan"),
@@ -1670,7 +1690,7 @@ def tab_assets(rules):
         c3.caption("수급(30분 저장)과 증권사 컨센서스(6시간 저장)는 네이버 증권 데이터를 읽어와요. 서버에서 접속이 막히면 표시되지 않아요. 목표가 여력은 평균 목표가가 현재가보다 몇 % 높은지예요.")
         for e in st.session_state.pop("flow_msg", []) or []:
             st.warning(f"수급을 못 가져왔어요 — {e}")
-        show = pos[["증권사", "종목명", "꼬리표", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "지지선(원)", "지지선까지(%)", "평소 되돌림(%)", "흐름", "파동", "수급(5일)", "목표가 여력(%)", "종합점수", "근거", "안전", "판단", "신호"]]
+        show = pos[["증권사", "종목명", "꼬리표", "기간", "수량", "평균단가", "현재가", "평가금액", "수익금액", "수익률", "고점 대비(%)", "수익 보호선(원)", "보호선 상태", "지지선(원)", "지지선까지(%)", "평소 되돌림(%)", "흐름", "파동", "수급(5일)", "목표가 여력(%)", "종합점수", "근거", "안전", "판단", "신호"]]
         st.dataframe(
             show,
             width="stretch",
@@ -1687,6 +1707,7 @@ def tab_assets(rules):
                 "고점 대비(%)": st.column_config.NumberColumn(format="%.1f", help="최근 1년(또는 매수일 이후) 최고 종가 대비예요."),
                 "지지선(원)": st.column_config.NumberColumn(format="%,d", help="과거에 밀렸다가 반등한 가격대 중 현재가 바로 아래에 있는 곳이에요. 참고용이에요."),
                 "지지선까지(%)": st.column_config.NumberColumn(format="%.1f"),
+                "기간": st.column_config.TextColumn(help="단타·스윙의 보유 기간 경과예요(매수일 기준 거래일/보유 기간). 만료되면 '(만료)', 2거래일 이내면 '(임박)'으로 표시돼요. 중장기이거나 매수일이 없으면 '-'예요. 매수일은 보유 종목 편집에서 적어요."),
                 "파동": st.column_config.TextColumn(help="오르내림을 반복하는 파동형 종목이면 최근 120일 가격 범위에서의 위치예요(진입 구간 25% 이하, 매도 구간 75% 이상). 파동형이 아니면 '-'예요."),
                 "종합점수": st.column_config.NumberColumn(format="%.0f", help="가격 흐름, 수급, 재무·안전, 컨센서스, 진입 구조를 모은 점수예요(50 중립). 이길 확률이 아니라 근거가 한 방향으로 모이는 정도예요. 근거 칸은 반영한 근거 수예요."),
                 "평소 되돌림(%)": st.column_config.NumberColumn(format="%.1f", help="이 종목이 과거에 고점에서 보통 이만큼 밀렸다가 반등했어요(중간값)."),
@@ -1933,6 +1954,8 @@ def render_entry(card, price, code, name, held, key):
     k[4].metric("기다릴 가격", "-" if not e["wait_price"] else f"{e['wait_price']:,.0f}원", None if not e["wait_price"] else f"{e['wait_pct']:.1f}%", delta_color="off",
                 help="손익비가 기준에 닿는 가격이에요(같은 무효가격과 목표를 가정). 비어 있으면 이미 기준을 넘었거나 계산할 수 없어요.")
     st.markdown(entry.entry_text(e))
+    if e.get("horizon"):
+        st.info("**" + e["horizon"]["why"] + "** 이 계수(저항선 대비 변동폭의 0.8배 등)는 시작 기본값이고 아직 데이터로 검증하지 않았어요. 규칙 화면에서 보유 기간을 바꿀 수 있어요.")
     if sizing_assets() is None:
         st.warning("총자산을 알 수 없어서 살 수 있는 크기를 계산하지 못했어요(보유 종목 입력 후, 목표·성과 탭에서 현금을 기록하면 계산돼요).")
     cons = cons_for(code)
@@ -1944,11 +1967,15 @@ def render_entry(card, price, code, name, held, key):
         elif not e.get("invalid"):
             st.error("무효가격을 먼저 정해 주세요.")
         else:
-            tag = card["tag"]
+            tag, hz = card["tag"], e.get("horizon")
+            ag_ = holding_agg(code)
+            today_ = str((ag_ or {}).get("since") or dt.date.today().isoformat())[:10]       # 이미 산 종목이면 매수일이 진입일(기간은 매수일부터 센다)
+            days_ = hz["days"] if hz else (st.session_state.rules.get(tag, {}).get("보유기간") or 0)
             row = {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "종목코드": code, "종목명": name, "생성일": dt.date.today().isoformat(), "상태": "진행", "꼬리표": tag,
                    "기준가": price, "수량": e["shares"] or 0, "무효가격": e["invalid"], "목표1": e["up_price"] or price * 1.15,
-                   "비율1": 30, "목표2": t2 or (card["ups"][0]["price"] if card["ups"] else price * 1.3), "비율2": 30,
-                   "보호폭": st.session_state.rules.get(tag, {}).get("보호폭", 15), "완료1": "", "완료2": "", "메모": ""}
+                   "비율1": 30, "목표2": (hz["t2"] if hz else (t2 or (card["ups"][0]["price"] if card["ups"] else price * 1.3))), "비율2": 30,
+                   "보호폭": st.session_state.rules.get(tag, {}).get("보호폭", 15), "완료1": "", "완료2": "",
+                   "메모": (hz["why"] if hz else ""), "진입일": today_, "보유기간": days_ or "", "만료일": (plan.expiry_date(today_, days_).date().isoformat() if days_ else "")}
             ok, msg = save_plans(pd.concat([pl, pd.DataFrame([row])], ignore_index=True))
             (st.success if ok else st.error)(msg + (" 매매 계획 화면에서 목표와 정리 비율을 다듬을 수 있어요." if ok else ""))
 
@@ -3406,11 +3433,13 @@ def tab_plan(rules):
             st_ = {s["단계"].split("(")[0]: s for s in ev["steps"]}
             tbl.append({"종목": p["종목명"] or p["종목코드"], "현재가": ev["price"], "기준가 대비(%)": ev["pl_pct"], "점검 결과": ev["action"],
                         "무효가격까지(%)": st_.get("무효가격", {}).get("현재가 대비(%)"), "1차 목표까지(%)": st_.get("1차 목표", {}).get("현재가 대비(%)"),
-                        "2차 목표까지(%)": st_.get("2차 목표", {}).get("현재가 대비(%)")})
+                        "2차 목표까지(%)": st_.get("2차 목표", {}).get("현재가 대비(%)"),
+                        "만료까지(거래일)": (ev.get("expiry") or {}).get("left")})
         st.dataframe(pd.DataFrame(tbl), width="stretch", hide_index=True, column_config={
             "현재가": st.column_config.NumberColumn(format="%,d"), "기준가 대비(%)": st.column_config.NumberColumn(format="%+.1f"),
             "무효가격까지(%)": st.column_config.NumberColumn(format="%+.1f"), "1차 목표까지(%)": st.column_config.NumberColumn(format="%+.1f"),
-            "2차 목표까지(%)": st.column_config.NumberColumn(format="%+.1f")})
+            "2차 목표까지(%)": st.column_config.NumberColumn(format="%+.1f"),
+            "만료까지(거래일)": st.column_config.NumberColumn(format="%d", help="매수일(진입일)부터 보유 기간이 끝나는 날까지 남은 거래일이에요(주말 제외, 공휴일은 반영하지 않아요). 0 이하면 만료예요. 비어 있으면 기간이 없는 계획이에요.")})
     else:
         st.info("진행 중인 계획이 없어요. 종목 리포트의 진입 평가에서 '이 조건으로 매매 계획 만들기'를 누르거나, 아래에서 새로 만드세요.")
 
@@ -3422,6 +3451,9 @@ def tab_plan(rules):
                     "가격": st.column_config.NumberColumn(format="%,d"), "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
                 st.caption(f"계획을 만든 날({p['생성일'].date()}) 이후 최고가 {ev['peak']:,.0f}원, 현재가 {ev['price']:,.0f}원")
             pid = p["id"]
+            ex_ = ev.get("expiry")
+            if ex_:
+                st.caption(f"꼬리표 {p['꼬리표']} · 진입일 {p['진입일']:%Y-%m-%d} · 보유 기간 {int(p['보유기간'])}거래일 · 만료일 {ex_['date']:%Y-%m-%d}" + (" — **만료됐어요**" if ex_["expired"] else f" — {ex_['left']}거래일 남음"))
             c1, c2, c3, c4 = st.columns(4)
             inv = c1.number_input("무효가격", min_value=0.0, value=float(p["무효가격"] or 0), step=100.0, key=f"pl_inv_{pid}")
             t1 = c2.number_input("1차 목표", min_value=0.0, value=float(p["목표1"] or 0), step=100.0, key=f"pl_t1_{pid}")
@@ -3458,6 +3490,21 @@ def tab_plan(rules):
                 (st.success if ok else st.error)(msg)
                 if ok:
                     st.rerun()
+            if ex_ and ex_["expired"]:
+                e1, e2 = st.columns([3, 1])
+                why_ext = e1.text_input("기간 연장 사유(연장하려면 꼭 적어요)", key=f"pl_ext_why_{pid}", placeholder="예: 20일선 지지 확인, 실적 발표 전이라 며칠 더 지켜봄")
+                if e2.button("기간 연장", key=f"pl_ext_{pid}", help="오늘부터 보유 기간만큼 다시 늘리고, 사유를 계획 메모에 남겨요."):
+                    if not why_ext.strip():
+                        st.error("연장 사유를 적어야 연장돼요. 사유 없이 길어지는 걸 막으려는 장치예요.")
+                    else:
+                        days_ = int(p["보유기간"])
+                        new_exp = plan.expiry_date(dt.date.today().isoformat(), days_)
+                        pl.loc[idx, "만료일"] = new_exp
+                        pl.loc[idx, "메모"] = (p["메모"] + " | " if p["메모"] else "") + f"[연장 {dt.date.today().isoformat()}] {why_ext.strip()}"
+                        ok, msg = save_plans(pl)
+                        (st.success if ok else st.error)(msg + " 판단 기록 탭에도 한 줄 남겨 두면 좋아요.")
+                        if ok:
+                            st.rerun()
             st.caption("정리를 실행했다면 판단 기록 탭에도 한 줄 남겨 두면, 계획대로 했을 때의 결과를 나중에 비교할 수 있어요.")
 
     with st.expander("새 계획 만들기"):
@@ -3471,22 +3518,30 @@ def tab_plan(rules):
         ag = holding_agg(code) if code else None
         df_ = hist_kr(code) if code else pd.DataFrame()
         if code and len(df_):
-            tag = (ag or {}).get("tag", "중장기")
+            tag_def = (ag or {}).get("tag", "중장기")
+            tag = st.radio("꼬리표(이 매매를 어떤 기간으로 보나요)", TAGS, index=TAGS.index(tag_def) if tag_def in TAGS else 0, horizontal=True, key=f"np_tag_{code}",
+                           help="꼬리표에 따라 목표·무효가격의 기준과 보유 기간이 달라져요. 단타·스윙은 가까운 저항선·지지선과 보유 기간 변동폭, 중장기는 컨센서스 절반·저항선과 지지선을 써요. 바꾸면 아래 기본값이 다시 계산돼요.")
             card = card_for(code, tag, (ag or {}).get("avg"), (ag or {}).get("qty"), (ag or {}).get("since"))
             price = float(df_["Close"].iloc[-1])
             st.caption(f"현재가 {price:,.0f}원" + ("" if not card else " · 아래 기본값은 종합 판단 카드가 제안한 값이에요(바꿔도 돼요)."))
             e = entry_for(card, price) if card else None
+            hz = (e or {}).get("horizon")
+            if hz:
+                st.info("**" + hz["why"] + "** (시작 기본값이고 아직 검증하지 않았어요)")
+            tg = tag
             c1, c2, c3 = st.columns(3)
-            base = c1.number_input("기준가(내 평단 또는 살 가격)", min_value=0.0, value=float((ag or {}).get("avg") or price), step=100.0, key=f"np_base_{code}")
-            qty = c2.number_input("수량", min_value=0.0, value=float((ag or {}).get("qty") or (e["shares"] if e and e["shares"] else 0)), step=1.0, key=f"np_qty_{code}")
-            tg = c3.selectbox("꼬리표", ["중장기", "스윙"], index=0 if tag == "중장기" else 1, key=f"np_tag_{code}")
+            base = c1.number_input("기준가(내 평단 또는 살 가격)", min_value=0.0, value=float((ag or {}).get("avg") or price), step=100.0, key=f"np_base_{code}_{tag}")
+            qty = c2.number_input("수량", min_value=0.0, value=float((ag or {}).get("qty") or (e["shares"] if e and e["shares"] else 0)), step=1.0, key=f"np_qty_{code}_{tag}")
+            days_def = int(hz["days"]) if hz else int(rules.get(tag, {}).get("보유기간") or 0)
+            days_in = c3.number_input("보유 기간(거래일, 0이면 기간 없음)", min_value=0, max_value=260, value=days_def, step=1, key=f"np_days_{code}_{tag}",
+                                      help="진입일(오늘 또는 매수일)부터 이 기간이 지나면 '기간 만료'로 알려줘요. 단타·스윙은 시간 손절 용도예요.")
             d1, d2, d3, d4 = st.columns(4)
-            inv = d1.number_input("무효가격", min_value=0.0, value=float(round(e["invalid"])) if e and e["invalid"] else 0.0, step=100.0, key=f"np_inv_{code}")
-            t1 = d2.number_input("1차 목표", min_value=0.0, value=float(round(card["up_price"])) if card and card.get("up_price") else float(round(price * 1.15)), step=100.0, key=f"np_t1_{code}")
+            inv = d1.number_input("무효가격", min_value=0.0, value=float(round(e["invalid"])) if e and e["invalid"] else 0.0, step=100.0, key=f"np_inv_{code}_{tag}")
+            t1 = d2.number_input("1차 목표", min_value=0.0, value=float(round(e["up_price"])) if e and e.get("up_price") else float(round(price * 1.15)), step=100.0, key=f"np_t1_{code}_{tag}")
             cons = cons_for(code)
-            t2d = (cons["target"] if cons and cons.get("has") and cons.get("target") else (card["ups"][0]["price"] if card and card["ups"] else price * 1.3))
-            t2 = d3.number_input("2차 목표", min_value=0.0, value=float(round(t2d)), step=100.0, key=f"np_t2_{code}")
-            w = d4.number_input("보호폭(%)", min_value=0.0, value=float(rules.get(tg, {}).get("보호폭", 15)), step=1.0, key=f"np_w_{code}")
+            t2d = (hz["t2"] if hz else (cons["target"] if cons and cons.get("has") and cons.get("target") else (card["ups"][0]["price"] if card and card["ups"] else price * 1.3)))
+            t2 = d3.number_input("2차 목표", min_value=0.0, value=float(round(t2d)), step=100.0, key=f"np_t2_{code}_{tag}")
+            w = d4.number_input("보호폭(%)", min_value=0.0, value=float(rules.get(tg, {}).get("보호폭", 15)), step=1.0, key=f"np_w_{code}_{tag}")
             f1, f2, f3 = st.columns([1, 1, 3])
             r1 = f1.number_input("1차 정리 비율(%)", min_value=0.0, max_value=100.0, value=30.0, step=5.0, key=f"np_r1_{code}")
             r2 = f2.number_input("2차 정리 비율(%)", min_value=0.0, max_value=100.0, value=30.0, step=5.0, key=f"np_r2_{code}")
@@ -3500,7 +3555,9 @@ def tab_plan(rules):
                 else:
                     name = (ag or {}).get("name") or (card and code) or code
                     row = {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "종목코드": code, "종목명": name, "생성일": dt.date.today().isoformat(), "상태": "진행",
-                           "꼬리표": tg, "기준가": base, "수량": qty, "무효가격": inv, "목표1": t1, "비율1": r1, "목표2": t2, "비율2": r2, "보호폭": w, "완료1": "", "완료2": "", "메모": memo}
+                           "꼬리표": tg, "기준가": base, "수량": qty, "무효가격": inv, "목표1": t1, "비율1": r1, "목표2": t2, "비율2": r2, "보호폭": w, "완료1": "", "완료2": "",
+                           "메모": memo or (hz["why"] if hz else ""), "진입일": ((ag or {}).get("since") or dt.date.today().isoformat())[:10],
+                           "보유기간": days_in or "", "만료일": (plan.expiry_date(((ag or {}).get("since") or dt.date.today().isoformat())[:10], days_in).date().isoformat() if days_in else "")}
                     ok, msg = save_plans(pd.concat([pl, pd.DataFrame([row])], ignore_index=True))
                     (st.success if ok else st.error)(msg)
                     if ok:
@@ -4122,6 +4179,22 @@ def tab_brief(rules):
         if wave.is_wave(pf_) and pf_["state"] == "매도 구간":
             extra.append({"우선순위": 2, "종목": h_["name"], "내용": f"파동 매도 구간(위치 {pf_['pos']:.0f}%) — 박스권 상단 {pf_['sell_lo']:,.0f}원 근처예요. 계획대로 일부 정리를 점검하세요", "볼 곳": "종목 리포트", "비중(%)": h_["weight"] or 0.0})
     held_codes = {h_["code"] for h_ in holds}
+    pl_ = st.session_state.get("plans")
+    plan_exp = set()
+    if pl_ is not None and not pl_.empty:
+        plan_exp = set(pl_[(pl_["상태"] == "진행") & pl_["만료일"].notna()]["종목코드"])
+    seen_exp = set()
+    for r_ in st.session_state.hold.to_dict("records"):          # 단타·스윙: 매수일 + 보유 기간이 지났거나 곧 지나면 알려준다
+        c_ = r_["종목코드"]
+        if c_ in plan_exp or c_ in seen_exp:
+            continue
+        hp_ = hold_period(r_["꼬리표"], r_.get("매수일"), st.session_state.rules)
+        if hp_ and (hp_["expired"] or hp_["imminent"]):
+            seen_exp.add(c_)
+            w_ = next((h_["weight"] for h_ in holds if h_["code"] == c_), 0.0) or 0.0
+            extra.append({"우선순위": 1 if hp_["expired"] else 2, "종목": r_["종목명"] or c_,
+                          "내용": (f"{r_['꼬리표']} 보유 기간 만료({hp_['elapsed']}/{hp_['limit']}거래일) — 목표에 닿지 못했다면 정리하거나, 연장하려면 사유를 기록하세요" if hp_["expired"]
+                                  else f"{r_['꼬리표']} 보유 기간 만료 임박({hp_['elapsed']}/{hp_['limit']}거래일, {hp_['left']}거래일 남음)"), "볼 곳": "매매 계획", "비중(%)": w_})
     for code_ in watch["종목코드"]:                    # 관심종목이 파동형이고 박스권 하단이면 진입 구간 안내
         if code_ in held_codes or not len(hist_kr(code_)):
             continue
@@ -4282,9 +4355,10 @@ def tab_rank(rules):
 def tab_rules():
     st.markdown("규칙 숫자를 바꾸면 신호가 바로 달라져요. 바꾼 뒤 맨 아래 '규칙 저장'을 눌러야 구글 시트에 저장돼요.")
     r = st.session_state.rules
-    a, b = st.columns(2)
+    a, b, c3 = st.columns(3)
     with a:
         st.markdown("**중장기**")
+        st.caption("보유 기간 없음 — 기간 만료 대신 월간 점검(판단 기록 탭)으로 봐요.")
         r["중장기"]["점검선"] = st.number_input("점검선(손실 %)", value=r["중장기"]["점검선"], step=1.0)
         r["중장기"]["목표"] = st.number_input("목표수익률(%)", value=r["중장기"]["목표"], step=1.0, key="l_t")
         r["중장기"]["고점권"] = st.number_input("52주 고점권 기준(%)", value=r["중장기"]["고점권"], step=1.0)
@@ -4307,6 +4381,22 @@ def tab_rules():
         r["스윙"]["보호폭"] = st.number_input("수익 보호폭(고점 대비 % 하락) ", value=float(r["스윙"]["보호폭"]), step=1.0, key="s_tw")
         r["스윙"]["지지선"] = int(st.checkbox("지지선 이탈 신호 사용 ", value=bool(r["스윙"].get("지지선", 1)), key="s_sp"))
         r["스윙"]["보호알림일"] = int(st.number_input("이탈 알림 유지 기간(거래일) ", min_value=1, value=int(r["스윙"].get("보호알림일", 10)), step=1, key="s_td"))
+        r["스윙"]["보유기간"] = int(st.number_input("보유 기간(거래일)", min_value=1, max_value=260, value=int(r["스윙"].get("보유기간", 10)), step=1, key="s_hold",
+                                              help="매수일부터 이 기간이 지나면 '기간 만료'로 알려줘요(기본 10거래일=2주). 목표·무효가격의 기간 변동폭 계산에도 쓰여요."))
+    with c3:
+        st.markdown("**단타**")
+        st.caption("당일 매매가 아니라 1~3거래일을 종가 기준으로 가져가는 단기 매매예요(이 앱은 장중 매매를 지원하지 않아요).")
+        r["단타"]["손절선"] = st.number_input("손절선(%)  ", value=r["단타"]["손절선"], step=0.5, key="d_sl")
+        r["단타"]["목표"] = st.number_input("목표수익률(%)  ", value=r["단타"]["목표"], step=1.0, key="d_t")
+        r["단타"]["RSI과열"] = st.number_input("RSI 과열(이상)  ", value=r["단타"]["RSI과열"], step=1.0, key="d_rsi")
+        r["단타"]["눌림_하단"] = st.number_input("눌림 RSI 하단  ", value=r["단타"]["눌림_하단"], step=1.0, key="d_pl")
+        r["단타"]["눌림_상단"] = st.number_input("눌림 RSI 상단  ", value=r["단타"]["눌림_상단"], step=1.0, key="d_ph")
+        r["단타"]["보호활성"] = st.number_input("수익 보호 시작(고점 기준 수익률 % 이상)  ", value=float(r["단타"]["보호활성"]), step=1.0, key="d_ta")
+        r["단타"]["보호폭"] = st.number_input("수익 보호폭(고점 대비 % 하락)  ", value=float(r["단타"]["보호폭"]), step=1.0, key="d_tw")
+        r["단타"]["지지선"] = int(st.checkbox("지지선 이탈 신호 사용  ", value=bool(r["단타"].get("지지선", 1)), key="d_sp"))
+        r["단타"]["보호알림일"] = int(st.number_input("이탈 알림 유지 기간(거래일)  ", min_value=1, value=int(r["단타"].get("보호알림일", 3)), step=1, key="d_td"))
+        r["단타"]["보유기간"] = int(st.number_input("보유 기간(거래일) ", min_value=1, max_value=260, value=int(r["단타"].get("보유기간", 3)), step=1, key="d_hold",
+                                              help="매수일부터 이 기간이 지나면 '기간 만료'로 알려줘요(기본 3거래일). 목표·무효가격의 기간 변동폭 계산에도 쓰여요."))
     st.divider()
     st.markdown("**안전 기준** — 켜져 있는 항목만 점검해요. 확인하지 못한 항목은 '확인 불가'로 표시하고 미달로 치지 않아요.")
     s = st.session_state.safe
@@ -4385,7 +4475,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 4, "levels": 1, "judge": 1, "journal": 2, "score": 2, "explain": 1, "entry": 1, "plan": 1, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 2, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2}
 
 
 def check_versions():

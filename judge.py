@@ -1,7 +1,7 @@
 """종합 판단 카드: 보수적인 상승 여력과 하락 위험, 손익비, 손익분기 승률, 내 평단 기준 시나리오.
 예측이 아니라 '내가 가진 근거로 잡은 최악과 최선 사이의 지도'다. 확률은 검증되기 전까지 모른다고 보고,
 대신 '이 손익비라면 몇 % 이상 맞혀야 본전인가(필요 승률)'를 보여준다."""
-VERSION = 2  # 2: 기간별(단기·중기) 손익비
+VERSION = 3  # 3: 단타 꼬리표
 
 import numpy as np
 
@@ -81,7 +81,7 @@ def build_card(price, avg, qty, tag, ind, lv, cons, flow, safety_counts, rules, 
     ret = ((price / avg - 1) * 100) if avg else None
     if ret is not None and rules:
         R = rules.get(tag, {})
-        if tag == "스윙" and R.get("손절선") is not None and ret <= R["손절선"]:
+        if tag in ("스윙", "단타") and R.get("손절선") is not None and ret <= R["손절선"]:
             warns.append(f"스윙 종목인데 손절선({R['손절선']:.0f}%)을 넘어 {ret:.1f}%로 보유 중이에요. 처음 계획에서 벗어난 상태예요. 중장기로 바꿨다면 꼬리표를 바꾸고 새 이유를 기록하세요.")
         if tag == "중장기" and R.get("점검선") is not None and ret <= R["점검선"]:
             warns.append(f"점검선({R['점검선']:.0f}%) 아래({ret:.1f}%)예요. 산 이유가 아직 유효한지 먼저 확인하세요.")

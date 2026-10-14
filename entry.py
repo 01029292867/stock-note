@@ -1,10 +1,48 @@
 """매수 후보 평가: 살 때의 구조(손익비, 무효가격, 포지션 크기)를 정리한다.
 '잃지 않는 종목'을 찾는 게 아니라, 틀렸을 때 잃는 크기를 미리 정해두는 도구다."""
-VERSION = 1
+VERSION = 2  # 2: 단타·스윙은 보유 기간 기준(저항선·지지선·기간 변동폭)으로 목표와 무효가격을 정한다
 
 import math
 
 DEFAULTS = {"per_trade": 1.0, "max_pos": 15.0, "min_ratio": 2.0}
+
+
+# ---- 보유 기간이 짧은 꼬리표(단타·스윙)의 목표·무효가격
+# 시작 기본값이에요(데이터로 검증한 숫자가 아님). 기간 변동폭 M = 일 변동성 × √보유기간(거래일): 그 기간에 보통 움직이는 폭.
+HORIZON_K = {"t1": 0.8, "t2": 1.6, "stop": 1.0}
+HORIZON_DAYS = {"단타": 3, "스윙": 10}
+
+
+def horizon_levels(card, price, tag, vol_d, rules=None):
+    """단타·스윙: 컨센서스(중장기 근거)는 빼고, 가까운 저항선·지지선과 '보유 기간 동안 보통 움직이는 폭'으로 정한다.
+    1차 목표 = 가까운 저항선과 (가격 × (1 + 0.8M)) 중 작은 값, 2차 목표 = 가격 × (1 + 1.6M),
+    무효가격 = 가까운 지지선의 2% 아래와 가격 × (1 − M) 중 현재가에 더 가까운 값(최소 1% 아래). 중장기이거나 변동성을 모르면 None."""
+    if tag not in HORIZON_DAYS or not vol_d or vol_d <= 0 or not price:
+        return None
+    R = (rules or {}).get(tag, {}) or {}
+    days = int(R.get("보유기간") or HORIZON_DAYS[tag])
+    m = vol_d * math.sqrt(days)
+    res = next((u["price"] for u in (card or {}).get("ups", []) if u.get("label") == "가까운 저항선" and u["price"] > price), None)
+    sup = next((d["price"] for d in (card or {}).get("downs", []) if d.get("label") == "가까운 지지선" and 0 < d["price"] < price), None)
+    t1_vol = price * (1 + HORIZON_K["t1"] * m)
+    t1 = min(res, t1_vol) if res else t1_vol
+    t2 = max(price * (1 + HORIZON_K["t2"] * m), t1 * 1.01)
+    stop_vol = price * (1 - HORIZON_K["stop"] * m)
+    inv = max(sup * 0.98, stop_vol) if sup else stop_vol
+    inv = min(inv, price * 0.99)
+    b1 = "가까운 저항선" if (res and res <= t1_vol) else f"기간 변동폭 +{HORIZON_K['t1'] * m * 100:.1f}%"
+    bs = "가까운 지지선 2% 아래" if (sup and sup * 0.98 >= stop_vol) else f"기간 변동폭 -{HORIZON_K['stop'] * m * 100:.1f}%"
+    why = (f"{tag} {days}거래일 기준 — 1차 목표 {t1:,.0f}원({b1}), 2차 목표 {t2:,.0f}원(기간 변동폭의 {HORIZON_K['t2']:g}배 +{HORIZON_K['t2'] * m * 100:.1f}%), "
+           f"무효가격 {inv:,.0f}원({bs}). 이 기간에 보통 움직이는 폭은 ±{m * 100:.1f}%(일 변동성 {vol_d * 100:.1f}% × √{days}). 컨센서스는 쓰지 않았어요.")
+    return {"tag": tag, "days": days, "move": m, "t1": t1, "t2": t2, "invalid": inv, "res": res, "sup": sup, "basis_t1": b1, "basis_inv": bs,
+            "up": (t1 / price - 1) * 100, "why": why}
+
+
+def with_horizon(card, h):
+    """카드의 상승 여력·무효가격을 보유 기간 기준으로 바꾼 복사본."""
+    c = dict(card or {})
+    c["up"], c["up_price"], c["invalid"] = h["up"], h["t1"], h["invalid"]
+    return c
 
 
 def plan_entry(price, card, total_assets, risk=None, invalid=None):
