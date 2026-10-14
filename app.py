@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-14 수정17(꼬리표별 기간·목표·만료)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-10-14 수정18(성과 확인)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -56,6 +56,7 @@ import flows
 import fund
 import journal
 import judge
+import measure
 import lab
 import market
 import perf
@@ -186,7 +187,7 @@ def warm_reads():
     try:
         import inspect
         from concurrent.futures import ThreadPoolExecutor
-        funcs = (load_tables, load_settings, load_watch, load_coins, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
+        funcs = (load_tables, load_settings, load_watch, load_coins, load_protocol, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
         src = "".join(inspect.getsource(f) for f in funcs)
         pairs = []
         for m in _re.finditer(r'\.read\(\s*"([^"]+)"\s*,\s*([A-Za-z_][\w\.]*)\s*\)', src):
@@ -292,6 +293,38 @@ def load_watch():
         except Exception:
             pass
     st.session_state.watch = df.reset_index(drop=True)
+
+
+def load_protocol():
+    """구글 시트 '프로토콜' 탭: 성과를 재는 기준(평가 기간·최소 표본·처리 기한·목표)을 확정한 기록."""
+    if "protocol" in st.session_state:
+        return
+    df = pd.DataFrame(columns=measure.PROTOCOL_COLS)
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = measure.clean_protocol(store.read("프로토콜", measure.PROTOCOL_COLS))
+        except Exception:
+            pass
+    st.session_state.protocol = df
+
+
+def save_protocol(row):
+    """새 프로토콜을 확정한다(이전 기록은 지우지 않고 이력으로 남긴다)."""
+    store = get_store()
+    df = measure.clean_protocol(pd.concat([st.session_state.protocol, pd.DataFrame([row])], ignore_index=True))
+    out = df.copy()
+    for c in ("확정일", "시작일"):
+        out[c] = out[c].dt.strftime("%Y-%m-%d")
+    try:
+        if store is not None:
+            if st.session_state.get("load_error"):
+                return False, "구글 시트 연결이 불안정해서 저장하지 않았어요."
+            store.write("프로토콜", out)
+        st.session_state.protocol = df
+        return True, "프로토콜을 확정했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
 
 
 def load_coins():
@@ -618,7 +651,8 @@ def save_plans(df):
         return False, "구글 시트에서 매매 계획을 읽지 못한 상태라 저장을 막았어요."
     clean_df = plan.clean(df)
     out = clean_df.copy()
-    out["생성일"] = out["생성일"].dt.strftime("%Y-%m-%d")
+    for c_ in ("생성일", "진입일", "만료일", "종료일", "완료1일", "완료2일"):
+        out[c_] = out[c_].dt.strftime("%Y-%m-%d").fillna("")
     try:
         if store is not None:
             store.write("매매계획", out)
@@ -1414,7 +1448,7 @@ def render_saved_detail(expanded):
 
 # ---------- 계산 ----------
 WAVE_WINS = {250: "1년(250일)", 180: "9개월(180일)", 120: "6개월(120일)"}
-PAGE_ICON = {"내 자산": "💼", "주간 브리핑": "🗓️", "종합 순위": "🏆", "목표·성과": "🎯", "목적 자금": "🧭", "종목 발굴": "🔎", "안전 점검": "🛡️", "종목 리포트": "📄",
+PAGE_ICON = {"내 자산": "💼", "주간 브리핑": "🗓️", "종합 순위": "🏆", "목표·성과": "🎯", "목적 자금": "🧭", "종목 발굴": "🔎", "성과 확인": "📊", "안전 점검": "🛡️", "종목 리포트": "📄",
              "매매 계획": "📝", "판단 기록": "📒", "가설 실험실": "🧪", "규칙": "⚙️"}
 
 
@@ -3473,19 +3507,19 @@ def tab_plan(rules):
                 if ok:
                     st.rerun()
             if b2.button("1차 정리 완료 표시", key=f"pl_d1_{pid}", disabled=p["완료1"] == "Y"):
-                pl.loc[idx, "완료1"] = "Y"
+                pl.loc[idx, ["완료1", "완료1일"]] = ["Y", pd.Timestamp(dt.date.today())]
                 ok, msg = save_plans(pl)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     st.rerun()
             if b3.button("2차 정리 완료 표시", key=f"pl_d2_{pid}", disabled=p["완료2"] == "Y"):
-                pl.loc[idx, "완료2"] = "Y"
+                pl.loc[idx, ["완료2", "완료2일"]] = ["Y", pd.Timestamp(dt.date.today())]
                 ok, msg = save_plans(pl)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     st.rerun()
             if b4.button("계획 종료", key=f"pl_end_{pid}"):
-                pl.loc[idx, "상태"] = "종료"
+                pl.loc[idx, ["상태", "종료일"]] = ["종료", pd.Timestamp(dt.date.today())]
                 ok, msg = save_plans(pl)
                 (st.success if ok else st.error)(msg)
                 if ok:
@@ -4352,6 +4386,148 @@ def tab_rank(rules):
                 st.caption("점수가 높은 구간의 이후 20거래일 수익이 실제로 더 컸는지 보는 표예요. 같은 날 같은 종목이 겹치고 시장 전체의 움직임도 섞여 있어서, 건수가 수백 건이 되기 전에는 우연일 수 있어요. 가중치를 바꾸기 전에 이 표와 판단 기록의 점수대별 통계를 같이 보세요.")
 
 
+def tab_measure(rules):
+    st.markdown("**이 앱이 실제로 도움이 되는지**를 숫자로 확인하는 화면이에요. 결과를 본 뒤에 기준을 바꾸면 우연이 실력처럼 보이므로, **먼저 기준(프로토콜)을 확정하고 그 기준으로만 판정**해요. "
+                "세 가지를 봐요: ① 발굴한 종목이 같은 기간 **코스피보다** 나았나, ② 미리 정한 **규칙(무효가격·계획·기간 만료)을 지켰나**, ③ **느낌·감정으로 한 결정**이 근거·규칙으로 한 결정보다 못했나.")
+    proto = measure.active_protocol(st.session_state.protocol)
+    today = pd.Timestamp(dt.date.today())
+    top = st.container()
+    with st.expander("📋 프로토콜 — 성과를 재는 기준 (미리 정하고 바꾸지 않아요)", expanded=proto is None):
+        if proto:
+            st.success(f"{proto['확정일']:%Y-%m-%d}에 확정한 기준을 쓰고 있어요: 시작일 {proto['시작일']:%Y-%m-%d} · 평가 기간 {int(proto['평가기간'])}거래일 · 최소 표본 {int(proto['최소표본'])}개 · "
+                       f"처리 기한 {int(proto['처리기한'])}거래일 · 준수율 목표 {int(proto['준수율목표'])}%")
+        else:
+            st.warning("아직 확정한 프로토콜이 없어요. 아래 값을 정하고 `프로토콜 확정`을 누르면, **그 날(시작일) 이후에 담은 종목과 기록만** 판정에 써요(이미 본 결과로 기준을 맞추지 않으려는 장치예요).")
+        st.markdown("**성공 기준(고정)** — 평가 기간이 지난 발굴 종목들의 **평균 초과수익(코스피 대비)이 0보다 크고, 95% 신뢰구간 하한도 0보다 크며, 표본이 최소 표본 이상**일 때만 '충족'이에요. "
+                    "그 전에는 '진행 중'으로만 보여줘요. 규칙 준수율은 위 목표를 넘으면 합격으로 봐요.")
+        if proto is None or st.toggle("새 프로토콜로 바꾸기(이전 기록은 이력으로 남아요)", key="pt_new"):
+            d0 = measure.DEFAULT_PROTOCOL
+            c1, c2, c3, c4, c5 = st.columns(5)
+            start_ = c1.date_input("시작일", value=dt.date.today(), key="pt_start", help="이 날 이후에 담은 관심종목과 만든 계획·기록만 판정에 써요.")
+            hz_ = int(c2.number_input("평가 기간(거래일)", min_value=5, max_value=250, value=int(d0["평가기간"]), step=5, key="pt_hz", help="종목을 담은 날부터 이만큼 지난 뒤의 성과로 판정해요(60거래일 약 3개월)."))
+            mn_ = int(c3.number_input("최소 표본(종목 수)", min_value=3, max_value=200, value=int(d0["최소표본"]), step=1, key="pt_min", help="평가 기간이 지난 종목이 이 수 이상이어야 판정해요."))
+            gr_ = int(c4.number_input("처리 기한(거래일)", min_value=0, max_value=20, value=int(d0["처리기한"]), step=1, key="pt_grace", help="무효가격 이탈·기간 만료 등이 생긴 뒤 이 기간 안에 처리해야 '준수'예요."))
+            cg_ = int(c5.number_input("준수율 목표(%)", min_value=10, max_value=100, value=int(d0["준수율목표"]), step=5, key="pt_goal"))
+            memo_ = st.text_input("메모(이 기준을 정한 이유)", key="pt_memo", placeholder="예: 3개월 뒤 코스피와 비교, 10종목 이상 모이면 판정")
+            if st.button("프로토콜 확정", type="primary", key="pt_save"):
+                ok, msg = save_protocol({"확정일": today.isoformat()[:10], "시작일": pd.Timestamp(start_).isoformat()[:10], "평가기간": hz_, "최소표본": mn_, "처리기한": gr_, "준수율목표": cg_, "메모": memo_})
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
+        hist_ = st.session_state.protocol
+        if len(hist_) > 1:
+            st.caption("확정 이력")
+            st.dataframe(hist_.assign(확정일=hist_["확정일"].dt.strftime("%Y-%m-%d"), 시작일=hist_["시작일"].dt.strftime("%Y-%m-%d")), width="stretch", hide_index=True)
+    p = proto or {**measure.DEFAULT_PROTOCOL, "시작일": today}
+    start = p["시작일"] if proto else None
+    tag = "" if proto else "(프로토콜 확정 전이라 **참고용**이에요) "
+    horizon = int(p["평가기간"])
+    watch = st.session_state.get("watch", pd.DataFrame(columns=WATCH_COLS))
+    wd = watch[(watch["추가일"].astype(str) != "") & watch["추가가"].notna()].copy() if len(watch) and "추가일" in watch.columns else pd.DataFrame(columns=WATCH_COLS)
+    plans = st.session_state.get("plans")
+    plans = plans if (plans is not None and "종목코드" in plans.columns) else pd.DataFrame(columns=plan.COLS)
+    jr = st.session_state.get("jr")
+    jr = jr if (jr is not None and "종목코드" in jr.columns) else pd.DataFrame(columns=journal.COLS)
+    codes = set(wd["종목코드"]) | set(plans["종목코드"]) | set(jr["종목코드"])
+    with scan_mode():
+        prefetch_codes(list(codes), None, "시세")
+        closes = {c: hist_kr(c)["Close"] for c in codes if len(hist_kr(c))}
+    bidx = hist_index()
+    bench = bidx["Close"] if len(bidx) else None
+
+    # ---- ① 발굴 종목 vs 코스피
+    st.subheader("① 발굴한 종목은 코스피보다 나았나")
+    status_a, short_a = "자료 없음", "-"
+    if wd.empty:
+        st.info("관심종목에 **담은 날짜와 담은 가격**이 기록된 종목이 아직 없어요. 종목 발굴에서 '관심종목에 추가'하면 그날 종가가 함께 기록돼요(이 기능이 생긴 뒤부터 쌓여요).")
+    elif bench is None:
+        st.warning("코스피 시세를 가져오지 못해서 비교할 수 없어요. 잠시 뒤 다시 열어 보세요.")
+    else:
+        oc = measure.watch_outcomes(wd, closes, bench, horizon, start=start)
+        samp = oc[oc["표본"]] if len(oc) else oc
+        mature = samp[samp["만기"]] if len(samp) else samp
+        s_a = measure.summarize_excess(mature["기간 초과(%)"] if len(mature) else [])
+        status_a, msg_a = measure.judge_protocol(s_a, p) if proto else ("참고용", "프로토콜을 확정하면 그 날 이후에 담은 종목으로 판정해요.")
+        short_a = f"{s_a.get('n', 0)}/{int(p['최소표본'])}개"
+        k = st.columns(4)
+        k[0].metric("표본(프로토콜 이후 담은 종목)", f"{len(samp)}개")
+        k[1].metric(f"평가 기간({horizon}거래일) 지난 종목", f"{s_a.get('n', 0)}/{int(p['최소표본'])}개", help="최소 표본에 닿아야 판정해요.")
+        k[2].metric("평균 초과수익(평가 기간 기준)", f"{s_a['mean']:+.1f}%p" if "mean" in s_a else "-", help="종목 수익률에서 같은 기간 코스피 수익률을 뺀 값의 평균이에요.")
+        k[3].metric("판정", status_a)
+        st.markdown(tag + msg_a)
+        if len(samp):
+            cur = samp["초과(%)"].dropna()
+            st.caption(f"참고(판정에는 쓰지 않아요): 평가 기간이 안 지난 종목까지 합쳐 **현재까지 평균 초과수익은 {cur.mean():+.1f}%p**, 코스피를 이긴 종목은 {int((cur > 0).sum())}/{len(cur)}개예요. 기간이 짧을수록 우연의 영향이 커요.")
+            show = samp.assign(추가일=samp["추가일"].dt.strftime("%Y-%m-%d"))[["종목명", "추가일", "경과일", "현재(%)", "코스피(%)", "초과(%)", "기간 수익(%)", "기간 초과(%)"]]
+            st.dataframe(show, width="stretch", hide_index=True, column_config={c: st.column_config.NumberColumn(format="%+.1f") for c in ("현재(%)", "코스피(%)", "초과(%)", "기간 수익(%)", "기간 초과(%)")})
+        out_ = oc[~oc["표본"]] if len(oc) else oc
+        if len(out_):
+            with st.expander(f"프로토콜 시작일 이전에 담은 종목 {len(out_)}개 (판정에서 제외, 참고만)"):
+                st.dataframe(out_.assign(추가일=out_["추가일"].dt.strftime("%Y-%m-%d"))[["종목명", "추가일", "경과일", "현재(%)", "코스피(%)", "초과(%)"]], width="stretch", hide_index=True)
+        st.caption("추가가는 담은 날의 종가라서 실제 체결가와 다를 수 있어요. 코스피는 배당이 빠진 지수예요. 종목이 몇 개 안 되면 평균은 우연일 수 있어서, 최소 표본이 찰 때까지는 판정하지 않아요.")
+
+    # ---- ② 규칙 준수
+    st.subheader("② 정한 규칙을 지켰나")
+    jr_s = jr[jr["날짜"] >= start] if (proto and len(jr)) else jr
+    rate_setup, n_buy, n_ok = measure.entry_setup_rate(jr_s)
+    plans_s = plans[plans["생성일"] >= start] if (proto and len(plans)) else plans
+    ev_p = measure.plan_events(plans_s, closes, grace=int(p["처리기한"])) if len(plans_s) else pd.DataFrame(columns=["계획", "종목", "유형", "발생일", "처리일", "결과"])
+    cs = measure.compliance_summary(ev_p)
+    tot = cs[cs["유형"] == "전체"].iloc[0] if len(cs) else None
+    goal = int(p["준수율목표"])
+    k = st.columns(3)
+    k[0].metric("매수 전에 무효가격을 정한 비율", "-" if rate_setup != rate_setup else f"{rate_setup:.0f}%", None if rate_setup != rate_setup else f"{n_ok}/{n_buy}건 · 목표 {goal}%", delta_color="off",
+                help="판단 기록의 '매수·추가 매수' 중 무효가격을 같이 적은 비율이에요.")
+    k[1].metric("계획대로 처리한 비율", "-" if (tot is None or tot["평가 대상"] == 0) else f"{tot['준수율(%)']:.0f}%", None if (tot is None or tot["평가 대상"] == 0) else f"{int(tot['준수'])}/{int(tot['평가 대상'])}건 · 목표 {goal}%", delta_color="off",
+                help="무효가격 이탈, 1차 목표 도달, 기간 만료가 생긴 뒤 처리 기한 안에 종료·완료 표시·연장 사유를 남긴 비율이에요.")
+    k[2].metric("처리일 기록이 없는 건", "-" if tot is None else f"{int(tot['기록 없음'])}건", help="이 기능이 생기기 전에 끝낸 계획이라 언제 처리했는지 알 수 없는 건이에요(분모에서 뺐어요).")
+    if len(cs):
+        st.dataframe(cs, width="stretch", hide_index=True, column_config={"준수율(%)": st.column_config.NumberColumn(format="%.0f")})
+        with st.expander("건별 보기"):
+            st.dataframe(ev_p.assign(발생일=ev_p["발생일"].dt.strftime("%Y-%m-%d"), 처리일=ev_p["처리일"].dt.strftime("%Y-%m-%d")), width="stretch", hide_index=True)
+    else:
+        st.info("아직 무효가격 이탈, 목표 도달, 기간 만료가 생긴 계획이 없어요. 매매 계획을 만들고 종료·완료 표시·연장을 하면 처리일이 기록돼서 여기에 쌓여요.")
+    st.caption("기준을 지켰는지는 앱에 '종료·완료 표시·연장'을 눌렀는지로 봐요. 증권사에서 실제로 팔고도 앱에 표시하지 않으면 미준수로 보일 수 있어요.")
+    n_eval = 0 if tot is None else int(tot["평가 대상"])
+    comp = tot["준수율(%)"] if (tot is not None and n_eval) else np.nan
+
+    # ---- ③ 느낌 vs 근거
+    st.subheader("③ 느낌·감정으로 한 결정은 어땠나")
+    jr_c = jr[jr["날짜"] >= start] if (proto and len(jr)) else jr
+    hj = horizon if horizon in journal.HORIZONS else 60
+    short_c = "-"
+    if jr_c.empty:
+        st.info("판단 기록이 아직 없어요. 결정할 때 판단 기록에 이유를 같이 남기면(예: '불안·감정', '느낌·우량주 판단', '실적·재무') 몇 달 뒤 이유별 성적을 비교할 수 있어요.")
+    else:
+        evj = journal.evaluate(jr_c, closes, bench)
+        rc = measure.reason_compare(evj, hj)
+        if rc.empty:
+            st.info(f"기록은 {len(jr_c)}건이지만 아직 {hj}거래일이 지난 것이 없어요. 결과는 기록 후 {hj}거래일부터 나와요.")
+        else:
+            st.caption(f"기록 {len(jr_c)}건 중 {hj}거래일이 지나 결과가 나온 것을 이유 묶음별로 비교해요(사거나 들고 있는 결정은 오르면, 팔거나 사지 않은 결정은 내리면 맞은 판단).")
+            st.dataframe(rc, width="stretch", hide_index=True, column_config={"맞은 비율(%)": st.column_config.NumberColumn(format="%.0f"), "평균 결정 손익(%)": st.column_config.NumberColumn(format="%+.1f"),
+                                                                              "평균 코스피 대비(%p)": st.column_config.NumberColumn(format="%+.1f")})
+            g = rc.set_index("묶음")
+            if {"근거·규칙 기반", "느낌·감정·남의 말"} <= set(g.index) and g.loc[["근거·규칙 기반", "느낌·감정·남의 말"], "건수"].min() >= 20:
+                short_c = f"{g.loc['근거·규칙 기반', '평균 결정 손익(%)'] - g.loc['느낌·감정·남의 말', '평균 결정 손익(%)']:+.1f}%p"
+                st.markdown(f"근거·규칙 기반이 느낌·감정·남의 말보다 평균 결정 손익이 **{short_c}** 높았어요.")
+            else:
+                short_c = "표본 부족"
+                st.caption("두 묶음 모두 20건 이상 쌓이기 전에는 비교하지 않아요. 지금 숫자는 참고만 하세요.")
+    with top:
+        st.subheader("지금까지의 판정")
+        t1, t2, t3 = st.columns(3)
+        t1.metric("① 발굴 종목 vs 코스피", status_a, short_a, delta_color="off")
+        t2.metric("② 규칙 준수", "-" if comp != comp else f"{comp:.0f}%", None if comp != comp else (f"목표 달성 ✓ ({n_eval}건)" if comp >= goal else f"목표 {goal}%에 못 미침 ({n_eval}건)") if n_eval >= 5 else f"표본 부족({n_eval}건)", delta_color="off")
+        t3.metric("③ 근거 vs 느낌", short_c, delta_color="off")
+        if proto:
+            first = (wd[pd.to_datetime(wd["추가일"], errors="coerce") >= proto["시작일"]]["추가일"].pipe(pd.to_datetime, errors="coerce").min() if len(wd) else pd.NaT)
+            if pd.notna(first):
+                st.caption(f"프로토콜 표본에서 가장 먼저 담은 종목이 평가 기간({horizon}거래일)을 채우는 날은 대략 **{plan.expiry_date(first, horizon):%Y-%m-%d}**이에요. 그 전에는 '진행 중'이에요.")
+        else:
+            st.caption("먼저 아래 프로토콜을 확정하세요. 확정한 날 이후의 자료로만 판정해서, 결과를 보고 기준을 바꾸는 일을 막아요.")
+
+
 def tab_rules():
     st.markdown("규칙 숫자를 바꾸면 신호가 바로 달라져요. 바꾼 뒤 맨 아래 '규칙 저장'을 눌러야 구글 시트에 저장돼요.")
     r = st.session_state.rules
@@ -4475,7 +4651,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 2, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2}
+REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 3, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2, "measure": 1}
 
 
 def check_versions():
@@ -4544,6 +4720,7 @@ def main():
     st.session_state.risk.setdefault("coin_max", 10.0)
     load_watch()
     load_coins()
+    load_protocol()
     load_perf()
     load_cons_hist()
     load_journal()
@@ -4569,7 +4746,7 @@ def main():
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
     pages = {"내 자산": lambda: tab_assets(rules), "주간 브리핑": lambda: tab_brief(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
-             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
+             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "성과 확인": lambda: tab_measure(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     with st.sidebar:                    # 메뉴는 왼쪽에 두어서, 화면이 길어도 스크롤하지 않고 바로 다른 화면으로 갈 수 있다
         page = st.radio("화면", list(pages), key="page", label_visibility="collapsed", format_func=lambda p: f"{PAGE_ICON.get(p, '')} {p}".strip())
         st.divider()

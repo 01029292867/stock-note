@@ -22,6 +22,7 @@ def rows(url=""):
     s = "2. 이 시트의 탭 (앱의 저장소)"
     for tab, desc in (("보유종목", "증권사별 보유 종목, 수량, 평균단가, 매수일. 앱의 내 자산 탭에서 고치고 저장해요."),
                       ("정기매수", "카카오 소수점 정기매수(종목, 티커, 하루금액, 시작일)."),
+                      ("프로토콜", "성과 확인 화면에서 확정한 성과 측정 기준(시작일, 평가 기간, 최소 표본, 처리 기한, 준수율 목표). 이전 기록은 이력으로 남아요."),
                       ("코인", "보유 코인(거래소, 코인 약어, 수량, 평균단가). 내 자산 화면의 코인 편집에서 저장하고, 시세는 업비트(없으면 빗썸)에서 자동으로 가져와 평가금액·비중·쏠림 점검에 보기 전용으로 합쳐요."),
                       ("설정", "규칙 탭의 숫자(손절선, 보호선, 안전 기준 등)와 목표. 규칙 저장을 누르면 여기에 남아요."),
                       ("자산기록", "총자산 기록(주식+현금). 앱을 연 날 하루 한 번 자동으로 쌓여요. 목표·성과 탭의 수익률 계산에 써요."),
@@ -82,7 +83,7 @@ def rows(url=""):
 
     s = "6. 앱 코드를 고칠 때 반영 순서"
     add(s, "순서", "① 새 파일을 GitHub 저장소 맨 위(폴더 없이)에 Add file > Upload files로 올리고 Commit changes ② 앱 오른쪽 아래 Manage app > ⋮ > Reboot app ③ 1~3분 뒤 새로고침")
-    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, helptext.py, scan.py, sectors.py, wave.py, coins.py, guide.py, requirements.txt (내 PC에서만 쓰는 local_collector.py는 올려도 되지만 collector_config.json은 절대 올리지 마세요)")
+    add(s, "저장소에 있어야 하는 파일", "app.py, signals.py, levels.py, market.py, store.py, dart_data.py, safety.py, discover.py, perf.py, flows.py, consensus.py, reports.py, judge.py, journal.py, explain.py, entry.py, plan.py, fund.py, lab.py, score.py, brief.py, naverfin.py, helptext.py, scan.py, sectors.py, wave.py, coins.py, measure.py, guide.py, requirements.txt (내 PC에서만 쓰는 local_collector.py는 올려도 되지만 collector_config.json은 절대 올리지 마세요)")
     add(s, "파일 버전이 안 맞으면", "앱이 어느 파일이 예전 버전인지 알려줘요. 그 파일을 최신으로 올리고 Reboot 하세요.")
 
     s = "7. 문제가 생기면"
