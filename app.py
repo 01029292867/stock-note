@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-10-14 수정18(성과 확인)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-11-09 수정19(거래 기록)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -57,6 +57,7 @@ import fund
 import journal
 import judge
 import measure
+import trades
 import lab
 import market
 import perf
@@ -187,7 +188,7 @@ def warm_reads():
     try:
         import inspect
         from concurrent.futures import ThreadPoolExecutor
-        funcs = (load_tables, load_settings, load_watch, load_coins, load_protocol, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
+        funcs = (load_tables, load_settings, load_watch, load_coins, load_protocol, load_trades, load_perf, load_cons_hist, load_journal, load_plans, load_hyp, load_disc_results, load_scorelog, load_flowlog, load_fincache)
         src = "".join(inspect.getsource(f) for f in funcs)
         pairs = []
         for m in _re.finditer(r'\.read\(\s*"([^"]+)"\s*,\s*([A-Za-z_][\w\.]*)\s*\)', src):
@@ -325,6 +326,80 @@ def save_protocol(row):
         return True, "프로토콜을 확정했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
     except Exception as e:
         return False, f"저장에 실패했어요: {e}"
+
+
+def load_trades():
+    """구글 시트 '거래기록' 탭: 매수·매도·배당 원장. 매도의 확정 손익과 배당이 여기에 쌓인다."""
+    if "trades" in st.session_state:
+        return
+    df = pd.DataFrame(columns=trades.TRADE_COLS)
+    store = get_store()
+    if store is not None and not st.session_state.get("load_error"):
+        try:
+            df = trades.clean(store.read("거래기록", trades.TRADE_COLS))
+        except Exception:
+            pass
+    st.session_state.trades = df
+
+
+def save_trades(df):
+    """거래 기록 전체를 저장한다. 반환: (성공, 문구)"""
+    store = get_store()
+    cl = trades.clean(df)
+    out = cl.copy()
+    out["날짜"] = out["날짜"].dt.strftime("%Y-%m-%d")
+    try:
+        if store is not None:
+            if st.session_state.get("load_error"):
+                return False, "구글 시트 연결이 불안정해서 저장하지 않았어요."
+            store.write("거래기록", out)
+        st.session_state.trades = cl
+        return True, "저장했어요." + ("" if store is not None else "(데모 모드라서 저장되지는 않아요)")
+    except Exception as e:
+        return False, f"저장에 실패했어요: {e}"
+
+
+def save_hold_df(h):
+    """보유 종목 표를 저장하고 화면에 반영한다(보유 종목 편집의 저장과 같은 방식)."""
+    store = get_store()
+    h = clean_hold(h)
+    try:
+        if store is not None:
+            if st.session_state.get("load_error"):
+                return False, "구글 시트 연결이 불안정해서 보유 종목을 저장하지 않았어요."
+            store.write("보유종목", h)
+        st.session_state.hold = h
+        st.session_state.pop("hold_editor", None)
+        return True, "보유 종목을 저장했어요."
+    except Exception as e:
+        return False, f"보유 종목 저장에 실패했어요: {e}"
+
+
+def apply_cash_effect(delta, memo, rules):
+    """거래로 현금이 늘거나(매도·배당) 줄 때(매수) 오늘의 총자산 기록에 반영한다. 현금이 모자라면 부족분을 입금으로 기록한다.
+    매도·매수는 주식과 현금이 서로 바뀌는 것이라 수익률에는 영향이 없고, 배당은 현금이 늘어난 만큼 수익으로 잡혀요."""
+    stock_val, missing = current_stock_value(rules)
+    if stock_val is None:
+        return False, "시세를 가져오지 못한 종목이 있어서 총자산 기록은 건너뛰었어요(목표·성과에서 오늘 현금을 직접 고쳐 주세요)."
+    snaps_raw = st.session_state.perf_snaps
+    snaps = perf.clean_snaps(snaps_raw)
+    last_cash = float(snaps["현금"].dropna().iloc[-1]) if len(snaps) and snaps["현금"].notna().any() else 0.0
+    new_cash, shortfall = last_cash + float(delta), 0.0
+    if new_cash < 0:
+        shortfall, new_cash = -new_cash, 0.0
+    today = dt.date.today().isoformat()
+    base = snaps_view(snaps_raw)
+    base = base[pd.to_datetime(base["날짜"], errors="coerce").dt.strftime("%Y-%m-%d") != today]
+    row = pd.DataFrame([[today, stock_val, new_cash, stock_val + new_cash, "거래", memo]], columns=perf.SNAP_COLS)
+    ok, msg = save_perf(snaps=pd.concat([base, row], ignore_index=True))
+    if not ok:
+        return False, msg
+    txt = f"총자산 기록(오늘)에 반영했어요: 주식 {stock_val:,.0f}원 + 현금 {new_cash:,.0f}원."
+    if shortfall > 0:
+        fl = flows_view(st.session_state.perf_flows)
+        ok2, msg2 = save_perf(flows=pd.concat([fl, pd.DataFrame([[today, shortfall, "매수 자금(자동): " + memo]], columns=perf.FLOW_COLS)], ignore_index=True))
+        txt += f" 기록된 현금이 모자라서 부족분 {shortfall:,.0f}원을 입출금에 입금으로 남겼어요." if ok2 else f" 부족분 {shortfall:,.0f}원의 입금 기록은 실패했어요({msg2})."
+    return True, txt
 
 
 def load_coins():
@@ -1448,7 +1523,7 @@ def render_saved_detail(expanded):
 
 # ---------- 계산 ----------
 WAVE_WINS = {250: "1년(250일)", 180: "9개월(180일)", 120: "6개월(120일)"}
-PAGE_ICON = {"내 자산": "💼", "주간 브리핑": "🗓️", "종합 순위": "🏆", "목표·성과": "🎯", "목적 자금": "🧭", "종목 발굴": "🔎", "성과 확인": "📊", "안전 점검": "🛡️", "종목 리포트": "📄",
+PAGE_ICON = {"내 자산": "💼", "주간 브리핑": "🗓️", "종합 순위": "🏆", "목표·성과": "🎯", "목적 자금": "🧭", "종목 발굴": "🔎", "성과 확인": "📊", "거래 기록": "🧾", "안전 점검": "🛡️", "종목 리포트": "📄",
              "매매 계획": "📝", "판단 기록": "📒", "가설 실험실": "🧪", "규칙": "⚙️"}
 
 
@@ -4528,6 +4603,225 @@ def tab_measure(rules):
             st.caption("먼저 아래 프로토콜을 확정하세요. 확정한 날 이후의 자료로만 판정해서, 결과를 보고 기준을 바꾸는 일을 막아요.")
 
 
+def _jr_row(decision, code, name, reason, qty, price, avg, tag, memo):
+    """거래에서 만드는 판단 기록 한 줄(카드 숫자는 비워 둔다). 계획 기반 이유는 '비중·리스크 관리'로 묶고 원래 이유는 메모에 남긴다."""
+    plan_based = reason in trades.PLAN_REASONS
+    return {"id": dt.datetime.now().strftime("%Y%m%d%H%M%S") + code, "날짜": dt.date.today().isoformat(), "종목코드": code, "종목명": name, "결정": decision,
+            "이유": "비중·리스크 관리" if plan_based else reason, "확신도": 3, "기록가": price, "평단": avg, "수량": qty, "꼬리표": tag,
+            "메모": (f"[{reason}] " if plan_based else "") + (memo or "")}
+
+
+def _flash(kind, text):
+    st.session_state.setdefault("tr_flash", []).append((kind, text))
+
+
+def tab_trades(rules):
+    st.markdown("매수·매도·배당을 기록하면 **확정 손익(판 가격 − 평단)**, 승률, 평균 이익·손실, 배당이 쌓여요. 기록하면 **보유 종목 수량과 평단이 같이 바뀌고**, 원하면 총자산 기록의 현금, 판단 기록, 매매 계획까지 한 번에 정리해요. "
+                "**지금부터 쌓여요**(예전 거래는 복원하지 못해요). 평단은 이 앱의 **이동평균 방식**이라 증권사 화면의 평단과 조금 다를 수 있어요.")
+    for kind_, text_ in st.session_state.pop("tr_flash", []):
+        {"ok": st.success, "warn": st.warning, "err": st.error}.get(kind_, st.info)(text_)
+    hold = st.session_state.hold.reset_index(drop=True)
+    tr = st.session_state.trades
+    plans = st.session_state.get("plans")
+    kind = st.radio("무엇을 기록할까요", ["매도", "배당", "매수"], horizontal=True, key="tr_kind")
+    reasons = trades.PLAN_REASONS + journal.REASONS
+    today = dt.date.today()
+
+    def close_plan(code, memo_text=""):
+        if plans is None or plans.empty or "상태" not in plans.columns:
+            return None
+        m = (plans["종목코드"] == code) & (plans["상태"] == "진행")
+        if not m.any():
+            return None
+        pl = plans.copy()
+        pl.loc[m, ["상태", "종료일"]] = ["종료", pd.Timestamp(today)]
+        ok_, msg_ = save_plans(pl)
+        return f"진행 중인 매매 계획 {int(m.sum())}건을 종료로 표시했어요." if ok_ else f"계획 종료 표시에 실패했어요({msg_})."
+
+    if kind == "매도":
+        if hold.empty:
+            st.info("보유 종목이 없어요. 내 자산의 '보유 종목 편집'에서 먼저 추가하세요.")
+        else:
+            opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · {r['증권사']} · {float(r['수량']):g}주 · 평단 {float(r['평균단가']):,.0f}원": i for i, r in hold.iterrows()}
+            pick = st.selectbox("판 종목", list(opts), key="tr_s_pick")
+            r = hold.iloc[opts[pick]]
+            code, broker, name, tag = r["종목코드"], r["증권사"], r["종목명"] or r["종목코드"], r["꼬리표"]
+            held, avg = float(r["수량"]), float(r["평균단가"])
+            d_ = hist_kr(code)
+            px = float(d_["Close"].iloc[-1]) if len(d_) else avg
+            kk = f"{code}_{broker}"
+            c1, c2, c3, c4 = st.columns(4)
+            day = c1.date_input("판 날짜", value=today, key="tr_s_date")
+            qty = c2.number_input("판 수량", min_value=0.0, value=held, step=1.0, format="%g", key=f"tr_s_q_{kk}", help="전량이면 보유 수량 그대로 두세요. 일부만 팔았다면 판 수량만 적어요.")
+            price = c3.number_input("판 단가(원)", min_value=0.0, value=round(px, 2), step=100.0, key=f"tr_s_p_{kk}", help="체결된 1주당 가격이에요.")
+            cost = c4.number_input("수수료·세금(원)", min_value=0.0, value=0.0, step=100.0, key=f"tr_s_c_{kk}", help="증권사 수수료와 거래세 등 합계예요. 모르면 0으로 두세요(확정 손익이 조금 크게 보여요).")
+            full = qty >= held - 1e-9
+            if qty > 0 and price > 0 and avg > 0:
+                pnl, pct = trades.realized(price, avg, qty, cost)
+                st.markdown(f"평단 **{avg:,.0f}원** → 판 가격 **{price:,.0f}원**: 확정 손익 **{pnl:+,.0f}원 ({pct:+.1f}%)** · " + ("**전량 매도**라 보유 종목에서 지워져요." if full else f"{held - qty:g}주가 남아요."))
+            reason = st.selectbox("이유", reasons, key="tr_s_reason", help="'느낌·감정' 같은 이유도 솔직하게 고르세요. 성과 확인에서 이유별 성적을 비교해요.")
+            memo = st.text_input("메모(선택)", key="tr_s_memo")
+            o1, o2, o3 = st.columns(3)
+            cash_ = o1.checkbox("판 대금을 총자산 기록의 현금에 반영", value=True, key="tr_s_cash", help="안 하면 주식 평가금액만 줄어서 총자산이 줄어든 것처럼 기록돼요(낙폭·수익률이 틀어져요).")
+            jr_ = o2.checkbox("판단 기록에도 남기기", value=True, key="tr_s_jr")
+            act = plans is not None and not plans.empty and "상태" in plans.columns and ((plans["종목코드"] == code) & (plans["상태"] == "진행")).any()
+            plan_ = o3.checkbox("진행 중인 매매 계획을 종료로 표시", value=bool(full), key="tr_s_plan") if (full and act) else False
+            if st.button("기록하고 반영", type="primary", key="tr_s_go"):
+                if qty <= 0 or price <= 0:
+                    st.error("수량과 단가를 입력하세요.")
+                else:
+                    try:
+                        new_hold, avg_at, removed = trades.apply_sell(hold, broker, code, qty)
+                    except ValueError as e:
+                        st.error(str(e))
+                        st.stop()
+                    ok, msg = save_hold_df(new_hold)
+                    if not ok:
+                        st.error(msg)
+                        st.stop()
+                    row = trades.make_row("매도", day, broker, code, name, qty, price, None, cost, avg_at, reason, tag, memo)
+                    ok2, msg2 = save_trades(pd.concat([tr, pd.DataFrame([row])], ignore_index=True))
+                    pnl_, pct_ = row["실현손익"], row["실현수익률"]
+                    _flash("ok" if ok2 else "err", (f"매도를 기록했어요: {name} {qty:g}주, 확정 손익 {pnl_:+,.0f}원({pct_:+.1f}%). " + ("보유 종목에서 지웠어요." if removed else f"{held - qty:g}주가 남았어요.")) if ok2
+                          else f"보유 종목은 바뀌었지만 거래 기록 저장에 실패했어요({msg2}). 이중 반영을 막으려면 다시 누르지 말고 아래 거래 목록을 확인하세요.")
+                    if cash_:
+                        okc, txtc = apply_cash_effect(qty * price - cost, f"{name} 매도", rules)
+                        _flash("ok" if okc else "warn", txtc)
+                    if jr_:
+                        okj, txtj = save_journal([_jr_row("전량 매도" if removed else "일부 매도", code, name, reason, qty, price, avg_at, tag, memo)])
+                        _flash("ok" if okj else "warn", "판단 기록에도 남겼어요." if okj else f"판단 기록 저장 실패: {txtj}")
+                    if plan_:
+                        t_ = close_plan(code)
+                        if t_:
+                            _flash("ok", t_)
+                    st.rerun()
+    elif kind == "배당":
+        opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · {r['증권사']}": i for i, r in hold.iterrows()}
+        pick = st.selectbox("배당 받은 종목", list(opts) + ["직접 입력(이미 판 종목 등)"], key="tr_d_pick")
+        if pick in opts:
+            r = hold.iloc[opts[pick]]
+            code, broker, name = r["종목코드"], r["증권사"], r["종목명"] or r["종목코드"]
+        else:
+            e1, e2, e3 = st.columns(3)
+            code = e1.text_input("종목코드(6자리)", key="tr_d_code")
+            name = e2.text_input("종목명", key="tr_d_name")
+            broker = e3.selectbox("증권사", BROKERS, key="tr_d_broker")
+            code = code.strip().zfill(6) if code.strip().isdigit() else code.strip()
+        c1, c2 = st.columns(2)
+        day = c1.date_input("받은 날", value=today, key="tr_d_date")
+        amt = c2.number_input("배당금(세후, 원)", min_value=0.0, value=0.0, step=1000.0, key="tr_d_amt", help="계좌에 실제로 들어온 금액이에요(세금을 뗀 뒤).")
+        memo = st.text_input("메모(선택)", key="tr_d_memo")
+        cash_ = st.checkbox("총자산 기록의 현금에 반영", value=True, key="tr_d_cash", help="배당은 현금이 늘어난 만큼 수익으로 잡혀요(입금이 아니에요).")
+        if st.button("기록하고 반영", type="primary", key="tr_d_go"):
+            if amt <= 0 or not code:
+                st.error("종목과 배당금을 입력하세요.")
+            else:
+                ok2, msg2 = save_trades(pd.concat([tr, pd.DataFrame([trades.make_row("배당", day, broker, code, name or code, None, None, amt, 0.0, None, "", "", memo)])], ignore_index=True))
+                _flash("ok" if ok2 else "err", f"배당을 기록했어요: {name or code} {amt:,.0f}원." if ok2 else msg2)
+                if ok2 and cash_:
+                    okc, txtc = apply_cash_effect(amt, f"{name or code} 배당", rules)
+                    _flash("ok" if okc else "warn", txtc)
+                st.rerun()
+    else:
+        opts = {f"{r['종목명'] or r['종목코드']} ({r['종목코드']}) · {r['증권사']} · {float(r['수량']):g}주 · 평단 {float(r['평균단가']):,.0f}원": i for i, r in hold.iterrows()}
+        pick = st.selectbox("산 종목", list(opts) + ["새 종목"], key="tr_b_pick")
+        if pick in opts:
+            r = hold.iloc[opts[pick]]
+            code, broker, name, tag = r["종목코드"], r["증권사"], r["종목명"] or r["종목코드"], r["꼬리표"]
+        else:
+            e1, e2, e3, e4 = st.columns(4)
+            code = e1.text_input("종목코드(6자리)", key="tr_b_code")
+            name = e2.text_input("종목명", key="tr_b_name")
+            broker = e3.selectbox("증권사", BROKERS, key="tr_b_broker")
+            tag = e4.radio("꼬리표", TAGS, horizontal=True, key="tr_b_tag")
+            code = code.strip().zfill(6) if code.strip().isdigit() else code.strip()
+        kk = f"{code}"
+        c1, c2, c3, c4 = st.columns(4)
+        day = c1.date_input("산 날짜", value=today, key="tr_b_date")
+        qty = c2.number_input("산 수량", min_value=0.0, value=0.0, step=1.0, format="%g", key=f"tr_b_q_{kk}")
+        price = c3.number_input("산 단가(원)", min_value=0.0, value=0.0, step=100.0, key=f"tr_b_p_{kk}")
+        cost = c4.number_input("수수료(원)", min_value=0.0, value=0.0, step=100.0, key=f"tr_b_c_{kk}")
+        if qty > 0 and price > 0:
+            cur_q, cur_a = (float(r["수량"]), float(r["평균단가"])) if pick in opts else (0.0, 0.0)
+            new_a = (cur_q * cur_a + qty * price + cost) / (cur_q + qty)
+            st.markdown(f"새 평단 **{new_a:,.0f}원**, 보유 **{cur_q + qty:g}주**" + (f" (이전 평단 {cur_a:,.0f}원)" if cur_q else " (새로 보유 종목에 추가돼요)"))
+        reason = st.selectbox("이유", journal.REASONS, key="tr_b_reason")
+        memo = st.text_input("메모(선택)", key="tr_b_memo")
+        o1, o2 = st.columns(2)
+        cash_ = o1.checkbox("산 금액을 총자산 기록의 현금에서 빼기", value=True, key="tr_b_cash", help="기록된 현금이 모자라면 부족분을 입출금에 '입금'으로 남겨요(통장에서 새로 넣은 돈으로 본다는 뜻이에요).")
+        jr_ = o2.checkbox("판단 기록에도 남기기", value=True, key="tr_b_jr")
+        if st.button("기록하고 반영", type="primary", key="tr_b_go"):
+            if qty <= 0 or price <= 0 or not code or len(code) != 6 or not code.isdigit():
+                st.error("종목코드(6자리 숫자), 수량, 단가를 입력하세요.")
+            else:
+                held_before = pick in opts
+                new_hold = trades.apply_buy(hold, broker, code, name, tag, qty, price, cost, day)
+                ok, msg = save_hold_df(new_hold)
+                if not ok:
+                    st.error(msg)
+                    st.stop()
+                avg_now = float(new_hold[(new_hold["증권사"] == broker) & (new_hold["종목코드"] == code)]["평균단가"].iloc[0])
+                row = trades.make_row("매수", day, broker, code, name or code, qty, price, None, cost, avg_now, reason, tag, memo)
+                ok2, msg2 = save_trades(pd.concat([tr, pd.DataFrame([row])], ignore_index=True))
+                _flash("ok" if ok2 else "err", f"매수를 기록했어요: {name or code} {qty:g}주, 평단 {avg_now:,.0f}원." if ok2 else f"보유 종목은 바뀌었지만 거래 기록 저장에 실패했어요({msg2}).")
+                if cash_:
+                    okc, txtc = apply_cash_effect(-(qty * price + cost), f"{name or code} 매수", rules)
+                    _flash("ok" if okc else "warn", txtc)
+                if jr_:
+                    okj, txtj = save_journal([_jr_row("추가 매수" if held_before else "매수", code, name or code, reason, qty, price, avg_now, tag, memo)])
+                    _flash("ok" if okj else "warn", "판단 기록에도 남겼어요." if okj else f"판단 기록 저장 실패: {txtj}")
+                st.rerun()
+    st.caption("카카오 소수점 정기매수 종목과 코인은 아직 이 화면에서 기록하지 않아요. 판 대금을 출금했다면 목표·성과의 입출금에 출금을 적으세요(그래야 수익률이 맞아요).")
+
+    # ---- 성적
+    st.subheader("확정 손익과 거래 성적")
+    if tr.empty:
+        st.info("아직 거래 기록이 없어요. 위에서 매도·배당을 기록하면 여기에 쌓여요.")
+        return
+    per = st.radio("기간", ["올해", "최근 12개월", "전체"], horizontal=True, key="tr_per")
+    start = {"올해": pd.Timestamp(year=today.year, month=1, day=1), "최근 12개월": pd.Timestamp(today) - pd.DateOffset(years=1), "전체": None}[per]
+    s = trades.stats(tr, start=start)
+
+    def won(n):
+        return "-" if pd.isna(n) else (f"{n / 1e4:,.0f}만원" if abs(n) >= 1e4 else f"{n:,.0f}원")
+    k = st.columns(4)
+    k[0].metric("확정(실현) 손익", won(s["total"]), help="판 가격 − 평단, 수수료·세금 반영. 아직 안 판 종목의 평가손익은 포함되지 않아요.")
+    k[1].metric("배당(세후)", won(s["div"]))
+    k[2].metric("합계(확정 손익 + 배당)", won(s["net"]))
+    k[3].metric("매도 건수", f"{s['n']}건")
+    if s["n"]:
+        k2 = st.columns(4)
+        k2[0].metric("승률", f"{s['win_rate']:.0f}%", f"{s['wins']}승 {s['losses']}패", delta_color="off", help="확정 손익이 0보다 큰 매도의 비율이에요.")
+        k2[1].metric("평균 이익", "-" if s["avg_win"] != s["avg_win"] else f"{s['avg_win']:+,.0f}원")
+        k2[2].metric("평균 손실", "-" if s["avg_loss"] != s["avg_loss"] else f"{s['avg_loss']:+,.0f}원")
+        k2[3].metric("손익비", "-" if s["payoff"] != s["payoff"] else f"{s['payoff']:.2f}", help="평균 이익 ÷ 평균 손실(절댓값)이에요. 승률이 낮아도 손익비가 크면 벌 수 있고, 승률이 높아도 손익비가 작으면 잃을 수 있어요.")
+        st.caption(f"건당 기대값 {s['expectancy']:+,.0f}원({s['exp_pct']:+.1f}%) · 가장 큰 이익 {s['best']:+,.0f}원 · 가장 큰 손실 {s['worst']:+,.0f}원. 매도가 {journal.MIN_N}건 미만이면 숫자는 우연일 수 있어요.")
+    mo = trades.monthly(tr)
+    if len(mo):
+        st.markdown("**월별**")
+        st.bar_chart(mo.set_index("월")[["실현손익", "배당"]])
+        st.dataframe(mo, width="stretch", hide_index=True, column_config={c: st.column_config.NumberColumn(format="%,.0f") for c in ("실현손익", "배당", "합계")})
+    bs = trades.by_stock(tr, start=start)
+    if len(bs):
+        st.markdown("**종목별**")
+        st.dataframe(bs, width="stretch", hide_index=True, column_config={"실현손익": st.column_config.NumberColumn(format="%,.0f"), "배당": st.column_config.NumberColumn(format="%,.0f"), "승률(%)": st.column_config.NumberColumn(format="%.0f")})
+    br = trades.by_reason(tr, start=start)
+    if len(br):
+        st.markdown("**이유 묶음별 매도 성적**(근거·규칙 vs 느낌·감정·남의 말)")
+        st.dataframe(br, width="stretch", hide_index=True, column_config={"승률(%)": st.column_config.NumberColumn(format="%.0f"), "평균 수익률(%)": st.column_config.NumberColumn(format="%+.1f"), "실현손익": st.column_config.NumberColumn(format="%,.0f")})
+    with st.expander("거래 목록(전체)"):
+        show = tr.sort_values("날짜", ascending=False).assign(날짜=lambda d: d["날짜"].dt.strftime("%Y-%m-%d"))[["날짜", "구분", "종목명", "증권사", "수량", "단가", "금액", "수수료세금", "평단", "실현손익", "실현수익률", "이유", "메모"]]
+        st.dataframe(show, width="stretch", hide_index=True, column_config={"실현수익률": st.column_config.NumberColumn(format="%+.1f"), "금액": st.column_config.NumberColumn(format="%,.0f"),
+                                                                           "실현손익": st.column_config.NumberColumn(format="%,.0f"), "평단": st.column_config.NumberColumn(format="%,.0f"), "단가": st.column_config.NumberColumn(format="%,.0f")})
+        labels = {f"{r['날짜']:%Y-%m-%d} {r['구분']} {r['종목명'] or r['종목코드']} ({r['id'][-6:]})": r["id"] for r in tr.to_dict("records")}
+        dels = st.multiselect("잘못 적은 기록 삭제", list(labels), key="tr_del", help="기록만 지워요. 보유 종목, 총자산 기록의 현금, 판단 기록, 매매 계획은 되돌리지 않아요(필요하면 직접 고치세요).")
+        if dels and st.button("선택한 기록 삭제", key="tr_del_go"):
+            ids = {labels[x] for x in dels}
+            ok_, msg_ = save_trades(tr[~tr["id"].isin(ids)])
+            _flash("ok" if ok_ else "err", f"{len(ids)}건을 지웠어요(보유 종목·현금은 그대로예요)." if ok_ else msg_)
+            st.rerun()
+
+
 def tab_rules():
     st.markdown("규칙 숫자를 바꾸면 신호가 바로 달라져요. 바꾼 뒤 맨 아래 '규칙 저장'을 눌러야 구글 시트에 저장돼요.")
     r = st.session_state.rules
@@ -4651,7 +4945,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 3, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2, "measure": 1}
+REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 3, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2, "measure": 1, "trades": 1}
 
 
 def check_versions():
@@ -4721,6 +5015,7 @@ def main():
     load_watch()
     load_coins()
     load_protocol()
+    load_trades()
     load_perf()
     load_cons_hist()
     load_journal()
@@ -4746,7 +5041,7 @@ def main():
     st.title("📈 내 투자 노트")
     st.caption("시세는 무료 출처라 지연되거나 틀릴 수 있어요. 주문 전에는 증권사 앱의 시세를 꼭 확인하세요. 이 앱의 신호는 내 규칙에 해당하는지 알려주는 것이고, 투자 권유가 아니에요.")
     pages = {"내 자산": lambda: tab_assets(rules), "주간 브리핑": lambda: tab_brief(rules), "종합 순위": lambda: tab_rank(rules), "목표·성과": lambda: tab_perf(rules), "목적 자금": tab_fund, "종목 발굴": tab_discover, "안전 점검": tab_safety,
-             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "성과 확인": lambda: tab_measure(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
+             "종목 리포트": lambda: tab_report(rules), "매매 계획": lambda: tab_plan(rules), "판단 기록": lambda: tab_journal(rules), "거래 기록": lambda: tab_trades(rules), "성과 확인": lambda: tab_measure(rules), "가설 실험실": tab_lab, "규칙": tab_rules}
     with st.sidebar:                    # 메뉴는 왼쪽에 두어서, 화면이 길어도 스크롤하지 않고 바로 다른 화면으로 갈 수 있다
         page = st.radio("화면", list(pages), key="page", label_visibility="collapsed", format_func=lambda p: f"{PAGE_ICON.get(p, '')} {p}".strip())
         st.divider()
