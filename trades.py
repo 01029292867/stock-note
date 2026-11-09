@@ -1,6 +1,6 @@
 """거래 기록(원장): 매수·매도·배당을 남기고, 매도의 확정 손익과 거래 성적을 계산한다.
 평단은 이동평균 방식(보유 종목의 평균단가)이라 증권사 화면의 평단과 약간 다를 수 있다. 기록한 날부터 쌓인다(예전 거래는 복원하지 못한다)."""
-VERSION = 1
+VERSION = 2  # 2: 정수 칸에 소수점 값을 넣을 때 나는 오류(최신 pandas) 수정
 
 import datetime as dt
 
@@ -46,6 +46,17 @@ def realized(price, avg, qty, cost=0.0):
     return pnl, (pnl / basis * 100 if basis > 0 else float("nan"))
 
 
+def _norm(hold):
+    """보유 종목 표를 계산하기 좋게 맞춘다: 수량·평균단가는 실수, 나머지는 글자. 정수만 있는 칸(예: 수량 10, 평균단가 61400)에 소수점 값을 넣으면 최신 pandas가 오류를 내서 미리 실수로 바꾼다."""
+    h = hold.copy().reset_index(drop=True)
+    for c in ("수량", "평균단가"):
+        h[c] = pd.to_numeric(h[c], errors="coerce").astype("float64")
+    for c in h.columns:
+        if c not in ("수량", "평균단가"):
+            h[c] = h[c].astype("object")
+    return h
+
+
 def _find(h, broker, code):
     m = (h["증권사"].astype(str) == str(broker)) & (h["종목코드"].astype(str) == str(code))
     return h.index[m][0] if m.any() else None
@@ -53,7 +64,7 @@ def _find(h, broker, code):
 
 def apply_buy(hold, broker, code, name, tag, qty, price, cost, date):
     """매수를 보유 종목에 반영한다(이동평균 평단: (기존 수량 × 기존 평단 + 산 금액 + 비용) ÷ 새 수량). 새 종목이면 줄을 추가한다."""
-    h = hold.copy().reset_index(drop=True)
+    h = _norm(hold)
     qty, price, cost = round(float(qty), 8), float(price), float(cost or 0)
     if qty <= 0 or price <= 0:
         raise ValueError("수량과 단가는 0보다 커야 해요.")
@@ -74,7 +85,7 @@ def apply_buy(hold, broker, code, name, tag, qty, price, cost, date):
 
 def apply_sell(hold, broker, code, qty):
     """매도를 보유 종목에서 뺀다. 전량이면 줄을 지운다. 반환: (새 보유 종목, 매도 시점 평단, 줄이 지워졌는지)"""
-    h = hold.copy().reset_index(drop=True)
+    h = _norm(hold)
     i = _find(h, broker, code)
     if i is None:
         raise ValueError("보유 종목에서 그 종목(증권사)을 찾지 못했어요.")

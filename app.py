@@ -44,7 +44,7 @@ if not getattr(_orig_write, "_mdfix", False):
     _write._mdfix = True
     st.write = _write
 
-APP_BUILD = "2026-11-09 수정19(거래 기록)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
+APP_BUILD = "2026-11-09 수정19b(거래 기록 오류 수정)"   # 올라간 app.py가 최신인지 확인하는 표시(사이드바 맨 아래)
 
 import coins
 import consensus
@@ -4945,7 +4945,7 @@ def tab_rules():
 
 
 # 같이 올려야 하는 파일의 최소 버전. 예전 파일이 남아 있으면 오류 대신 올려야 할 파일을 알려준다.
-REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 3, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2, "measure": 1, "trades": 1}
+REQUIRED_VERSIONS = {"signals": 5, "levels": 1, "judge": 3, "journal": 2, "score": 2, "explain": 1, "entry": 2, "plan": 3, "fund": 1, "lab": 4, "brief": 2, "naverfin": 3, "helptext": 1, "scan": 1, "sectors": 2, "wave": 6, "coins": 2, "discover": 2, "measure": 1, "trades": 2}
 
 
 def check_versions():
